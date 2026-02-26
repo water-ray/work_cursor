@@ -1,0 +1,21 @@
+---
+description: Go core and FFI conventions for wateray
+globs: core/**/*.go
+alwaysApply: false
+---
+
+# Go Core Rules
+
+- Keep exported C ABI functions minimal and stable in `core/internal/ffi/`.
+- Put runtime lifecycle and state transitions behind explicit start/stop/reload boundaries.
+- Keep TUN lifecycle decoupled from outbound switching logic.
+- Use context cancellation and structured error propagation for long-running routines.
+- Avoid importing UI concerns into the core module.
+
+## Example
+
+```go
+// GOOD: use context to stop worker safely
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()
+```

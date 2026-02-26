@@ -1,0 +1,26 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+*.iml
+
+# Flutter / Dart
+app/.dart_tool/
+app/.packages
+app/build/
+app/.flutter-plugins
+app/.flutter-plugins-dependencies
+app/.metadata
+app/**/.DS_Store
+
+# Go
+core/bin/
+core/dist/
+core/*.exe
+core/*.dll
+core/*.so
+core/*.dylib
+core/*.test
+core/coverage.out

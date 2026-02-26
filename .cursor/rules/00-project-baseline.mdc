@@ -1,0 +1,19 @@
+---
+description: Wateray global architecture and runtime constraints
+alwaysApply: true
+---
+
+# Wateray Baseline
+
+- Keep module boundaries: UI in `app/`, engine in `core/`, automation in `scripts/`.
+- Keep TUN adapter persistent during node switches. Update outbound through hot reload APIs.
+- Run core engine asynchronously and expose non-blocking FFI APIs to UI.
+- Load user-facing strings from external JSON under `app/assets/i18n/`.
+- Changes touching tunnel or routing must include verification steps.
+
+## Example
+
+```text
+BAD: stop core -> destroy tun -> recreate tun on each node switch
+GOOD: keep tun alive -> hot reload outbound -> continue traffic accounting
+```
