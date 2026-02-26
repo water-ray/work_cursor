@@ -66,3 +66,17 @@ scripts/  # 构建与发布脚本
 - 私有仓库请先设置 `GITHUB_TOKEN`
 - 执行：
   - `pwsh ./scripts/build/download-sb-libs.ps1 -Tag sb-libs-v0.1.0`
+
+## GitHub 仅编译 Windows sb 库
+
+- 工作流：`.github/workflows/sb-windows-release.yml`
+- 触发：
+  - `git tag sb-win-v0.1.0`
+  - `git push origin sb-win-v0.1.0`
+- 下载：
+  - `pwsh ./scripts/build/download-sb-windows.ps1 -Tag sb-win-v0.1.0`
+
+## 本地 Windows 开发环境初始化
+
+- 自动检查/初始化脚本：
+  - `pwsh ./scripts/dev/setup-windows-dev.ps1 -WindowsLibTag sb-win-v0.1.0 -InitFlutterWindowsRunner`

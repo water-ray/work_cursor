@@ -1,0 +1,143 @@
+name: Build sing-box Windows Library
+
+on:
+  workflow_dispatch:
+    inputs:
+      sing_box_ref:
+        description: "sing-box tag/branch/commit"
+        required: true
+        default: "dev-next"
+        type: string
+      release_tag:
+        description: "Release tag (optional)"
+        required: false
+        default: ""
+        type: string
+      release_name:
+        description: "Release name (optional)"
+        required: false
+        default: ""
+        type: string
+  push:
+    tags:
+      - "sb-win-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      sb_ref: ${{ steps.meta.outputs.sb_ref }}
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+      release_name: ${{ steps.meta.outputs.release_name }}
+    steps:
+      - name: Resolve build metadata
+        id: meta
+        shell: bash
+        env:
+          INPUT_SB_REF: ${{ github.event.inputs.sing_box_ref }}
+          INPUT_RELEASE_TAG: ${{ github.event.inputs.release_tag }}
+          INPUT_RELEASE_NAME: ${{ github.event.inputs.release_name }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            release_tag="${GITHUB_REF_NAME}"
+            sb_ref="dev-next"
+          else
+            sb_ref="${INPUT_SB_REF:-dev-next}"
+            release_tag="${INPUT_RELEASE_TAG}"
+            if [[ -z "${release_tag}" ]]; then
+              release_tag="sb-win-$(date +%Y%m%d-%H%M%S)"
+            fi
+          fi
+
+          release_name="${INPUT_RELEASE_NAME}"
+          if [[ -z "${release_name}" ]]; then
+            release_name="sing-box windows lib ${release_tag}"
+          fi
+
+          echo "sb_ref=${sb_ref}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
+          echo "release_name=${release_name}" >> "$GITHUB_OUTPUT"
+
+  build_windows_dll:
+    name: Build Windows DLL
+    runs-on: windows-latest
+    needs: prepare
+    steps:
+      - name: Checkout wateray
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+
+      - name: Setup MinGW
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+
+      - name: Add MinGW to PATH
+        shell: pwsh
+        run: |
+          "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Build c-shared DLL
+        shell: pwsh
+        working-directory: core
+        run: |
+          go get "github.com/sagernet/sing-box@${{ needs.prepare.outputs.sb_ref }}"
+          go mod tidy
+          New-Item -ItemType Directory -Force -Path "..\dist\windows" | Out-Null
+          go build -tags "cshared,sbcore" -buildmode=c-shared -trimpath -ldflags "-s -w" -o "..\dist\windows\wateray_core.dll" "./cmd/wateray_core"
+          if (!(Test-Path "..\dist\windows\wateray_core.h")) { throw "missing generated header: wateray_core.h" }
+          Compress-Archive -Path "..\dist\windows\wateray_core.dll", "..\dist\windows\wateray_core.h" -DestinationPath "..\dist\wateray-core-windows-amd64.zip" -Force
+
+      - name: Upload Windows DLL package
+        uses: actions/upload-artifact@v4
+        with:
+          name: wateray-core-windows-amd64
+          path: dist/wateray-core-windows-amd64.zip
+
+  publish_release:
+    name: Publish Release
+    runs-on: ubuntu-latest
+    needs:
+      - prepare
+      - build_windows_dll
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum *.zip > SHA256SUMS.txt
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.release_tag }}
+          name: ${{ needs.prepare.outputs.release_name }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          body: |
+            Automated sing-box Windows library build for wateray.
+
+            - sing-box ref: `${{ needs.prepare.outputs.sb_ref }}`
+            - artifact:
+              - `wateray-core-windows-amd64.zip` (DLL + header)
+          files: |
+            dist/*.zip
+            dist/SHA256SUMS.txt
