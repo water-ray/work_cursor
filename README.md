@@ -33,3 +33,14 @@ scripts/  # 构建与发布脚本
 
 - 项目基础目录与代码骨架已完成初始化。
 - Cursor 项目规则位于 `.cursor/rules/`。
+
+## 社区协作
+
+- 提交规范见 `CONTRIBUTING.md`
+- 安全报告见 `SECURITY.md`
+- 行为规范见 `CODE_OF_CONDUCT.md`
+- CI 工作流见 `.github/workflows/ci.yml`
+
+## 许可证
+
+本项目使用 `MIT` 许可证，详见 `LICENSE`。
