@@ -44,3 +44,25 @@ scripts/  # 构建与发布脚本
 ## 许可证
 
 本项目使用 `MIT` 许可证，详见 `LICENSE`。
+
+## GitHub 编译 sing-box 三端库
+
+- 工作流：`.github/workflows/sb-libs-release.yml`
+- 产物：
+  - `wateray-core-windows-amd64.zip`（`wateray_core.dll` + `wateray_core.h`）
+  - `wateray-core-android-so.zip`（Android `libbox.so` + AAR）
+  - `wateray-core-ios-xcframework.zip`（`Libbox.xcframework`）
+
+### 触发方式
+
+- 方式 1：推送标签（自动触发）
+  - `git tag sb-libs-v0.1.0`
+  - `git push origin sb-libs-v0.1.0`
+- 方式 2：在 GitHub Actions 页面手动运行 `Build sing-box Libraries`
+  - 可指定 `sing_box_ref`（例如 `dev-next` 或某个 tag）
+
+### 下载到本地
+
+- 私有仓库请先设置 `GITHUB_TOKEN`
+- 执行：
+  - `pwsh ./scripts/build/download-sb-libs.ps1 -Tag sb-libs-v0.1.0`

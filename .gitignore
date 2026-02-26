@@ -18,6 +18,7 @@ app/**/.DS_Store
 # Go
 core/bin/
 core/dist/
+core/prebuilt/
 core/*.exe
 core/*.dll
 core/*.so

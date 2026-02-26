@@ -1,21 +1,57 @@
 package ffi
 
-/*
-#include <stdint.h>
-*/
-import "C"
+import (
+	"encoding/json"
+	"sync"
+)
 
-// StartCore starts core runtime with JSON config payload.
-//
-//export StartCore
-func StartCore(configJSON *C.char) C.int {
-	_ = configJSON
-	return 0
+const (
+	ErrOK            int32 = 0
+	ErrInvalidConfig int32 = 1
+)
+
+var (
+	runtimeMu  sync.Mutex
+	running    bool
+	lastConfig string
+)
+
+// StartCore validates config and starts runtime state.
+func StartCore(configJSON string) int32 {
+	if !json.Valid([]byte(configJSON)) {
+		return ErrInvalidConfig
+	}
+	runtimeMu.Lock()
+	defer runtimeMu.Unlock()
+	running = true
+	lastConfig = configJSON
+	return ErrOK
 }
 
-// StopCore stops core runtime safely.
-//
-//export StopCore
-func StopCore() C.int {
-	return 0
+// ReloadCore validates config and applies runtime hot-reload state.
+func ReloadCore(configJSON string) int32 {
+	if !json.Valid([]byte(configJSON)) {
+		return ErrInvalidConfig
+	}
+	runtimeMu.Lock()
+	defer runtimeMu.Unlock()
+	if !running {
+		return ErrInvalidConfig
+	}
+	lastConfig = configJSON
+	return ErrOK
+}
+
+// StopCore stops runtime state.
+func StopCore() int32 {
+	runtimeMu.Lock()
+	defer runtimeMu.Unlock()
+	running = false
+	lastConfig = ""
+	return ErrOK
+}
+
+// CoreVersion returns linked sing-box version string.
+func CoreVersion() string {
+	return singBoxVersion()
 }
