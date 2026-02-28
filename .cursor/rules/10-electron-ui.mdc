@@ -1,0 +1,22 @@
+---
+description: Electron frontend implementation conventions for wateray
+globs: ElectronApp/src/renderer/src/**/*.{ts,tsx}
+alwaysApply: false
+---
+
+# Electron UI Rules
+
+- Keep renderer code inside `ElectronApp/src/renderer/src/` with feature-first structure: layout/router modules, `pages/`, `components/`, `hooks/`, `services/`.
+- Keep frontend as console-only: no runtime authority logic in React components, hooks, or local stores.
+- Route runtime operations through typed service abstractions (`services/daemonApi.ts`) and IPC bridge; do not call core internals directly.
+- Keep interactions asynchronous and resilient; surface daemon errors with clear user feedback.
+- Keep platform-only capabilities behind preload IPC APIs; do not enable unsafe Node integration in renderer.
+- Keep page logic split by concern; avoid dumping multiple pages or feature flows into one file.
+- Persist only UI preferences in frontend; runtime config/state belongs to core daemon.
+
+## Example
+
+```ts
+// BAD: parse subscription payload and mutate runtime state in React component
+// GOOD: call daemon API -> core handles parsing/persistence -> component renders returned snapshot
+```

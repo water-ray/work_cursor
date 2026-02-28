@@ -1,0 +1,25 @@
+---
+description: Mandatory runtime boundary between Electron UI and Go daemon
+alwaysApply: true
+---
+
+# Runtime Framework (Mandatory)
+
+- Treat `ElectronApp/` as frontend control console only; do not place VPN engine logic in renderer/main process business code.
+- Treat `core/cmd/waterayd` as long-running backend daemon/service that stays alive after UI exits.
+- Route all runtime mutations through control-plane APIs (IPC/HTTP); UI sends command requests and renders returned snapshots.
+- Keep core as source of truth for subscriptions, groups, rules, selected group/node, connection stage, traffic stats, and runtime config.
+- Limit frontend persistence to UI preferences only (locale/theme/window state/table-layout preferences).
+- Keep control schema evolution backward-compatible; additive changes must not break older UI clients.
+- Platform runtime shape:
+  - Windows/macOS/Linux: daemon or system service.
+  - Android: `VpnService` + foreground service.
+  - iOS: Network Extension (`Packet Tunnel`) runtime.
+- If a feature crosses runtime boundaries, fix architecture first, then implement feature behavior.
+
+## Example
+
+```text
+BAD: Electron renderer parses subscriptions and writes runtime routing state as authoritative source.
+GOOD: Electron sends import/apply request -> core parses/persists -> renderer only displays state snapshot.
+```

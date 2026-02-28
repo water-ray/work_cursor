@@ -1,9 +1,7 @@
 param(
   [string]$WindowsLibTag = "",
 
-  [string]$Repository = "water-ray/wateray",
-
-  [switch]$InitFlutterWindowsRunner
+  [string]$Repository = "water-ray/wateray"
 )
 
 Set-StrictMode -Version Latest
@@ -24,17 +22,17 @@ if (-not (Test-Command -Name "go")) {
   throw "go is required. Install Go 1.24+ first."
 }
 
-go version
-
-$flutterReady = Test-Command -Name "flutter"
-if (-not $flutterReady) {
-  Write-Warning "flutter not found. Install Flutter SDK and add it to PATH."
-  Write-Host "Suggested: winget install Flutter.Flutter"
-} else {
-  flutter --version
-  flutter config --enable-windows-desktop
-  flutter doctor -v
+if (-not (Test-Command -Name "node")) {
+  throw "node is required. Install Node.js 20+ first."
 }
+
+if (-not (Test-Command -Name "npm")) {
+  throw "npm is required. Install npm first."
+}
+
+go version
+node --version
+npm --version
 
 if (-not [string]::IsNullOrWhiteSpace($WindowsLibTag)) {
   $downloadScript = Join-Path $PSScriptRoot "..\build\download-sb-windows.ps1"
@@ -43,22 +41,21 @@ if (-not [string]::IsNullOrWhiteSpace($WindowsLibTag)) {
 }
 
 $projectRoot = Resolve-Path (Join-Path $PSScriptRoot "..\..")
-$appDir = Join-Path $projectRoot "app"
+$electronDir = Join-Path $projectRoot "ElectronApp"
 
-if ($flutterReady -and (Test-Path $appDir)) {
-  Push-Location $appDir
+if (Test-Path $electronDir) {
+  Push-Location $electronDir
   try {
-    if ($InitFlutterWindowsRunner -and -not (Test-Path (Join-Path $appDir "windows"))) {
-      flutter create --platforms=windows .
-    }
-    flutter pub get
+    npm install
   } finally {
     Pop-Location
   }
+} else {
+  Write-Warning "ElectronApp directory not found. Skip npm install."
 }
 
 Write-Host "=== Setup done ==="
 Write-Host "Next:"
 Write-Host "1) Verify DLL and header under core/prebuilt/windows"
-Write-Host "2) Wire FFI dynamic loading in app"
-Write-Host "3) Run a minimal Windows lifecycle integration test"
+Write-Host "2) Start core daemon: cd core && go run -tags with_clash_api,with_gvisor ./cmd/waterayd"
+Write-Host "3) Start Electron frontend: cd ElectronApp && npm run dev"

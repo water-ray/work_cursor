@@ -1,0 +1,20 @@
+---
+description: Remove obsolete code during feature changes
+alwaysApply: true
+---
+
+# Obsolete Code Cleanup (Mandatory)
+
+- When implementing or refactoring features, remove replaced or unused code paths immediately.
+- Do not keep legacy UI flows, dead handlers, deprecated state fields, or temporary fallback branches unless explicitly required.
+- If old logic is still needed for compatibility, document the reason in the same change.
+- Keep i18n keys, API payload fields, and menu items aligned with active behavior; delete orphaned entries.
+- Keep token/schema renames clean: remove deprecated alias fields after call sites are migrated.
+- Prefer clear deletion over commented-out code.
+
+## Example
+
+```text
+BAD: Keep old right-click menu code after adding a new menu implementation.
+GOOD: Remove old menu trigger/handler and keep only one active path.
+```

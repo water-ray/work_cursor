@@ -1,0 +1,21 @@
+---
+description: Electron UI token naming and style organization conventions
+globs: ElectronApp/src/renderer/src/**/*.{ts,tsx,css}
+alwaysApply: false
+---
+
+# Electron UI Tokens Convention
+
+- Keep design tokens centralized in dedicated files (for example `styles/tokens.css` or `theme/tokens.ts`); avoid scattered per-page constants.
+- Use explicit semantic token names; avoid ambiguous abbreviations like `sm1`, `color2`, `gapA`.
+- Group tokens by concern (spacing, radius, color, typography, z-index, motion) and keep each file focused on one concern.
+- Prefer CSS variables or typed theme objects for shared values; avoid hard-coded values repeated in JSX.
+- Keep component-specific overrides near component files, but source values from shared tokens.
+- Remove legacy token aliases after call sites are migrated; do not leave stale fallback names.
+
+## Example
+
+```text
+BAD: margin: 13px; border-radius: 7px repeated in multiple pages.
+GOOD: use shared tokens like --spacing-small and --radius-card across components.
+```

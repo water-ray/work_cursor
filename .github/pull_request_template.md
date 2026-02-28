@@ -13,8 +13,8 @@
 
 ## Test plan
 
-- [ ] `flutter analyze` in `app/`
-- [ ] `flutter test` in `app/`
+- [ ] `npm run typecheck` in `ElectronApp/`
+- [ ] `npm run build` in `ElectronApp/`
 - [ ] `go test ./...` in `core/`
 - [ ] Manual verification completed
 

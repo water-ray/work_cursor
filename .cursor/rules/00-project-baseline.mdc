@@ -1,19 +1,21 @@
 ---
-description: Wateray global architecture and runtime constraints
+description: Wateray global boundaries and engineering baseline
 alwaysApply: true
 ---
 
-# Wateray Baseline
+# Wateray Baseline (Mandatory)
 
-- Keep module boundaries: UI in `app/`, engine in `core/`, automation in `scripts/`.
-- Keep TUN adapter persistent during node switches. Update outbound through hot reload APIs.
-- Run core engine asynchronously and expose non-blocking FFI APIs to UI.
-- Load user-facing strings from external JSON under `app/assets/i18n/`.
-- Changes touching tunnel or routing must include verification steps.
+- Keep module boundaries explicit: UI in `ElectronApp/`, runtime engine in `core/`, automation in `scripts/`, docs in `docs/`.
+- Keep process boundaries explicit: `ElectronApp/` is frontend console; `core/cmd/waterayd` is backend daemon.
+- Keep core daemon as the runtime authority for subscriptions, groups, routing, connection stage, stats, and runtime config.
+- Keep UI independent from core lifetime: closing UI must not stop backend runtime.
+- Keep user-facing text centralized in frontend locale/resources; avoid scattered hard-coded product text.
+- Keep tunnel/routing related changes verifiable; include runnable verification steps in the same change.
+- If rules conflict, prioritize architecture/runtime boundary rules first, then language/framework-specific rules.
 
 ## Example
 
 ```text
-BAD: stop core -> destroy tun -> recreate tun on each node switch
-GOOD: keep tun alive -> hot reload outbound -> continue traffic accounting
+BAD: Move subscription parsing and runtime decisions into React page handlers.
+GOOD: Keep runtime logic in core; Electron frontend only sends commands and renders snapshots.
 ```

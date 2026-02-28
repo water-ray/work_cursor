@@ -1,0 +1,35 @@
+---
+description: Enforce latest sing-box config fields in core runtime generator
+globs: core/internal/control/**/*.go
+alwaysApply: false
+---
+
+# sing-box Latest Config Only
+
+- Generate runtime config using current sing-box syntax; do not reintroduce deprecated fields.
+- For DNS server entries, use typed format (`type` + `server`) instead of legacy `address`.
+- Do not use top-level `dns.fakeip`; use DNS server type `fakeip` in `dns.servers`.
+- Do not use route rule fields `geoip`/`geosite`; convert them to `rule_set` references.
+- Do not use route rule `rule_set_ipcidr_match_source`; use `rule_set_ip_cidr_match_source` when needed.
+- Prefer rule actions for DNS interception (`action: hijack-dns`) instead of legacy DNS outbound wiring.
+- Keep node/domain resolution on `domain_resolver` / `default_domain_resolver`; do not add deprecated DNS routing shortcuts.
+- For Wateray Rule V2, compile `baseRules -> composedRules (ordered)` into final `route.rules`; do not bypass this resolver path.
+- `applyMode` (`proxy` / `direct`) only flips reversible rules (`actionMode=inherit`); fixed actions (`reject`, fixed `direct`) must stay unchanged.
+
+## Migration Examples
+
+```json
+// BAD
+{ "dns": { "servers": [{ "tag": "remote", "address": "https://1.1.1.1/dns-query" }] } }
+
+// GOOD
+{ "dns": { "servers": [{ "type": "https", "tag": "remote", "server": "1.1.1.1" }] } }
+```
+
+```json
+// BAD
+{ "route": { "rules": [{ "geosite": ["cn"], "outbound": "direct" }] } }
+
+// GOOD
+{ "route": { "rules": [{ "rule_set": ["geosite-cn"], "action": "route", "outbound": "direct" }] } }
+```

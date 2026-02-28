@@ -6,15 +6,6 @@ Thumbs.db
 .idea/
 *.iml
 
-# Flutter / Dart
-app/.dart_tool/
-app/.packages
-app/build/
-app/.flutter-plugins
-app/.flutter-plugins-dependencies
-app/.metadata
-app/**/.DS_Store
-
 # Go
 core/bin/
 core/dist/
@@ -25,3 +16,8 @@ core/*.so
 core/*.dylib
 core/*.test
 core/coverage.out
+
+# Electron / Node
+ElectronApp/node_modules/
+ElectronApp/out/
+ElectronApp/.electron-vite/

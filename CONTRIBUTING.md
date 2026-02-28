@@ -26,11 +26,11 @@ Prefer conventional commits:
 
 ## Validation before opening PR
 
-From `app/`:
+From `ElectronApp/`:
 
-- `flutter pub get`
-- `flutter analyze`
-- `flutter test`
+- `npm install`
+- `npm run typecheck`
+- `npm run build`
 
 From `core/`:
 
