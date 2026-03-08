@@ -1,22 +1,35 @@
 ---
-description: Electron frontend implementation conventions for wateray
-globs: ElectronApp/src/renderer/src/**/*.{ts,tsx}
+description: Renderer UI conventions (framework, draft, notice, icons, tokens)
+globs: ElectronApp/src/renderer/src/**/*.{ts,tsx,css}
 alwaysApply: false
 ---
 
-# Electron UI Rules
+# Renderer UI Conventions
 
-- Keep renderer code inside `ElectronApp/src/renderer/src/` with feature-first structure: layout/router modules, `pages/`, `components/`, `hooks/`, `services/`.
-- Keep frontend as console-only: no runtime authority logic in React components, hooks, or local stores.
-- Route runtime operations through typed service abstractions (`services/daemonApi.ts`) and IPC bridge; do not call core internals directly.
-- Keep interactions asynchronous and resilient; surface daemon errors with clear user feedback.
-- Keep platform-only capabilities behind preload IPC APIs; do not enable unsafe Node integration in renderer.
-- Keep page logic split by concern; avoid dumping multiple pages or feature flows into one file.
-- Persist only UI preferences in frontend; runtime config/state belongs to core daemon.
+- Use `React + Ant Design` as the default renderer stack, and prefer framework components before custom widgets.
+- Route runtime operations through typed services (`services/daemonApi.ts`) and preload IPC APIs; do not call core internals directly.
+- Keep interactions asynchronous and resilient; surface daemon errors with clear, user-facing feedback.
+- Keep page logic split by concern (`pages/`, `components/`, `hooks/`, `services/`); avoid oversized multi-flow files.
+- Use shared draft/notice patterns:
+  - Draft toolbar + navigation lock: `DraftActionBar` + `useDraftNavLock`.
+  - Operation notifications: `useAppNotice`.
+  - Draft result notifications: `useDraftNotice`.
+- Draft submit default is persist-only (`daemonApi.setSettings({ applyRuntime: false })`) unless runtime apply is explicitly required.
+- Renderer code must not directly call Ant Design `message.success/error/warning/info`.
+- Switch layout convention:
+  - Forms/detail rows: left switch + right label (prefer `SwitchWithLabel`), help icon on label right.
+  - Table cells: switch only, no repeated label text.
+- Help tooltip convention:
+  - Reuse shared `HelpLabel` / `SwitchWithLabel.helpContent`; do not build page-local `Popover + question-circle` helpers.
+  - Help copy follows structured sections: default `使用场景 / 作用 / 注意` and optional `推荐`; when label meaning is already explicit, allow concise `作用 / 推荐`.
+  - Use component-managed line breaks (`\n` or structured sections), and keep help icon on the label's right side.
+- Renderer icon source is `bootstrap-icons` via shared `BiIcon`; do not import `@ant-design/icons`.
+- Keep style values tokenized/centralized; avoid repeated hard-coded spacing/radius/colors in JSX/CSS.
+- Keep window chrome behavior (title bar/minimize/maximize/close) in dedicated components + IPC utilities.
 
 ## Example
 
-```ts
-// BAD: parse subscription payload and mutate runtime state in React component
-// GOOD: call daemon API -> core handles parsing/persistence -> component renders returned snapshot
+```text
+BAD: page imports `antd/message` and builds local draft toast branches.
+GOOD: page uses `useAppNotice` / `useDraftNotice` and shared draft hooks.
 ```

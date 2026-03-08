@@ -3,19 +3,51 @@
     {
       "path": ".",
       "name": "root"
-    },
-    {
-      "path": "core",
-      "name": "内核"
-    },
-    {
-      "path": "ElectronApp",
-      "name": "前端"
     }
-    
   ],
  "settings": {
     "git.enabled": true,
-    "taskManager.exclude": "^(?:包|安装|工作流|测试|清理|清理重新生成|生成|配置|(?:build|test|Build|Test) (?:package|workspace|Workspace))(?: - .*)?$"
+    "taskManager.exclude": "^(?:包|安装|工作流|测试|清理|清理重新生成|生成|配置|(?:build|test|Build|Test) (?:package|workspace|Workspace))(?: - .*)?$",
+    // 1. 防止 VS Code 监控这些目录的文件变动（解决占用的核心）
+    "files.watcherExclude": {
+      "**/Bin/**": true,
+      "**/core/bin/**": true,
+      "**/core/dist/**": true,
+      "**/core/prebuilt/**": true,
+      "**/core/cache.db": true,
+      "**/docs/build/**": true,
+      "**/scripts/build/__pycache__/**": true,
+      "**/ElectronApp/.electron-vite/**": true,
+      "**/ElectronApp/out/**": true,
+      "**/ElectronApp/out-package/**": true,
+      "**/node_modules/**": true
+    },
+    // 2. 从搜索结果中排除（减少磁盘 IO 和索引压力）
+    "search.exclude": {
+      "**/Bin/**": true,
+      "**/core/bin/**": true,
+      "**/core/dist/**": true,
+      "**/core/prebuilt/**": true,
+      "**/core/cache.db": true,
+      "**/docs/build/**": true,
+      "**/scripts/build/__pycache__/**": true,
+      "**/ElectronApp/.electron-vite/**": true,
+      "**/ElectronApp/out/**": true,
+      "**/ElectronApp/out-package/**": true,
+      "**/node_modules/**": true
+    },
+    // 3. 在左侧资源管理器中隐藏这些目录（可选，界面更清爽）
+    "files.exclude": {
+      "**/Bin/**": true,
+      "**/core/bin/**": true,
+      "**/core/dist/**": true,
+      "**/core/prebuilt/**": true,
+      "**/docs/build/**": true,
+      "**/scripts/build/__pycache__/**": true,
+      "**/ElectronApp/.electron-vite/**": true,
+      "**/ElectronApp/out/**": true,
+      "**/ElectronApp/out-package/**": true,
+      "**/node_modules/**": true
+    }
   }
 }

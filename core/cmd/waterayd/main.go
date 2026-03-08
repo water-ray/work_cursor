@@ -9,6 +9,9 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"regexp"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
@@ -18,13 +21,42 @@ import (
 	"wateray/core/internal/control"
 )
 
+const defaultUnifiedVersion = "0.1.0"
+
+var (
+	appVersion          string
+	strictSemVerPattern = regexp.MustCompile(`^\d+\.\d+\.\d+$`)
+)
+
 func main() {
 	const addr = "127.0.0.1:39080"
+
+	lock, err := acquireDaemonInstanceLock()
+	if err != nil {
+		if errors.Is(err, errDaemonAlreadyRunning) {
+			log.Println("waterayd daemon already running, skip duplicate start")
+			return
+		}
+		log.Fatalf("waterayd acquire instance lock failed: %v", err)
+	}
+	defer func() {
+		if releaseErr := lock.release(); releaseErr != nil {
+			log.Printf("waterayd release instance lock failed: %v", releaseErr)
+		}
+	}()
+
 	runtimeLabel := "waterayd:http://" + addr
-	store := control.NewRuntimeStore(runtimeLabel, "daemon")
+	store := control.NewRuntimeStore(runtimeLabel, resolveCoreVersion())
+	shutdownRequestCh := make(chan string, 1)
+	requestShutdown := func(reason string) {
+		select {
+		case shutdownRequestCh <- reason:
+		default:
+		}
+	}
 
 	mux := http.NewServeMux()
-	registerHandlers(mux, store)
+	registerHandlers(mux, store, requestShutdown)
 
 	server := &http.Server{
 		Addr:              addr,
@@ -40,9 +72,19 @@ func main() {
 	}()
 
 	// Daemon mode: keep runtime alive independently of UI process lifecycle.
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
-	<-stop
+	stopSignal := make(chan os.Signal, 1)
+	signal.Notify(stopSignal, syscall.SIGINT, syscall.SIGTERM)
+	shutdownReason := "signal"
+	select {
+	case <-stopSignal:
+	case reason := <-shutdownRequestCh:
+		if strings.TrimSpace(reason) != "" {
+			shutdownReason = reason
+		}
+	}
+	if shutdownReason != "signal" {
+		log.Printf("waterayd daemon shutdown requested: %s", shutdownReason)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -50,7 +92,71 @@ func main() {
 	log.Println("waterayd daemon stopped")
 }
 
-func registerHandlers(mux *http.ServeMux, store *control.RuntimeStore) {
+func resolveCoreVersion() string {
+	if version, ok := normalizeSemVerVersion(appVersion); ok {
+		return version
+	}
+	buildInfo, ok := debug.ReadBuildInfo()
+	if ok && buildInfo != nil {
+		if version, versionOK := normalizeSemVerVersion(buildInfo.Main.Version); versionOK {
+			return version
+		}
+	}
+	if version, ok := resolveCoreVersionFromFile(); ok {
+		return version
+	}
+	return defaultUnifiedVersion
+}
+
+func normalizeSemVerVersion(raw string) (string, bool) {
+	value := strings.TrimSpace(raw)
+	value = strings.TrimPrefix(value, "v")
+	if strictSemVerPattern.MatchString(value) {
+		return value, true
+	}
+	return "", false
+}
+
+func resolveCoreVersionFromFile() (string, bool) {
+	candidates := []string{
+		"VERSION",
+		filepath.Join("..", "VERSION"),
+		filepath.Join("..", "..", "VERSION"),
+	}
+	if executablePath, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(executablePath)
+		candidates = append(candidates,
+			filepath.Join(exeDir, "VERSION"),
+			filepath.Join(exeDir, "..", "VERSION"),
+			filepath.Join(exeDir, "..", "..", "VERSION"),
+		)
+	}
+	visited := map[string]struct{}{}
+	for _, candidate := range candidates {
+		absolutePath, err := filepath.Abs(candidate)
+		if err != nil {
+			continue
+		}
+		if _, exists := visited[absolutePath]; exists {
+			continue
+		}
+		visited[absolutePath] = struct{}{}
+		raw, readErr := os.ReadFile(absolutePath)
+		if readErr != nil {
+			continue
+		}
+		if version, ok := normalizeSemVerVersion(string(raw)); ok {
+			return version, true
+		}
+	}
+	return "", false
+}
+
+func registerHandlers(
+	mux *http.ServeMux,
+	store *control.RuntimeStore,
+	requestShutdown func(reason string),
+) {
 	mux.HandleFunc("/v1/events/ws", func(w http.ResponseWriter, r *http.Request) {
 		if !allowMethod(w, r, http.MethodGet) {
 			return
@@ -201,10 +307,78 @@ func registerHandlers(mux *http.ServeMux, store *control.RuntimeStore) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		snapshot, err := store.ProbeNodes(r.Context(), req)
+		snapshot, summary, err := store.ProbeNodes(r.Context(), req)
 		logCoreAction(
 			store,
 			fmt.Sprintf("probe nodes group=%s count=%d", req.GroupID, len(req.NodeIDs)),
+			err,
+		)
+		writeProbeNodesResult(w, snapshot, summary, err)
+	})
+
+	mux.HandleFunc("/v1/tasks/background", func(w http.ResponseWriter, r *http.Request) {
+		if !allowMethod(w, r, http.MethodDelete) {
+			return
+		}
+		taskID := strings.TrimSpace(r.URL.Query().Get("taskId"))
+		snapshot, err := store.RemoveBackgroundTask(r.Context(), taskID)
+		logCoreAction(
+			store,
+			fmt.Sprintf("remove background task id=%s", taskID),
+			err,
+		)
+		writeResult(w, snapshot, err)
+	})
+
+	mux.HandleFunc("/v1/nodes/probe/clear", func(w http.ResponseWriter, r *http.Request) {
+		if !allowMethod(w, r, http.MethodPost) {
+			return
+		}
+		var req control.ClearProbeDataRequest
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		snapshot, err := store.ClearProbeData(r.Context(), req)
+		logCoreAction(
+			store,
+			fmt.Sprintf("clear probe data group=%s count=%d", req.GroupID, len(req.NodeIDs)),
+			err,
+		)
+		writeResult(w, snapshot, err)
+	})
+
+	mux.HandleFunc("/v1/nodes/traffic/reset", func(w http.ResponseWriter, r *http.Request) {
+		if !allowMethod(w, r, http.MethodPost) {
+			return
+		}
+		var req control.ResetTrafficStatsRequest
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		snapshot, err := store.ResetTrafficStats(r.Context(), req)
+		logCoreAction(
+			store,
+			fmt.Sprintf("reset traffic stats group=%s count=%d", req.GroupID, len(req.NodeIDs)),
+			err,
+		)
+		writeResult(w, snapshot, err)
+	})
+
+	mux.HandleFunc("/v1/nodes/country/update", func(w http.ResponseWriter, r *http.Request) {
+		if !allowMethod(w, r, http.MethodPost) {
+			return
+		}
+		var req control.UpdateNodeCountriesRequest
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		snapshot, err := store.UpdateNodeCountries(r.Context(), req)
+		logCoreAction(
+			store,
+			fmt.Sprintf("update node countries count=%d", len(req.NodeIDs)),
 			err,
 		)
 		writeResult(w, snapshot, err)
@@ -235,6 +409,42 @@ func registerHandlers(mux *http.ServeMux, store *control.RuntimeStore) {
 		logCoreAction(
 			store,
 			fmt.Sprintf("add manual node group=%s name=%s", req.GroupID, req.Name),
+			err,
+		)
+		writeResult(w, snapshot, err)
+	})
+
+	mux.HandleFunc("/v1/nodes/manual/update", func(w http.ResponseWriter, r *http.Request) {
+		if !allowMethod(w, r, http.MethodPost) {
+			return
+		}
+		var req control.UpdateManualNodeRequest
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		snapshot, err := store.UpdateManualNode(r.Context(), req)
+		logCoreAction(
+			store,
+			fmt.Sprintf("update manual node group=%s node=%s", req.GroupID, req.NodeID),
+			err,
+		)
+		writeResult(w, snapshot, err)
+	})
+
+	mux.HandleFunc("/v1/nodes/manual/import-text", func(w http.ResponseWriter, r *http.Request) {
+		if !allowMethod(w, r, http.MethodPost) {
+			return
+		}
+		var req control.ImportManualNodesTextRequest
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		snapshot, err := store.ImportManualNodesText(r.Context(), req)
+		logCoreAction(
+			store,
+			fmt.Sprintf("import manual nodes from text group=%s bytes=%d", req.GroupID, len(strings.TrimSpace(req.Content))),
 			err,
 		)
 		writeResult(w, snapshot, err)
@@ -313,13 +523,46 @@ func registerHandlers(mux *http.ServeMux, store *control.RuntimeStore) {
 		writeResult(w, snapshot, err)
 	})
 
-	mux.HandleFunc("/v1/rules/reload", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1/rulesets/status", func(w http.ResponseWriter, r *http.Request) {
 		if !allowMethod(w, r, http.MethodPost) {
 			return
 		}
-		snapshot, err := store.HotReloadRules(r.Context())
-		logCoreAction(store, "hot reload rules", err)
-		writeResult(w, snapshot, err)
+		var req control.QueryBuiltInRuleSetsStatusRequest
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		snapshot, statuses, err := store.QueryBuiltInRuleSetsStatus(r.Context(), req)
+		logCoreAction(
+			store,
+			fmt.Sprintf("query built-in rule-sets status geoip=%d geosite=%d", len(req.GeoIP), len(req.GeoSite)),
+			err,
+		)
+		writeRuleSetStatusResult(w, snapshot, statuses, err)
+	})
+
+	mux.HandleFunc("/v1/rulesets/update", func(w http.ResponseWriter, r *http.Request) {
+		if !allowMethod(w, r, http.MethodPost) {
+			return
+		}
+		var req control.UpdateBuiltInRuleSetsRequest
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		snapshot, summary, err := store.UpdateBuiltInRuleSets(r.Context(), req)
+		logCoreAction(
+			store,
+			fmt.Sprintf(
+				"update built-in rule-sets mode=%s requested=%d success=%d failed=%d",
+				req.DownloadMode,
+				summary.Requested,
+				summary.Success,
+				summary.Failed,
+			),
+			err,
+		)
+		writeRuleSetUpdateResult(w, snapshot, summary, err)
 	})
 
 	mux.HandleFunc("/v1/rules/profiles", func(w http.ResponseWriter, r *http.Request) {
@@ -384,6 +627,89 @@ func registerHandlers(mux *http.ServeMux, store *control.RuntimeStore) {
 		writeResult(w, snapshot, err)
 	})
 
+	mux.HandleFunc("/v1/dns/health", func(w http.ResponseWriter, r *http.Request) {
+		if !allowMethod(w, r, http.MethodPost) {
+			return
+		}
+		var req control.DNSHealthCheckRequest
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		snapshot, report, err := store.CheckDNSHealth(r.Context(), req)
+		logCoreAction(store, "check dns health", err)
+		writeDNSHealthResult(w, snapshot, report, err)
+	})
+
+	mux.HandleFunc("/v1/system/loopback/exempt", func(w http.ResponseWriter, r *http.Request) {
+		if !allowMethod(w, r, http.MethodPost) {
+			return
+		}
+		snapshot, result, err := store.ExemptWindowsLoopback(r.Context())
+		logCoreAction(store, "exempt windows loopback", err)
+		writeLoopbackExemptResult(w, snapshot, result, err)
+	})
+
+	mux.HandleFunc("/v1/system/shutdown", func(w http.ResponseWriter, r *http.Request) {
+		if !allowMethod(w, r, http.MethodPost) {
+			return
+		}
+		snapshot, stopErr := store.Stop(r.Context())
+		if stopErr != nil {
+			store.LogCore(
+				control.LogLevelWarn,
+				fmt.Sprintf("stop proxy before daemon shutdown failed: %v", stopErr),
+			)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":       true,
+			"snapshot": snapshot,
+		})
+		if requestShutdown != nil {
+			go func() {
+				time.Sleep(150 * time.Millisecond)
+				requestShutdown("api:/v1/system/shutdown")
+			}()
+		}
+	})
+
+	mux.HandleFunc("/v1/session/heartbeat", func(w http.ResponseWriter, r *http.Request) {
+		if !allowMethod(w, r, http.MethodPost) {
+			return
+		}
+		var req struct {
+			SessionID string `json:"sessionId"`
+			TTLSec    int    `json:"ttlSec,omitempty"`
+		}
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		activeSessions := store.TouchClientSession(req.SessionID, req.TTLSec)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":             true,
+			"activeSessions": activeSessions,
+		})
+	})
+
+	mux.HandleFunc("/v1/session/disconnect", func(w http.ResponseWriter, r *http.Request) {
+		if !allowMethod(w, r, http.MethodPost) {
+			return
+		}
+		var req struct {
+			SessionID string `json:"sessionId"`
+		}
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		activeSessions := store.DisconnectClientSession(req.SessionID)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":             true,
+			"activeSessions": activeSessions,
+		})
+	})
+
 	mux.HandleFunc("/v1/logs/ui", func(w http.ResponseWriter, r *http.Request) {
 		if !allowMethod(w, r, http.MethodPost) {
 			return
@@ -440,12 +766,99 @@ func registerHandlers(mux *http.ServeMux, store *control.RuntimeStore) {
 		})
 	})
 
+	mux.HandleFunc("/v1/config/catalog", func(w http.ResponseWriter, r *http.Request) {
+		if !allowMethod(w, r, http.MethodGet) {
+			return
+		}
+		catalog, err := store.ListConfigCatalog(r.Context())
+		logCoreAction(store, "list config catalog", err)
+		writeConfigCatalogResult(w, catalog, err)
+	})
+
+	mux.HandleFunc("/v1/config/backup/create", func(w http.ResponseWriter, r *http.Request) {
+		if !allowMethod(w, r, http.MethodPost) {
+			return
+		}
+		var req control.CreateConfigBackupRequest
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		entry, err := store.CreateConfigBackup(r.Context(), req)
+		logCoreAction(
+			store,
+			fmt.Sprintf("create config backup file=%s include_subscriptions=%t", req.FileName, req.IncludeSubscriptionGroups),
+			err,
+		)
+		writeConfigEntryResult(w, entry, err)
+	})
+
+	mux.HandleFunc("/v1/config/restore", func(w http.ResponseWriter, r *http.Request) {
+		if !allowMethod(w, r, http.MethodPost) {
+			return
+		}
+		var req control.RestoreConfigRequest
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		snapshot, summary, err := store.RestoreConfig(r.Context(), req)
+		logCoreAction(store, fmt.Sprintf("restore config entry=%s", req.EntryID), err)
+		writeConfigImportResult(w, snapshot, summary, err)
+	})
+
+	mux.HandleFunc("/v1/config/export/content", func(w http.ResponseWriter, r *http.Request) {
+		if !allowMethod(w, r, http.MethodPost) {
+			return
+		}
+		var req control.ExportConfigContentRequest
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		result, err := store.ExportConfigContent(r.Context(), req)
+		logCoreAction(store, fmt.Sprintf("export config content entry=%s", req.EntryID), err)
+		writeConfigExportContentResult(w, result, err)
+	})
+
+	mux.HandleFunc("/v1/config/import/content", func(w http.ResponseWriter, r *http.Request) {
+		if !allowMethod(w, r, http.MethodPost) {
+			return
+		}
+		var req control.ImportConfigContentRequest
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		snapshot, summary, err := store.ImportConfigContent(r.Context(), req)
+		logCoreAction(store, "import config content", err)
+		writeConfigImportResult(w, snapshot, summary, err)
+	})
+
 	mux.HandleFunc("/v1/connection/start", func(w http.ResponseWriter, r *http.Request) {
 		if !allowMethod(w, r, http.MethodPost) {
 			return
 		}
 		snapshot, err := store.Start(r.Context())
 		logCoreAction(store, "start connection", err)
+		writeResult(w, snapshot, err)
+	})
+
+	mux.HandleFunc("/v1/connection/start/precheck", func(w http.ResponseWriter, r *http.Request) {
+		if !allowMethod(w, r, http.MethodPost) {
+			return
+		}
+		snapshot, precheck, err := store.CheckStartPreconditions(r.Context())
+		logCoreAction(store, "check start preconditions", err)
+		writeStartPrecheckResult(w, snapshot, precheck, err)
+	})
+
+	mux.HandleFunc("/v1/connection/restart", func(w http.ResponseWriter, r *http.Request) {
+		if !allowMethod(w, r, http.MethodPost) {
+			return
+		}
+		snapshot, err := store.Restart(r.Context())
+		logCoreAction(store, "restart connection", err)
 		writeResult(w, snapshot, err)
 	})
 
@@ -503,9 +916,211 @@ func writeResult(w http.ResponseWriter, snapshot control.StateSnapshot, err erro
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":       true,
-		"snapshot": snapshot,
+		"ok":        true,
+		"snapshot":  snapshot,
+		"task":      resolveResponseTask(snapshot),
+		"operation": resolveResponseOperation(snapshot),
 	})
+}
+
+func writeProbeNodesResult(
+	w http.ResponseWriter,
+	snapshot control.StateSnapshot,
+	summary control.ProbeNodesSummary,
+	err error,
+) {
+	status := http.StatusOK
+	payload := map[string]any{
+		"ok":           true,
+		"snapshot":     snapshot,
+		"probeSummary": summary,
+		"task":         resolveResponseTask(snapshot),
+		"operation":    resolveResponseOperation(snapshot),
+	}
+	if err != nil {
+		status = http.StatusBadRequest
+		payload["ok"] = false
+		payload["error"] = err.Error()
+	}
+	writeJSON(w, status, payload)
+}
+
+func writeRuleSetUpdateResult(
+	w http.ResponseWriter,
+	snapshot control.StateSnapshot,
+	summary control.RuleSetUpdateSummary,
+	err error,
+) {
+	status := http.StatusOK
+	payload := map[string]any{
+		"ok":            true,
+		"snapshot":      snapshot,
+		"ruleSetUpdate": summary,
+		"task":          resolveResponseTask(snapshot),
+		"operation":     resolveResponseOperation(snapshot),
+	}
+	if err != nil {
+		status = http.StatusBadRequest
+		payload["ok"] = false
+		payload["error"] = err.Error()
+	}
+	writeJSON(w, status, payload)
+}
+
+func writeRuleSetStatusResult(
+	w http.ResponseWriter,
+	snapshot control.StateSnapshot,
+	statuses []control.RuleSetLocalStatus,
+	err error,
+) {
+	status := http.StatusOK
+	payload := map[string]any{
+		"ok":              true,
+		"snapshot":        snapshot,
+		"ruleSetStatuses": statuses,
+	}
+	if err != nil {
+		status = http.StatusBadRequest
+		payload["ok"] = false
+		payload["error"] = err.Error()
+	}
+	writeJSON(w, status, payload)
+}
+
+func writeStartPrecheckResult(
+	w http.ResponseWriter,
+	snapshot control.StateSnapshot,
+	precheck control.StartPrecheckResult,
+	err error,
+) {
+	status := http.StatusOK
+	payload := map[string]any{
+		"ok":            true,
+		"snapshot":      snapshot,
+		"startPrecheck": precheck,
+	}
+	if err != nil {
+		status = http.StatusBadRequest
+		payload["ok"] = false
+		payload["error"] = err.Error()
+	}
+	writeJSON(w, status, payload)
+}
+
+func writeDNSHealthResult(
+	w http.ResponseWriter,
+	snapshot control.StateSnapshot,
+	report control.DNSHealthReport,
+	err error,
+) {
+	status := http.StatusOK
+	payload := map[string]any{
+		"ok":        true,
+		"snapshot":  snapshot,
+		"dnsHealth": report,
+	}
+	if err != nil {
+		status = http.StatusBadRequest
+		payload["ok"] = false
+		payload["error"] = err.Error()
+	}
+	writeJSON(w, status, payload)
+}
+
+func writeLoopbackExemptResult(
+	w http.ResponseWriter,
+	snapshot control.StateSnapshot,
+	result control.LoopbackExemptResult,
+	err error,
+) {
+	status := http.StatusOK
+	payload := map[string]any{
+		"ok":             true,
+		"snapshot":       snapshot,
+		"loopbackExempt": result,
+	}
+	if err != nil {
+		status = http.StatusBadRequest
+		payload["ok"] = false
+		payload["error"] = err.Error()
+	}
+	writeJSON(w, status, payload)
+}
+
+func writeConfigCatalogResult(
+	w http.ResponseWriter,
+	catalog control.ConfigCatalog,
+	err error,
+) {
+	status := http.StatusOK
+	payload := map[string]any{
+		"ok":            true,
+		"configCatalog": catalog,
+	}
+	if err != nil {
+		status = http.StatusBadRequest
+		payload["ok"] = false
+		payload["error"] = err.Error()
+	}
+	writeJSON(w, status, payload)
+}
+
+func writeConfigEntryResult(
+	w http.ResponseWriter,
+	entry control.ConfigCatalogEntry,
+	err error,
+) {
+	status := http.StatusOK
+	payload := map[string]any{
+		"ok":          true,
+		"configEntry": entry,
+	}
+	if err != nil {
+		status = http.StatusBadRequest
+		payload["ok"] = false
+		payload["error"] = err.Error()
+	}
+	writeJSON(w, status, payload)
+}
+
+func writeConfigExportContentResult(
+	w http.ResponseWriter,
+	result control.ExportConfigContentResult,
+	err error,
+) {
+	status := http.StatusOK
+	payload := map[string]any{
+		"ok":            true,
+		"exportContent": result,
+	}
+	if err != nil {
+		status = http.StatusBadRequest
+		payload["ok"] = false
+		payload["error"] = err.Error()
+	}
+	writeJSON(w, status, payload)
+}
+
+func writeConfigImportResult(
+	w http.ResponseWriter,
+	snapshot control.StateSnapshot,
+	summary control.ImportConfigSummary,
+	err error,
+) {
+	status := http.StatusOK
+	payload := map[string]any{
+		"ok":            true,
+		"snapshot":      snapshot,
+		"importSummary": summary,
+		"task":          resolveResponseTask(snapshot),
+		"operation":     resolveResponseOperation(snapshot),
+	}
+	if err != nil {
+		status = http.StatusBadRequest
+		payload["ok"] = false
+		payload["error"] = err.Error()
+	}
+	writeJSON(w, status, payload)
 }
 
 func writeError(w http.ResponseWriter, status int, message string) {
@@ -513,6 +1128,34 @@ func writeError(w http.ResponseWriter, status int, message string) {
 		"ok":    false,
 		"error": message,
 	})
+}
+
+func resolveResponseTask(snapshot control.StateSnapshot) *control.BackgroundTask {
+	if len(snapshot.BackgroundTasks) == 0 {
+		return nil
+	}
+	for _, task := range snapshot.BackgroundTasks {
+		if task.Status == control.BackgroundTaskStatusQueued || task.Status == control.BackgroundTaskStatusRunning {
+			taskCopy := task
+			return &taskCopy
+		}
+	}
+	taskCopy := snapshot.BackgroundTasks[0]
+	return &taskCopy
+}
+
+func resolveResponseOperation(snapshot control.StateSnapshot) *control.OperationStatus {
+	if len(snapshot.Operations) == 0 {
+		return nil
+	}
+	for _, operation := range snapshot.Operations {
+		if operation.Status == control.OperationStatusQueued || operation.Status == control.OperationStatusRunning {
+			operationCopy := operation
+			return &operationCopy
+		}
+	}
+	operationCopy := snapshot.Operations[0]
+	return &operationCopy
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {

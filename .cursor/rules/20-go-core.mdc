@@ -1,5 +1,5 @@
 ---
-description: Go core daemon and control-plane conventions
+description: Go core daemon lifecycle and runtime conventions
 globs: core/**/*.go
 alwaysApply: false
 ---
@@ -7,13 +7,11 @@ alwaysApply: false
 # Go Core Rules
 
 - Keep exported C ABI functions minimal and stable in `core/internal/ffi/`.
-- Keep daemon control-plane contracts explicit and backward-compatible for UI compatibility.
 - Keep runtime lifecycle/state transitions behind explicit boundaries (start/stop and controlled reload/update paths).
 - Keep TUN lifecycle decoupled from outbound switching logic.
 - Use context cancellation and structured error propagation for long-running routines.
 - Avoid importing UI concerns into the core module.
-- Keep core daemon as owner of runtime config persistence and subscription/rule resolution.
-- When generating sing-box runtime config, use latest non-deprecated fields only (see `21-singbox-latest-config.mdc`).
+- Expose real version values in daemon/runtime snapshots; do not leave final placeholders like `daemon` or `unknown`.
 - In Rule V2, treat `baseRules + composedRules` as source of truth for UI editing, and compile/resolve them to `rules` at apply time.
 
 ## Example

@@ -3,6 +3,9 @@ package control
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,27 +24,39 @@ import (
 	"time"
 
 	box "github.com/sagernet/sing-box"
+	"github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/include"
 	singboxlog "github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	singjson "github.com/sagernet/sing/common/json"
+	"golang.org/x/net/dns/dnsmessage"
 )
 
 const (
 	defaultLocalMixedListenAddress  = "127.0.0.1"
 	defaultLocalMixedListenPort     = 1088
 	defaultTunInterfaceName         = "wateray-tun"
+	defaultTunMTU                   = 1420
+	minTunMTU                       = 576
+	maxTunMTU                       = 9000
 	defaultClashAPIController       = "127.0.0.1:39081"
 	bootstrapDNSServerTag           = "bootstrap"
 	localDNSServerTag               = "local-resolver"
+	dnsHostsOverrideServerTag       = "hosts-overrides"
 	proxySelectorTag                = "proxy"
-	defaultDNSRemoteServer          = "https://1.1.1.1/dns-query"
+	proxyURLTestTag                 = "proxy-auto"
+	proxyURLTestProbeURL            = "https://www.gstatic.com/generate_204"
+	proxyURLTestInterval            = "3m"
+	proxyURLTestIdleTimeout         = "30m"
+	proxyURLTestToleranceMS         = 50
+	defaultRuleSetUpdateInterval    = "1d"
+	defaultDNSRemoteServer          = "https://dns.google/dns-query"
 	defaultDNSDirectServer          = "223.5.5.5"
 	defaultDNSBootstrapServer       = defaultDNSDirectServer
-	defaultDNSFakeIPV4Range         = "198.18.0.0/15"
+	defaultDNSFakeIPV4Range         = "10.128.0.0/9"
 	defaultDNSFakeIPV6Range         = "fc00::/18"
 	defaultDNSStrategy              = DNSStrategyPreferIPv4
-	defaultDNSCacheCapacity         = 4096
+	defaultDNSCacheCapacity         = 16384
 	fakeIPDNSCacheCapacity          = 8192
 	tunFakeIPDNSCacheCapacity       = 16384
 	defaultSniffEnabled             = true
@@ -52,35 +67,235 @@ const (
 )
 
 type proxyRuntime struct {
-	mu     sync.Mutex
-	cancel context.CancelFunc
-	box    *box.Box
-	onLog  func(level LogLevel, message string)
+	mu                  sync.RWMutex
+	cancel              context.CancelFunc
+	box                 *box.Box
+	onLog               func(level LogLevel, message string)
+	clashAPIController  string
+	defaultController   string
+	disableCacheFile    bool
+	disableExperimental bool
+	internalProxyPort   int
+}
+
+type preparedRuntimeConfig struct {
+	options            option.Options
+	clashAPIController string
+}
+
+type runtimeRestartOutcome struct {
+	Applied         bool
+	RollbackApplied bool
+}
+
+type clashConnectionsSnapshot struct {
+	UploadTotal        int64                   `json:"uploadTotal"`
+	DownloadTotal      int64                   `json:"downloadTotal"`
+	UploadTotalSnake   int64                   `json:"upload_total"`
+	DownloadTotalSnake int64                   `json:"download_total"`
+	Connections        []clashConnectionRecord `json:"connections"`
+}
+
+type clashConnectionRecord struct {
+	ID            string                  `json:"id"`
+	Upload        int64                   `json:"upload"`
+	Download      int64                   `json:"download"`
+	UploadSnake   int64                   `json:"upload_bytes"`
+	DownloadSnake int64                   `json:"download_bytes"`
+	Metadata      clashConnectionMetadata `json:"metadata"`
+	Chains        []string                `json:"chains"`
+}
+
+type clashConnectionMetadata struct {
+	Network string `json:"network"`
 }
 
 func newProxyRuntime(onLog func(level LogLevel, message string)) *proxyRuntime {
 	return &proxyRuntime{
-		onLog: onLog,
+		onLog:             onLog,
+		defaultController: defaultClashAPIController,
 	}
 }
 
+func currentProxyCoreVersion() string {
+	version := strings.TrimSpace(constant.Version)
+	if version == "" {
+		return "unknown"
+	}
+	return version
+}
+
+func resolveClashAPIController(controller string) string {
+	controller = strings.TrimSpace(controller)
+	if controller == "" {
+		return defaultClashAPIController
+	}
+	return controller
+}
+
+func (r *proxyRuntime) clashAPIControllerOrDefault() string {
+	if r == nil {
+		return defaultClashAPIController
+	}
+	r.mu.RLock()
+	controller := resolveClashAPIController(r.clashAPIController)
+	r.mu.RUnlock()
+	return controller
+}
+
+func (r *proxyRuntime) ConfigurePrepareDefaults(
+	controller string,
+	disableCacheFile bool,
+	disableExperimental bool,
+) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.defaultController = resolveClashAPIController(controller)
+	r.disableCacheFile = disableCacheFile
+	r.disableExperimental = disableExperimental
+}
+
+func (r *proxyRuntime) ConfigureInternalProxyPort(port int) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.internalProxyPort = port
+}
+
+func (r *proxyRuntime) PrepareRuntimeConfig(snapshot StateSnapshot) (*preparedRuntimeConfig, error) {
+	if r == nil {
+		return nil, errors.New("runtime is required")
+	}
+	r.mu.Lock()
+	controller := resolveClashAPIController(r.defaultController)
+	disableCacheFile := r.disableCacheFile
+	disableExperimental := r.disableExperimental
+	internalProxyPort := r.internalProxyPort
+	r.mu.Unlock()
+	return r.PrepareRuntimeConfigWithControllerOptions(
+		snapshot,
+		controller,
+		disableCacheFile,
+		disableExperimental,
+		internalProxyPort,
+	)
+}
+
+func (r *proxyRuntime) PrepareRuntimeConfigWithController(
+	snapshot StateSnapshot,
+	externalController string,
+) (*preparedRuntimeConfig, error) {
+	return r.PrepareRuntimeConfigWithControllerOptions(snapshot, externalController, false, false, 0)
+}
+
+func (r *proxyRuntime) PrepareRuntimeConfigWithControllerOptions(
+	snapshot StateSnapshot,
+	externalController string,
+	disableCacheFile bool,
+	disableExperimental bool,
+	internalProxyPort int,
+) (*preparedRuntimeConfig, error) {
+	configContent, err := buildRuntimeConfigWithControllerOptions(
+		snapshot,
+		externalController,
+		disableCacheFile,
+		disableExperimental,
+		internalProxyPort,
+	)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithCancel(include.Context(context.Background()))
+	defer cancel()
+	options, err := singjson.UnmarshalExtendedContext[option.Options](ctx, []byte(configContent))
+	if err != nil {
+		return nil, fmt.Errorf("decode sing-box config failed: %w", err)
+	}
+	return &preparedRuntimeConfig{
+		options:            options,
+		clashAPIController: resolveClashAPIController(externalController),
+	}, nil
+}
+
 func (r *proxyRuntime) Start(snapshot StateSnapshot) error {
-	configContent, err := buildRuntimeConfig(snapshot)
+	prepared, err := r.PrepareRuntimeConfig(snapshot)
 	if err != nil {
 		return err
 	}
+	return r.StartPrepared(prepared)
+}
 
+func (r *proxyRuntime) StartPrepared(prepared *preparedRuntimeConfig) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_ = r.stopLocked()
+	if err := r.startPreparedLocked(prepared); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *proxyRuntime) RestartFast(nextPrepared *preparedRuntimeConfig, rollbackPrepared *preparedRuntimeConfig) (runtimeRestartOutcome, error) {
+	if nextPrepared == nil {
+		return runtimeRestartOutcome{}, errors.New("next prepared runtime config is required")
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	_ = r.stopLocked()
-
-	ctx, cancel := context.WithCancel(include.Context(context.Background()))
-	options, err := singjson.UnmarshalExtendedContext[option.Options](ctx, []byte(configContent))
-	if err != nil {
-		cancel()
-		return fmt.Errorf("decode sing-box config failed: %w", err)
+	if err := r.startPreparedLocked(nextPrepared); err != nil {
+		if rollbackPrepared == nil {
+			return runtimeRestartOutcome{}, fmt.Errorf("start next runtime failed: %w", err)
+		}
+		rollbackErr := r.startPreparedLocked(rollbackPrepared)
+		if rollbackErr != nil {
+			return runtimeRestartOutcome{}, fmt.Errorf("start next runtime failed: %v; rollback failed: %w", err, rollbackErr)
+		}
+		return runtimeRestartOutcome{
+			Applied:         false,
+			RollbackApplied: true,
+		}, fmt.Errorf("start next runtime failed: %v; rollback succeeded", err)
 	}
+	return runtimeRestartOutcome{
+		Applied:         true,
+		RollbackApplied: false,
+	}, nil
+}
+
+func (r *proxyRuntime) ValidateConfig(snapshot StateSnapshot) error {
+	if _, err := r.PrepareRuntimeConfig(snapshot); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *proxyRuntime) Stop() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.stopLocked()
+}
+
+func (r *proxyRuntime) IsRunning() bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	running := r.box != nil
+	r.mu.Unlock()
+	return running
+}
+
+func (r *proxyRuntime) startPreparedLocked(prepared *preparedRuntimeConfig) error {
+	if prepared == nil {
+		return errors.New("prepared runtime config is required")
+	}
+	ctx, cancel := context.WithCancel(include.Context(context.Background()))
+	options := prepared.options
 	instance, err := box.New(box.Options{
 		Context:           ctx,
 		Options:           options,
@@ -91,24 +306,222 @@ func (r *proxyRuntime) Start(snapshot StateSnapshot) error {
 		return fmt.Errorf("create sing-box instance failed: %w", err)
 	}
 	if err := instance.Start(); err != nil {
-		_ = instance.Close()
 		cancel()
+		_ = instance.Close()
 		return fmt.Errorf("start sing-box failed: %w", err)
 	}
-
 	r.box = instance
 	r.cancel = cancel
+	r.clashAPIController = resolveClashAPIController(prepared.clashAPIController)
 	return nil
-}
-
-func (r *proxyRuntime) Stop() error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.stopLocked()
 }
 
 func (r *proxyRuntime) SwitchSelectedNode(nodeID string) error {
 	return r.SwitchSelectorOutbound(proxySelectorTag, runtimeNodeTag(nodeID))
+}
+
+func (r *proxyRuntime) UpdateLogLevel(level LogLevel) error {
+	targetLevel := normalizeClashAPILogLevel(toClashAPILogLevel(level))
+	controller := r.clashAPIControllerOrDefault()
+	requestBody, err := json.Marshal(map[string]string{
+		"log-level": toClashAPILogLevel(level),
+	})
+	if err != nil {
+		return fmt.Errorf("build update log-level request failed: %w", err)
+	}
+	request, err := http.NewRequest(
+		http.MethodPatch,
+		"http://"+controller+"/configs",
+		bytes.NewReader(requestBody),
+	)
+	if err != nil {
+		return fmt.Errorf("create update log-level request failed: %w", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	client := &http.Client{
+		Timeout: 3 * time.Second,
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return fmt.Errorf("update log-level failed: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode == http.StatusNoContent || response.StatusCode == http.StatusOK {
+		currentLevel, queryErr := queryClashAPILogLevel(controller, client)
+		if queryErr != nil {
+			return fmt.Errorf("verify update log-level failed: %w", queryErr)
+		}
+		if normalizeClashAPILogLevel(currentLevel) != targetLevel {
+			return fmt.Errorf(
+				"update log-level not applied: expected=%s actual=%s",
+				targetLevel,
+				currentLevel,
+			)
+		}
+		return nil
+	}
+	body, _ := io.ReadAll(io.LimitReader(response.Body, 1024))
+	return fmt.Errorf(
+		"update log-level failed: status=%d body=%s",
+		response.StatusCode,
+		strings.TrimSpace(string(body)),
+	)
+}
+
+func (r *proxyRuntime) UpdateMode(mode string) error {
+	targetMode := normalizeClashAPIProxyMode(mode)
+	if targetMode == "" {
+		return errors.New("mode is required")
+	}
+	controller := r.clashAPIControllerOrDefault()
+	requestBody, err := json.Marshal(map[string]string{
+		"mode": targetMode,
+	})
+	if err != nil {
+		return fmt.Errorf("build update mode request failed: %w", err)
+	}
+	request, err := http.NewRequest(
+		http.MethodPatch,
+		"http://"+controller+"/configs",
+		bytes.NewReader(requestBody),
+	)
+	if err != nil {
+		return fmt.Errorf("create update mode request failed: %w", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	client := &http.Client{
+		Timeout: 3 * time.Second,
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return fmt.Errorf("update mode failed: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode == http.StatusNoContent || response.StatusCode == http.StatusOK {
+		currentMode, queryErr := queryClashAPIProxyMode(controller, client)
+		if queryErr != nil {
+			return fmt.Errorf("verify update mode failed: %w", queryErr)
+		}
+		if normalizeClashAPIProxyMode(currentMode) != targetMode {
+			return fmt.Errorf(
+				"update mode not applied: expected=%s actual=%s",
+				targetMode,
+				currentMode,
+			)
+		}
+		return nil
+	}
+	body, _ := io.ReadAll(io.LimitReader(response.Body, 1024))
+	return fmt.Errorf(
+		"update mode failed: status=%d body=%s",
+		response.StatusCode,
+		strings.TrimSpace(string(body)),
+	)
+}
+
+func queryClashAPILogLevel(controller string, client *http.Client) (string, error) {
+	controller = resolveClashAPIController(controller)
+	if client == nil {
+		client = &http.Client{
+			Timeout: 3 * time.Second,
+		}
+	}
+	request, err := http.NewRequest(
+		http.MethodGet,
+		"http://"+controller+"/configs",
+		nil,
+	)
+	if err != nil {
+		return "", fmt.Errorf("create query log-level request failed: %w", err)
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return "", fmt.Errorf("query log-level failed: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 1024))
+		return "", fmt.Errorf(
+			"query log-level failed: status=%d body=%s",
+			response.StatusCode,
+			strings.TrimSpace(string(body)),
+		)
+	}
+	var payload struct {
+		LogLevel string `json:"log-level"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		return "", fmt.Errorf("decode query log-level response failed: %w", err)
+	}
+	if strings.TrimSpace(payload.LogLevel) == "" {
+		return "", errors.New("query log-level response missing log-level")
+	}
+	return payload.LogLevel, nil
+}
+
+func queryClashAPIProxyMode(controller string, client *http.Client) (string, error) {
+	controller = resolveClashAPIController(controller)
+	if client == nil {
+		client = &http.Client{
+			Timeout: 3 * time.Second,
+		}
+	}
+	request, err := http.NewRequest(
+		http.MethodGet,
+		"http://"+controller+"/configs",
+		nil,
+	)
+	if err != nil {
+		return "", fmt.Errorf("create query mode request failed: %w", err)
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return "", fmt.Errorf("query mode failed: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 1024))
+		return "", fmt.Errorf(
+			"query mode failed: status=%d body=%s",
+			response.StatusCode,
+			strings.TrimSpace(string(body)),
+		)
+	}
+	var payload struct {
+		Mode string `json:"mode"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		return "", fmt.Errorf("decode query mode response failed: %w", err)
+	}
+	if strings.TrimSpace(payload.Mode) == "" {
+		return "", errors.New("query mode response missing mode")
+	}
+	return payload.Mode, nil
+}
+
+func normalizeClashAPILogLevel(level string) string {
+	value := strings.ToLower(strings.TrimSpace(level))
+	switch value {
+	case "warn":
+		return "warning"
+	case "none", "off":
+		return "silent"
+	default:
+		return value
+	}
+}
+
+func normalizeClashAPIProxyMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "direct":
+		return "direct"
+	case "global":
+		return "global"
+	case "rule":
+		return "rule"
+	default:
+		return ""
+	}
 }
 
 func (r *proxyRuntime) SwitchSelectorOutbound(selectorTag string, outboundTag string) error {
@@ -117,6 +530,7 @@ func (r *proxyRuntime) SwitchSelectorOutbound(selectorTag string, outboundTag st
 	if selectorTag == "" || outboundTag == "" {
 		return errors.New("selectorTag/outboundTag is required")
 	}
+	controller := r.clashAPIControllerOrDefault()
 	requestBody, err := json.Marshal(map[string]string{
 		"name": outboundTag,
 	})
@@ -125,7 +539,7 @@ func (r *proxyRuntime) SwitchSelectorOutbound(selectorTag string, outboundTag st
 	}
 	request, err := http.NewRequest(
 		http.MethodPut,
-		"http://"+defaultClashAPIController+"/proxies/"+url.PathEscape(selectorTag),
+		"http://"+controller+"/proxies/"+url.PathEscape(selectorTag),
 		bytes.NewReader(requestBody),
 	)
 	if err != nil {
@@ -149,6 +563,7 @@ func (r *proxyRuntime) SwitchSelectorOutbound(selectorTag string, outboundTag st
 
 func (r *proxyRuntime) ProbeNodeDelay(nodeID string, probeURL string, timeoutMS int) (int, error) {
 	tag := runtimeNodeTag(nodeID)
+	controller := r.clashAPIControllerOrDefault()
 	normalizedProbeURL := strings.TrimSpace(probeURL)
 	if normalizedProbeURL == "" {
 		normalizedProbeURL = "https://www.gstatic.com/generate_204"
@@ -156,7 +571,7 @@ func (r *proxyRuntime) ProbeNodeDelay(nodeID string, probeURL string, timeoutMS 
 	if timeoutMS <= 0 {
 		timeoutMS = 5000
 	}
-	controllerURL := "http://" + defaultClashAPIController + "/proxies/" + url.PathEscape(tag) + "/delay?url=" + url.QueryEscape(normalizedProbeURL) + "&timeout=" + strconv.Itoa(timeoutMS)
+	controllerURL := "http://" + controller + "/proxies/" + url.PathEscape(tag) + "/delay?url=" + url.QueryEscape(normalizedProbeURL) + "&timeout=" + strconv.Itoa(timeoutMS)
 	request, err := http.NewRequest(http.MethodGet, controllerURL, nil)
 	if err != nil {
 		return 0, fmt.Errorf("create probe request failed: %w", err)
@@ -189,10 +604,15 @@ func (r *proxyRuntime) ProbeNodeDelay(nodeID string, probeURL string, timeoutMS 
 	return payload.Delay, nil
 }
 
+func (r *proxyRuntime) ProbeNodeRealConnect(nodeID string, probeURL string, timeoutMS int) (int, error) {
+	return r.ProbeNodeDelay(nodeID, probeURL, timeoutMS)
+}
+
 func (r *proxyRuntime) CloseAllConnections() error {
+	controller := r.clashAPIControllerOrDefault()
 	request, err := http.NewRequest(
 		http.MethodDelete,
-		"http://"+defaultClashAPIController+"/connections",
+		"http://"+controller+"/connections",
 		nil,
 	)
 	if err != nil {
@@ -217,10 +637,121 @@ func (r *proxyRuntime) CloseAllConnections() error {
 	)
 }
 
+func (r *proxyRuntime) QueryConnectionsStats() (TrafficTickPayload, error) {
+	controller := r.clashAPIControllerOrDefault()
+	request, err := http.NewRequest(
+		http.MethodGet,
+		"http://"+controller+"/connections",
+		nil,
+	)
+	if err != nil {
+		return TrafficTickPayload{}, fmt.Errorf("create query connections request failed: %w", err)
+	}
+	client := &http.Client{
+		Timeout: 3 * time.Second,
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return TrafficTickPayload{}, fmt.Errorf("query connections failed: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 1024))
+		return TrafficTickPayload{}, fmt.Errorf(
+			"query connections failed: status=%d body=%s",
+			response.StatusCode,
+			strings.TrimSpace(string(body)),
+		)
+	}
+	var payload clashConnectionsSnapshot
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		return TrafficTickPayload{}, fmt.Errorf("decode query connections response failed: %w", err)
+	}
+	return buildTrafficTickFromConnectionsSnapshot(payload), nil
+}
+
+func buildTrafficTickFromConnectionsSnapshot(payload clashConnectionsSnapshot) TrafficTickPayload {
+	stats := TrafficTickPayload{
+		UploadBytes:   maxInt64(payload.UploadTotal, payload.UploadTotalSnake),
+		DownloadBytes: maxInt64(payload.DownloadTotal, payload.DownloadTotalSnake),
+	}
+	if len(payload.Connections) == 0 {
+		return stats
+	}
+	stats.TotalConnections = int64(len(payload.Connections))
+	nodeUsage := map[string]int64{}
+	nodeUploadBytes := map[string]int64{}
+	nodeDownloadBytes := map[string]int64{}
+	for _, connection := range payload.Connections {
+		network := strings.ToLower(strings.TrimSpace(connection.Metadata.Network))
+		switch {
+		case strings.HasPrefix(network, "tcp"):
+			stats.TCPConnections++
+		case strings.HasPrefix(network, "udp"):
+			stats.UDPConnections++
+		}
+		connectionUploadBytes := maxInt64(connection.Upload, connection.UploadSnake)
+		connectionDownloadBytes := maxInt64(connection.Download, connection.DownloadSnake)
+		connectionNodeIDs := map[string]struct{}{}
+		for _, chainTag := range connection.Chains {
+			nodeID, ok := parseRuntimeNodeIDFromTag(chainTag)
+			if !ok {
+				continue
+			}
+			connectionNodeIDs[nodeID] = struct{}{}
+		}
+		for nodeID := range connectionNodeIDs {
+			nodeUsage[nodeID]++
+			nodeUploadBytes[nodeID] += connectionUploadBytes
+			nodeDownloadBytes[nodeID] += connectionDownloadBytes
+		}
+	}
+	if len(nodeUsage) == 0 {
+		return stats
+	}
+	stats.ActiveNodeCount = int64(len(nodeUsage))
+	nodeIDs := make([]string, 0, len(nodeUsage))
+	for nodeID := range nodeUsage {
+		nodeIDs = append(nodeIDs, nodeID)
+	}
+	sort.Slice(nodeIDs, func(i, j int) bool {
+		left := nodeUsage[nodeIDs[i]]
+		right := nodeUsage[nodeIDs[j]]
+		if left == right {
+			return nodeIDs[i] < nodeIDs[j]
+		}
+		return left > right
+	})
+	stats.Nodes = make([]ActiveNodeConnection, 0, len(nodeIDs))
+	for _, nodeID := range nodeIDs {
+		stats.Nodes = append(stats.Nodes, ActiveNodeConnection{
+			NodeID:        nodeID,
+			Connections:   nodeUsage[nodeID],
+			UploadBytes:   nodeUploadBytes[nodeID],
+			DownloadBytes: nodeDownloadBytes[nodeID],
+		})
+	}
+	return stats
+}
+
+func maxInt64(a int64, b int64) int64 {
+	if a >= b {
+		if a < 0 {
+			return 0
+		}
+		return a
+	}
+	if b < 0 {
+		return 0
+	}
+	return b
+}
+
 func (r *proxyRuntime) FlushFakeIPCache() error {
+	controller := r.clashAPIControllerOrDefault()
 	request, err := http.NewRequest(
 		http.MethodPost,
-		"http://"+defaultClashAPIController+"/cache/fakeip/flush",
+		"http://"+controller+"/cache/fakeip/flush",
 		nil,
 	)
 	if err != nil {
@@ -238,22 +769,298 @@ func (r *proxyRuntime) FlushFakeIPCache() error {
 		return nil
 	}
 	body, _ := io.ReadAll(io.LimitReader(response.Body, 1024))
+	bodyText := strings.TrimSpace(string(body))
+	// sing-box may return 500 {"message":"bucket not found"} when fakeip cache bucket does not exist.
+	// Treat it as an idempotent no-op instead of surfacing a hard error to UI.
+	if response.StatusCode == http.StatusInternalServerError &&
+		strings.Contains(strings.ToLower(bodyText), "bucket not found") {
+		return nil
+	}
 	return fmt.Errorf(
 		"flush fakeip cache failed: status=%d body=%s",
 		response.StatusCode,
-		strings.TrimSpace(string(body)),
+		bodyText,
 	)
+}
+
+func (r *proxyRuntime) CheckDNSResolver(
+	ctx context.Context,
+	endpoint DNSResolverEndpoint,
+	domain string,
+	timeout time.Duration,
+) ([]string, error) {
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	domain = strings.TrimSpace(domain)
+	if domain == "" {
+		return nil, errors.New("domain is required")
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	resolveWithSystem := func() ([]string, error) {
+		values, err := net.DefaultResolver.LookupHost(checkCtx, domain)
+		if err != nil {
+			return nil, err
+		}
+		return uniqueNonEmptyStrings(values), nil
+	}
+	switch endpoint.Type {
+	case DNSResolverTypeLocal, DNSResolverTypeHosts, DNSResolverTypeResolved, DNSResolverTypeDHCP:
+		return resolveWithSystem()
+	case DNSResolverTypeUDP, DNSResolverTypeTCP:
+		serverAddress := net.JoinHostPort(endpoint.Address, strconv.Itoa(endpoint.Port))
+		resolverNetwork := "udp"
+		if endpoint.Type == DNSResolverTypeTCP {
+			resolverNetwork = "tcp"
+		}
+		dialer := net.Dialer{
+			Timeout: timeout,
+		}
+		resolver := &net.Resolver{
+			PreferGo: true,
+			Dial: func(ctx context.Context, network string, address string) (net.Conn, error) {
+				return dialer.DialContext(ctx, resolverNetwork, serverAddress)
+			},
+		}
+		values, err := resolver.LookupHost(checkCtx, domain)
+		if err != nil {
+			return nil, err
+		}
+		return uniqueNonEmptyStrings(values), nil
+	case DNSResolverTypeTLS:
+		return resolveDNSOverTLS(checkCtx, endpoint, domain, timeout)
+	case DNSResolverTypeQUIC:
+		address := net.JoinHostPort(endpoint.Address, strconv.Itoa(endpoint.Port))
+		conn, err := (&net.Dialer{Timeout: timeout}).DialContext(checkCtx, "udp", address)
+		if err != nil {
+			return nil, err
+		}
+		_ = conn.Close()
+		return []string{}, nil
+	case DNSResolverTypeHTTPS, DNSResolverTypeH3:
+		return resolveDNSOverHTTPS(checkCtx, endpoint, domain, timeout)
+	default:
+		return nil, errors.New("unsupported dns resolver type")
+	}
+}
+
+func resolveDNSOverTLS(
+	ctx context.Context,
+	endpoint DNSResolverEndpoint,
+	domain string,
+	timeout time.Duration,
+) ([]string, error) {
+	address := net.JoinHostPort(endpoint.Address, strconv.Itoa(endpoint.Port))
+	dialer := &tls.Dialer{
+		NetDialer: &net.Dialer{
+			Timeout: timeout,
+		},
+		Config: &tls.Config{
+			ServerName:         endpoint.Address,
+			InsecureSkipVerify: true,
+		},
+	}
+	queryFn := func(query []byte) ([]byte, error) {
+		conn, err := dialer.DialContext(ctx, "tcp", address)
+		if err != nil {
+			return nil, err
+		}
+		defer conn.Close()
+		if deadline, ok := ctx.Deadline(); ok {
+			_ = conn.SetDeadline(deadline)
+		} else {
+			_ = conn.SetDeadline(time.Now().Add(timeout))
+		}
+		packet := make([]byte, 2+len(query))
+		binary.BigEndian.PutUint16(packet[:2], uint16(len(query)))
+		copy(packet[2:], query)
+		if _, err := conn.Write(packet); err != nil {
+			return nil, err
+		}
+		lengthBuffer := make([]byte, 2)
+		if _, err := io.ReadFull(conn, lengthBuffer); err != nil {
+			return nil, err
+		}
+		responseLength := int(binary.BigEndian.Uint16(lengthBuffer))
+		if responseLength <= 0 || responseLength > 65535 {
+			return nil, errors.New("invalid dns-over-tls response length")
+		}
+		response := make([]byte, responseLength)
+		if _, err := io.ReadFull(conn, response); err != nil {
+			return nil, err
+		}
+		return response, nil
+	}
+	return resolveDNSViaQueryFn(domain, queryFn)
+}
+
+func resolveDNSOverHTTPS(
+	ctx context.Context,
+	endpoint DNSResolverEndpoint,
+	domain string,
+	timeout time.Duration,
+) ([]string, error) {
+	pathValue := strings.TrimSpace(endpoint.Path)
+	if pathValue == "" {
+		pathValue = "/dns-query"
+	}
+	client := &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				ServerName:         endpoint.Address,
+				InsecureSkipVerify: true,
+			},
+		},
+	}
+	queryFn := func(query []byte) ([]byte, error) {
+		baseURL := url.URL{
+			Scheme: "https",
+			Host:   net.JoinHostPort(endpoint.Address, strconv.Itoa(endpoint.Port)),
+			Path:   pathValue,
+		}
+		queryValues := baseURL.Query()
+		queryValues.Set("dns", base64.RawURLEncoding.EncodeToString(query))
+		baseURL.RawQuery = queryValues.Encode()
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL.String(), nil)
+		if err != nil {
+			return nil, err
+		}
+		request.Header.Set("Accept", "application/dns-message")
+		response, err := client.Do(request)
+		if err != nil {
+			return nil, err
+		}
+		defer response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(io.LimitReader(response.Body, 1024))
+			return nil, fmt.Errorf(
+				"dns-over-https status=%d body=%s",
+				response.StatusCode,
+				strings.TrimSpace(string(body)),
+			)
+		}
+		payload, err := io.ReadAll(io.LimitReader(response.Body, 65535))
+		if err != nil {
+			return nil, err
+		}
+		return payload, nil
+	}
+	return resolveDNSViaQueryFn(domain, queryFn)
+}
+
+func resolveDNSViaQueryFn(
+	domain string,
+	queryFn func(query []byte) ([]byte, error),
+) ([]string, error) {
+	if queryFn == nil {
+		return nil, errors.New("dns query function is required")
+	}
+	aggregated := make([]string, 0, 4)
+	for _, queryType := range []dnsmessage.Type{
+		dnsmessage.TypeA,
+		dnsmessage.TypeAAAA,
+	} {
+		queryWire, err := buildDNSQueryWire(domain, queryType)
+		if err != nil {
+			return nil, err
+		}
+		responseWire, err := queryFn(queryWire)
+		if err != nil {
+			return nil, err
+		}
+		resolvedIPs, err := extractResolvedIPsFromDNSResponse(responseWire)
+		if err != nil {
+			return nil, err
+		}
+		aggregated = append(aggregated, resolvedIPs...)
+	}
+	aggregated = uniqueNonEmptyStrings(aggregated)
+	if len(aggregated) == 0 {
+		return nil, errors.New("dns response contains no A/AAAA records")
+	}
+	return aggregated, nil
+}
+
+func buildDNSQueryWire(domain string, queryType dnsmessage.Type) ([]byte, error) {
+	nameValue := strings.TrimSpace(domain)
+	if nameValue == "" {
+		return nil, errors.New("domain is required")
+	}
+	if !strings.HasSuffix(nameValue, ".") {
+		nameValue += "."
+	}
+	name, err := dnsmessage.NewName(nameValue)
+	if err != nil {
+		return nil, fmt.Errorf("invalid domain for dns query: %w", err)
+	}
+	message := dnsmessage.Message{
+		Header: dnsmessage.Header{
+			ID:                 uint16(time.Now().UnixNano()),
+			RecursionDesired:   true,
+			Response:           false,
+			Authoritative:      false,
+			Truncated:          false,
+			RecursionAvailable: false,
+		},
+		Questions: []dnsmessage.Question{
+			{
+				Name:  name,
+				Type:  queryType,
+				Class: dnsmessage.ClassINET,
+			},
+		},
+	}
+	wire, err := message.Pack()
+	if err != nil {
+		return nil, fmt.Errorf("pack dns query failed: %w", err)
+	}
+	return wire, nil
+}
+
+func extractResolvedIPsFromDNSResponse(response []byte) ([]string, error) {
+	if len(response) == 0 {
+		return nil, errors.New("empty dns response")
+	}
+	var message dnsmessage.Message
+	if err := message.Unpack(response); err != nil {
+		return nil, fmt.Errorf("decode dns response failed: %w", err)
+	}
+	if message.Header.RCode != dnsmessage.RCodeSuccess {
+		return nil, fmt.Errorf("dns response rcode=%s", message.Header.RCode)
+	}
+	ips := make([]string, 0, len(message.Answers))
+	for _, answer := range message.Answers {
+		switch body := answer.Body.(type) {
+		case *dnsmessage.AResource:
+			ip := net.IP(body.A[:]).String()
+			if strings.TrimSpace(ip) != "" {
+				ips = append(ips, ip)
+			}
+		case *dnsmessage.AAAAResource:
+			ip := net.IP(body.AAAA[:]).String()
+			if strings.TrimSpace(ip) != "" {
+				ips = append(ips, ip)
+			}
+		}
+	}
+	return uniqueNonEmptyStrings(ips), nil
 }
 
 func (r *proxyRuntime) stopLocked() error {
 	var stopErr error
-	if r.box != nil {
-		stopErr = r.box.Close()
-		r.box = nil
+	cancel := r.cancel
+	instance := r.box
+	r.cancel = nil
+	r.box = nil
+	r.clashAPIController = ""
+	if cancel != nil {
+		cancel()
 	}
-	if r.cancel != nil {
-		r.cancel()
-		r.cancel = nil
+	if instance != nil {
+		stopErr = instance.Close()
 	}
 	if errors.Is(stopErr, os.ErrClosed) {
 		return nil
@@ -262,55 +1069,94 @@ func (r *proxyRuntime) stopLocked() error {
 }
 
 func buildRuntimeConfig(snapshot StateSnapshot) (string, error) {
+	return buildRuntimeConfigWithController(snapshot, defaultClashAPIController)
+}
+
+func buildRuntimeConfigWithController(snapshot StateSnapshot, externalController string) (string, error) {
+	return buildRuntimeConfigWithControllerOptions(snapshot, externalController, false, false, 0)
+}
+
+func buildRuntimeConfigWithControllerOptions(
+	snapshot StateSnapshot,
+	externalController string,
+	disableCacheFile bool,
+	disableExperimental bool,
+	internalProxyPort int,
+) (string, error) {
 	mode := normalizeProxyMode(snapshot.ProxyMode)
 	if !isValidProxyMode(mode) {
 		mode = inferProxyMode(snapshot.TunEnabled, snapshot.SystemProxyEnabled)
 	}
-	if mode == ProxyModeOff {
-		return "", errors.New("proxy mode is off")
+	muxConfig := normalizeProxyMuxConfig(snapshot.Mux)
+	nodeOutbounds := []any{}
+	nodeTags := []string{}
+	nodeTagsByID := map[string]string{}
+	nodeByID := map[string]Node{}
+	seenNodeIDs := map[string]struct{}{}
+	selectedTag := ""
+	appendNodeOutbound := func(node Node) {
+		if _, exists := seenNodeIDs[node.ID]; exists {
+			return
+		}
+		outbound, outboundErr := buildNodeOutbound(node, muxConfig)
+		if outboundErr != nil {
+			return
+		}
+		tag := runtimeNodeTag(node.ID)
+		outbound["tag"] = tag
+		nodeOutbounds = append(nodeOutbounds, outbound)
+		nodeTags = append(nodeTags, tag)
+		nodeTagsByID[node.ID] = tag
+		nodeByID[node.ID] = node
+		seenNodeIDs[node.ID] = struct{}{}
 	}
 
-	selectedNode, err := resolveRuntimeNode(snapshot)
-	if err != nil {
-		return "", err
+	if mode != ProxyModeOff {
+		selectedNode, err := resolveRuntimeNode(snapshot)
+		if err != nil {
+			return "", err
+		}
+		selectedTag = runtimeNodeTag(selectedNode.ID)
+		appendNodeOutbound(selectedNode)
+	} else if selectedNode, err := resolveRuntimeNode(snapshot); err == nil {
+		// Prefer active node first in selector order when running probe-only minimal runtime.
+		selectedTag = runtimeNodeTag(selectedNode.ID)
+		appendNodeOutbound(selectedNode)
 	}
-	selectedOutbound, err := buildNodeOutbound(selectedNode)
-	if err != nil {
-		return "", err
-	}
-	selectedTag := runtimeNodeTag(selectedNode.ID)
-	selectedOutbound["tag"] = selectedTag
-	nodeOutbounds := []any{selectedOutbound}
-	nodeTags := []string{selectedTag}
-	nodeTagsByID := map[string]string{
-		selectedNode.ID: selectedTag,
-	}
-	nodeByID := map[string]Node{
-		selectedNode.ID: selectedNode,
-	}
-	seenNodeIDs := map[string]struct{}{
-		selectedNode.ID: {},
-	}
+
 	for _, group := range snapshot.Groups {
 		for _, node := range group.Nodes {
-			if _, exists := seenNodeIDs[node.ID]; exists {
-				continue
+			appendNodeOutbound(node)
+		}
+	}
+	if strings.TrimSpace(selectedTag) != "" {
+		selectedTagExists := false
+		for _, tag := range nodeTags {
+			if tag == selectedTag {
+				selectedTagExists = true
+				break
 			}
-			outbound, outboundErr := buildNodeOutbound(node)
-			if outboundErr != nil {
-				continue
-			}
-			tag := runtimeNodeTag(node.ID)
-			outbound["tag"] = tag
-			nodeOutbounds = append(nodeOutbounds, outbound)
-			nodeTags = append(nodeTags, tag)
-			nodeTagsByID[node.ID] = tag
-			nodeByID[node.ID] = node
-			seenNodeIDs[node.ID] = struct{}{}
+		}
+		if !selectedTagExists {
+			selectedTag = ""
+		}
+	}
+	if strings.TrimSpace(selectedTag) == "" {
+		if len(nodeTags) > 0 {
+			selectedTag = nodeTags[0]
+		} else {
+			selectedTag = "direct"
 		}
 	}
 	dnsConfig := buildDNSConfig(snapshot)
-	routeRules := make([]any, 0, len(snapshot.RuleConfigV2.Rules)+3)
+	routeRules := make([]any, 0, len(snapshot.RuleConfigV2.Rules)+4)
+	if internalProxyPort > 0 {
+		routeRules = append(routeRules, map[string]any{
+			"inbound":  []string{"internal-helper-in"},
+			"action":   "route",
+			"outbound": proxySelectorTag,
+		})
+	}
 	if runtimeSniffEnabled(snapshot) {
 		routeRules = append(routeRules, map[string]any{
 			"action":  "sniff",
@@ -322,6 +1168,9 @@ func buildRuntimeConfig(snapshot StateSnapshot) (string, error) {
 			"protocol": "dns",
 			"action":   "hijack-dns",
 		},
+	)
+	routeRules = append(routeRules, buildTransportGuardRouteRules(snapshot)...)
+	routeRules = append(routeRules,
 		map[string]any{
 			"ip_is_private": true,
 			"action":        "route",
@@ -340,8 +1189,10 @@ func buildRuntimeConfig(snapshot StateSnapshot) (string, error) {
 	routeConfig := map[string]any{
 		"rules":                   routeRules,
 		"final":                   finalOutbound,
-		"auto_detect_interface":   true,
 		"default_domain_resolver": bootstrapDNSServerTag,
+	}
+	if supportsRouteAutoDetectInterface(runtime.GOOS) {
+		routeConfig["auto_detect_interface"] = true
 	}
 	if ruleSetDefs := mergeRouteRuleSetDefinitions(
 		buildRouteRuleSetDefinitions(snapshot.RuleConfigV2),
@@ -351,29 +1202,48 @@ func buildRuntimeConfig(snapshot StateSnapshot) (string, error) {
 	}
 
 	inbounds := []any{}
-	if mode == ProxyModeTun {
+	if internalProxyPort > 0 {
 		inbounds = append(inbounds, map[string]any{
-			"type":           "tun",
-			"tag":            "tun-in",
-			"interface_name": defaultTunInterfaceName,
-			"address": []string{
-				"172.19.0.1/30",
-				"fdfe:dcba:9876::1/126",
-			},
-			"auto_route":   true,
-			"strict_route": true,
-			"stack":        "mixed",
+			"type":        "mixed",
+			"tag":         "internal-helper-in",
+			"listen":      defaultLocalMixedListenAddress,
+			"listen_port": internalProxyPort,
 		})
-	} else {
+	}
+	switch mode {
+	case ProxyModeTun:
+		inbounds = append(inbounds, buildTunInboundConfig(runtime.GOOS, snapshot), map[string]any{
+			"type":        "mixed",
+			"tag":         "mixed-in",
+			"listen":      runtimeListenAddress(snapshot),
+			"listen_port": runtimeListenPort(snapshot),
+		})
+	case ProxyModeSystem:
 		inbounds = append(inbounds, map[string]any{
 			"type":        "mixed",
 			"tag":         "mixed-in",
 			"listen":      runtimeListenAddress(snapshot),
 			"listen_port": runtimeListenPort(snapshot),
 		})
+	default:
+		// ProxyModeOff keeps runtime alive for probing only, without exposing local proxy inbounds.
 	}
 
 	runtimeOutbounds := append([]any{}, nodeOutbounds...)
+	selectorOutbounds := []string{"direct"}
+	if len(nodeTags) > 0 {
+		runtimeOutbounds = append(runtimeOutbounds, map[string]any{
+			"type":                        "urltest",
+			"tag":                         proxyURLTestTag,
+			"outbounds":                   append([]string{}, nodeTags...),
+			"url":                         proxyURLTestProbeURL,
+			"interval":                    proxyURLTestInterval,
+			"tolerance":                   proxyURLTestToleranceMS,
+			"idle_timeout":                proxyURLTestIdleTimeout,
+			"interrupt_exist_connections": true,
+		})
+		selectorOutbounds = append([]string{proxyURLTestTag}, nodeTags...)
+	}
 	runtimeOutbounds = append(runtimeOutbounds, rulePoolOutbounds...)
 	runtimeOutbounds = append(
 		runtimeOutbounds,
@@ -397,7 +1267,7 @@ func buildRuntimeConfig(snapshot StateSnapshot) (string, error) {
 			map[string]any{
 				"type":                        "selector",
 				"tag":                         proxySelectorTag,
-				"outbounds":                   nodeTags,
+				"outbounds":                   selectorOutbounds,
 				"default":                     selectedTag,
 				"interrupt_exist_connections": true,
 			},
@@ -405,8 +1275,10 @@ func buildRuntimeConfig(snapshot StateSnapshot) (string, error) {
 		"dns":   dnsConfig,
 		"route": routeConfig,
 	}
-	if experimentalConfig := buildExperimentalConfig(snapshot); experimentalConfig != nil {
-		config["experimental"] = experimentalConfig
+	if !disableExperimental {
+		if experimentalConfig := buildExperimentalConfig(snapshot, externalController, disableCacheFile); experimentalConfig != nil {
+			config["experimental"] = experimentalConfig
+		}
 	}
 
 	raw, err := json.Marshal(config)
@@ -414,6 +1286,67 @@ func buildRuntimeConfig(snapshot StateSnapshot) (string, error) {
 		return "", fmt.Errorf("marshal runtime config failed: %w", err)
 	}
 	return string(raw), nil
+}
+
+func buildTunInboundConfig(goos string, snapshot StateSnapshot) map[string]any {
+	stack := normalizeProxyTunStack(snapshot.TunStack)
+	if !isValidProxyTunStack(stack) {
+		stack = ProxyTunStackSystem
+	}
+	inbound := map[string]any{
+		"type":           "tun",
+		"tag":            "tun-in",
+		"interface_name": defaultTunInterfaceName,
+		"address": []string{
+			"172.19.0.1/30",
+			"fdfe:dcba:9876::1/126",
+		},
+		"auto_route":   true,
+		"strict_route": true,
+		"mtu":          normalizeProxyTunMTU(snapshot.TunMTU),
+		"stack":        string(stack),
+	}
+	if strings.EqualFold(strings.TrimSpace(goos), "linux") {
+		// Linux 平台下官方推荐启用 auto_redirect 以提升透明代理性能与兼容性。
+		inbound["auto_redirect"] = true
+	}
+	return inbound
+}
+
+func supportsRouteAutoDetectInterface(goos string) bool {
+	switch strings.ToLower(strings.TrimSpace(goos)) {
+	case "linux", "windows", "darwin":
+		return true
+	default:
+		return false
+	}
+}
+
+func buildTransportGuardRouteRules(snapshot StateSnapshot) []any {
+	rules := make([]any, 0, 2)
+	if snapshot.BlockUDP {
+		rules = append(rules, map[string]any{
+			"network": "udp",
+			"action":  "reject",
+		})
+		return rules
+	}
+	if !snapshot.BlockQUIC {
+		return rules
+	}
+	rules = append(
+		rules,
+		map[string]any{
+			"protocol": "quic",
+			"action":   "reject",
+		},
+		map[string]any{
+			"network": "udp",
+			"port":    443,
+			"action":  "reject",
+		},
+	)
+	return rules
 }
 
 func buildTrafficRuleRuntime(
@@ -428,21 +1361,18 @@ func buildTrafficRuleRuntime(
 		nodeTagsByID,
 		nodeByID,
 	)
-	defaultMatchPolicy := strings.TrimSpace(config.Defaults.OnMatch)
-	if defaultMatchPolicy == "" {
-		defaultMatchPolicy = "direct"
-	}
-	defaultMissPolicy := strings.TrimSpace(config.Defaults.OnMiss)
-	if defaultMissPolicy == "" {
+	defaultMatchPolicy := "proxy"
+	defaultMissPolicy := "direct"
+	if resolveActiveRuleGroupOnMissMode(config) == RuleMissModeProxy {
 		defaultMissPolicy = "proxy"
 	}
 	matchOutbound := resolvePolicyOutboundTag(defaultMatchPolicy, policyOutboundTag)
 	if strings.TrimSpace(matchOutbound) == "" {
-		matchOutbound = "direct"
+		matchOutbound = proxySelectorTag
 	}
 	finalOutbound := resolvePolicyOutboundTag(defaultMissPolicy, policyOutboundTag)
 	if strings.TrimSpace(finalOutbound) == "" {
-		finalOutbound = proxySelectorTag
+		finalOutbound = "direct"
 	}
 
 	routeRules := make([]any, 0, len(config.Rules))
@@ -520,6 +1450,8 @@ func buildRouteRuleSetDefinitions(config RuleConfigV2) []any {
 			entry["download_detour"] = "direct"
 			if provider.UpdateIntervalSec > 0 {
 				entry["update_interval"] = fmt.Sprintf("%ds", provider.UpdateIntervalSec)
+			} else {
+				entry["update_interval"] = defaultRuleSetUpdateInterval
 			}
 		}
 		definitions = append(definitions, entry)
@@ -640,37 +1572,43 @@ func buildPolicyGroupRuntimeOutbounds(
 				result[group.ID] = proxySelectorTag
 				continue
 			}
-			nodeIDs := resolveNodePoolRefsToNodeIDs(group.NodePool.Nodes, activeNodes)
-			if len(nodeIDs) == 0 {
-				result[group.ID] = proxySelectorTag
-				continue
-			}
-			nodeTags := make([]string, 0, len(nodeIDs))
-			for _, nodeID := range nodeIDs {
+			decision := resolveRulePoolDecision(group.NodePool, activeNodes, nodeByID)
+			nodeTags := make([]string, 0, len(decision.candidateNodeIDs))
+			seenTag := map[string]struct{}{}
+			for _, nodeID := range decision.candidateNodeIDs {
 				tag, ok := nodeTagsByID[nodeID]
 				if !ok {
 					continue
 				}
+				if _, exists := seenTag[tag]; exists {
+					continue
+				}
+				seenTag[tag] = struct{}{}
 				nodeTags = append(nodeTags, tag)
 			}
-			if len(nodeTags) == 0 {
-				result[group.ID] = proxySelectorTag
-				continue
+			fallbackTag := decision.fallbackOutboundTag
+			if strings.TrimSpace(fallbackTag) == "" {
+				fallbackTag = "block"
 			}
-			defaultTag := nodeTags[0]
-			if normalizeRuleNodeSelectStrategy(group.NodePool.NodeSelectStrategy) == RuleNodeSelectFastest {
-				if fastestNodeID, ok := pickBestRulePoolNodeID(nodeIDs, nodeByID); ok {
-					if fastestTag, exists := nodeTagsByID[fastestNodeID]; exists {
-						defaultTag = fastestTag
-					}
+			defaultTag := fallbackTag
+			if strings.TrimSpace(decision.selectedNodeID) != "" {
+				if selectedTag, exists := nodeTagsByID[decision.selectedNodeID]; exists {
+					defaultTag = selectedTag
 				}
+			}
+			selectorOutbounds := append([]string{}, nodeTags...)
+			if _, exists := seenTag[fallbackTag]; !exists {
+				selectorOutbounds = append(selectorOutbounds, fallbackTag)
+			}
+			if len(selectorOutbounds) == 0 {
+				selectorOutbounds = append(selectorOutbounds, fallbackTag)
 			}
 			selectorTag := buildPolicyGroupSelectorTag(group.ID, index)
 			result[group.ID] = selectorTag
 			extraOutbounds = append(extraOutbounds, map[string]any{
 				"type":                        "selector",
 				"tag":                         selectorTag,
-				"outbounds":                   nodeTags,
+				"outbounds":                   selectorOutbounds,
 				"default":                     defaultTag,
 				"interrupt_exist_connections": true,
 			})
@@ -812,12 +1750,22 @@ func buildGeoRuleSetRefs(
 				continue
 			}
 			if _, exists := generatedRuleSets[tag]; !exists {
-				generatedRuleSets[tag] = map[string]any{
-					"tag":             tag,
-					"type":            "remote",
-					"format":          "binary",
-					"url":             urlValue,
-					"download_detour": "direct",
+				if localPath, _, ok := statBuiltInRuleSetPath(kind, value); ok {
+					generatedRuleSets[tag] = map[string]any{
+						"tag":    tag,
+						"type":   "local",
+						"format": "binary",
+						"path":   localPath,
+					}
+				} else {
+					generatedRuleSets[tag] = map[string]any{
+						"tag":             tag,
+						"type":            "remote",
+						"format":          "binary",
+						"url":             urlValue,
+						"download_detour": "direct",
+						"update_interval": defaultRuleSetUpdateInterval,
+					}
 				}
 			}
 			ruleSetRefs = append(ruleSetRefs, tag)
@@ -836,7 +1784,7 @@ func normalizeGeoRuleSetValue(rawValue string) string {
 	builder := strings.Builder{}
 	builder.Grow(len(value))
 	for _, char := range value {
-		if (char >= 'a' && char <= 'z') || (char >= '0' && char <= '9') || char == '-' || char == '_' || char == '.' {
+		if (char >= 'a' && char <= 'z') || (char >= '0' && char <= '9') || char == '-' || char == '_' || char == '.' || char == '!' || char == '@' {
 			builder.WriteRune(char)
 			continue
 		}
@@ -897,28 +1845,16 @@ func resolveActiveGroupNodes(snapshot StateSnapshot) []Node {
 }
 
 func buildDNSConfig(snapshot StateSnapshot) map[string]any {
-	remoteServer := strings.TrimSpace(snapshot.DNSRemoteServer)
-	if remoteServer == "" {
-		remoteServer = defaultDNSRemoteServer
-	}
-	directServer := strings.TrimSpace(snapshot.DNSDirectServer)
-	if directServer == "" {
-		directServer = defaultDNSDirectServer
-	}
-	bootstrapServer := strings.TrimSpace(snapshot.DNSBootstrapServer)
-	if bootstrapServer == "" {
-		bootstrapServer = directServer
-	}
-	if bootstrapServer == "" {
-		bootstrapServer = defaultDNSBootstrapServer
-	}
-	strategy := normalizeDNSStrategy(snapshot.DNSStrategy)
-	if !isValidDNSStrategy(strategy) {
-		strategy = defaultDNSStrategy
+	dnsConfig, err := normalizeDNSConfig(snapshot.DNS)
+	if err != nil {
+		dnsConfig = defaultDNSConfig()
 	}
 	mode := normalizeProxyMode(snapshot.ProxyMode)
-	cacheCapacity := defaultDNSCacheCapacity
-	if snapshot.DNSFakeIPEnabled {
+	cacheCapacity := dnsConfig.Cache.Capacity
+	if cacheCapacity < 1024 {
+		cacheCapacity = defaultDNSCacheCapacity
+	}
+	if dnsConfig.FakeIP.Enabled {
 		cacheCapacity = fakeIPDNSCacheCapacity
 		if mode == ProxyModeTun {
 			cacheCapacity = tunFakeIPDNSCacheCapacity
@@ -930,44 +1866,69 @@ func buildDNSConfig(snapshot StateSnapshot) map[string]any {
 			"type": "local",
 			"tag":  localDNSServerTag,
 		},
-		buildModernDNSServer("remote", remoteServer, "proxy", localDNSServerTag),
+		buildStructuredDNSServer("remote", dnsConfig.Remote, bootstrapDNSServerTag),
 		map[string]any{
 			"type": "local",
 			"tag":  "local",
 		},
-		buildModernDNSServer("direct", directServer, "direct", localDNSServerTag),
-		buildModernDNSServer(bootstrapDNSServerTag, bootstrapServer, "direct", localDNSServerTag),
+		buildStructuredDNSServer("direct", dnsConfig.Direct, bootstrapDNSServerTag),
+		buildStructuredDNSServer(bootstrapDNSServerTag, dnsConfig.Bootstrap, ""),
 	}
-	rules := []any{
-		map[string]any{
-			"domain_suffix": []string{"lan", "local"},
-			"server":        "direct",
-		},
+	rules := make([]any, 0, len(dnsConfig.Rules)+1)
+	for _, rule := range dnsConfig.Rules {
+		if compiled := buildStructuredDNSRule(rule); compiled != nil {
+			rules = append(rules, compiled)
+		}
+	}
+	if hostsEntries := buildDNSHostsEntries(dnsConfig.Hosts); len(hostsEntries) > 0 {
+		servers = append(
+			servers,
+			map[string]any{
+				"type":       "hosts",
+				"tag":        dnsHostsOverrideServerTag,
+				"predefined": hostsEntries,
+			},
+		)
+		if domains := sortDNSHostsDomains(hostsEntries); len(domains) > 0 {
+			rules = append(
+				[]any{
+					map[string]any{
+						"domain": domains,
+						"action": "route",
+						"server": dnsHostsOverrideServerTag,
+					},
+				},
+				rules...,
+			)
+		}
 	}
 	dns := map[string]any{
 		"servers":           servers,
 		"rules":             rules,
-		"final":             "remote",
-		"strategy":          string(strategy),
-		"independent_cache": snapshot.DNSIndependentCache,
+		"final":             resolveDNSRuleServerTag(dnsConfig.Policy.Final),
+		"strategy":          string(dnsConfig.Policy.Strategy),
+		"independent_cache": dnsConfig.Cache.IndependentCache,
 		"cache_capacity":    cacheCapacity,
-		"reverse_mapping":   snapshot.DNSFakeIPEnabled,
+		"reverse_mapping":   dnsConfig.FakeIP.Enabled,
 	}
-
-	if snapshot.DNSFakeIPEnabled {
+	if clientSubnet := strings.TrimSpace(dnsConfig.Policy.ClientSubnet); clientSubnet != "" {
+		dns["client_subnet"] = clientSubnet
+	}
+	if dnsConfig.FakeIP.Enabled {
 		servers = append(
 			servers,
 			map[string]any{
 				"type":        "fakeip",
 				"tag":         "fakeip",
-				"inet4_range": firstNonEmpty(snapshot.DNSFakeIPV4Range, defaultDNSFakeIPV4Range),
-				"inet6_range": firstNonEmpty(snapshot.DNSFakeIPV6Range, defaultDNSFakeIPV6Range),
+				"inet4_range": firstNonEmpty(dnsConfig.FakeIP.IPv4Range, defaultDNSFakeIPV4Range),
+				"inet6_range": firstNonEmpty(dnsConfig.FakeIP.IPv6Range, defaultDNSFakeIPV6Range),
 			},
 		)
 		rules = append(
 			rules,
 			map[string]any{
 				"query_type": []string{"A", "AAAA"},
+				"action":     "route",
 				"server":     "fakeip",
 			},
 		)
@@ -975,6 +1936,114 @@ func buildDNSConfig(snapshot StateSnapshot) map[string]any {
 		dns["rules"] = rules
 	}
 	return dns
+}
+
+func buildDNSHostsEntries(config DNSHostsPolicy) map[string][]string {
+	entries := map[string][]string{}
+	if config.UseSystemHosts {
+		if systemEntries, err := loadSystemDNSHostsEntries(); err == nil && len(systemEntries) > 0 {
+			entries = mergeDNSHostsEntries(entries, systemEntries)
+		}
+	}
+	if config.UseCustomHosts {
+		customHosts := normalizeDNSHostsText(config.CustomHosts)
+		if customHosts != "" {
+			if customEntries, err := parseDNSHostsEntries(customHosts); err == nil && len(customEntries) > 0 {
+				// Custom records override system entries for same domain.
+				entries = mergeDNSHostsEntries(entries, customEntries)
+			}
+		}
+	}
+	return entries
+}
+
+func resolveDNSRuleServerTag(server DNSRuleServer) string {
+	switch normalizeDNSRuleServer(server) {
+	case DNSRuleServerDirect:
+		return "direct"
+	case DNSRuleServerBootstrap:
+		return bootstrapDNSServerTag
+	case DNSRuleServerFakeIP:
+		return "fakeip"
+	default:
+		return "remote"
+	}
+}
+
+func buildStructuredDNSServer(tag string, endpoint DNSResolverEndpoint, resolverTag string) map[string]any {
+	entry := map[string]any{
+		"type": string(endpoint.Type),
+		"tag":  tag,
+	}
+	switch endpoint.Type {
+	case DNSResolverTypeLocal, DNSResolverTypeHosts, DNSResolverTypeResolved:
+		return entry
+	case DNSResolverTypeDHCP:
+		if iface := strings.TrimSpace(endpoint.Interface); iface != "" && !strings.EqualFold(iface, "auto") {
+			entry["interface"] = iface
+		}
+		return entry
+	default:
+		entry["server"] = endpoint.Address
+		if endpoint.Port > 0 {
+			entry["server_port"] = endpoint.Port
+		}
+		if path := strings.TrimSpace(endpoint.Path); path != "" && (endpoint.Type == DNSResolverTypeHTTPS || endpoint.Type == DNSResolverTypeH3) {
+			entry["path"] = path
+		}
+		if normalizeDNSDetourMode(endpoint.Detour) == DNSDetourModeProxy {
+			entry["detour"] = proxySelectorTag
+		}
+		if shouldUseBootstrapResolver(endpoint.Address) && strings.TrimSpace(resolverTag) != "" && tag != resolverTag {
+			entry["domain_resolver"] = resolverTag
+		}
+		return entry
+	}
+}
+
+func buildStructuredDNSRule(rule DNSRule) map[string]any {
+	if !rule.Enabled {
+		return nil
+	}
+	action := normalizeDNSRuleActionType(rule.Action)
+	if action == "" {
+		return nil
+	}
+	compiled := map[string]any{}
+	if values := uniqueNonEmptyStrings(rule.Domain); len(values) > 0 {
+		compiled["domain"] = values
+	}
+	if values := uniqueNonEmptyStrings(rule.DomainSuffix); len(values) > 0 {
+		compiled["domain_suffix"] = values
+	}
+	if values := uniqueNonEmptyStrings(rule.DomainKeyword); len(values) > 0 {
+		compiled["domain_keyword"] = values
+	}
+	if values := uniqueNonEmptyStrings(rule.DomainRegex); len(values) > 0 {
+		compiled["domain_regex"] = values
+	}
+	if values := uniqueNonEmptyStrings(rule.QueryType); len(values) > 0 {
+		compiled["query_type"] = values
+	}
+	if values := uniqueNonEmptyStrings(rule.Outbound); len(values) > 0 {
+		compiled["outbound"] = values
+	}
+	if len(compiled) == 0 {
+		return nil
+	}
+	if action == DNSRuleActionTypeReject {
+		compiled["action"] = "reject"
+		return compiled
+	}
+	compiled["action"] = "route"
+	compiled["server"] = resolveDNSRuleServerTag(rule.Server)
+	if rule.DisableCache {
+		compiled["disable_cache"] = true
+	}
+	if subnet := strings.TrimSpace(rule.ClientSubnet); subnet != "" {
+		compiled["client_subnet"] = subnet
+	}
+	return compiled
 }
 
 type dnsServerSpec struct {
@@ -1123,19 +2192,27 @@ func splitServerPort(value string, defaultPort int) (string, int) {
 	return value, defaultPort
 }
 
-func buildExperimentalConfig(snapshot StateSnapshot) map[string]any {
+func buildExperimentalConfig(snapshot StateSnapshot, externalController string, disableCacheFile bool) map[string]any {
+	dnsConfig, err := normalizeDNSConfig(snapshot.DNS)
+	if err != nil {
+		dnsConfig = defaultDNSConfig()
+	}
+	controller := strings.TrimSpace(externalController)
+	if controller == "" {
+		controller = defaultClashAPIController
+	}
 	experimental := map[string]any{
 		"clash_api": map[string]any{
-			"external_controller": defaultClashAPIController,
+			"external_controller": controller,
 			"default_mode":        "Rule",
 		},
 	}
-	if snapshot.DNSCacheFileEnabled {
+	if dnsConfig.Cache.FileEnabled && !disableCacheFile {
 		experimental["cache_file"] = map[string]any{
 			"enabled":      true,
 			"path":         resolveDNSCacheFilePath(),
-			"store_rdrc":   snapshot.DNSCacheStoreRDRC,
-			"store_fakeip": snapshot.DNSFakeIPEnabled,
+			"store_rdrc":   dnsConfig.Cache.StoreRDRC,
+			"store_fakeip": dnsConfig.FakeIP.Enabled,
 			"rdrc_timeout": "7d",
 		}
 	}
@@ -1150,12 +2227,154 @@ func resolveDNSCacheFilePath() string {
 	return filepath.Join(configDir, "wateray", "singbox-cache.db")
 }
 
+func resolveRuleSetStorageDir() string {
+	configDir, err := os.UserConfigDir()
+	if err != nil || strings.TrimSpace(configDir) == "" {
+		return filepath.Join(os.TempDir(), "wateray", "rule-set")
+	}
+	return filepath.Join(configDir, "wateray", "rule-set")
+}
+
+func resolveBuiltInRuleSetPath(kind string, value string) (string, bool) {
+	normalizedKind := strings.ToLower(strings.TrimSpace(kind))
+	normalizedValue := normalizeGeoRuleSetValue(value)
+	if normalizedKind == "" || normalizedValue == "" {
+		return "", false
+	}
+	switch normalizedKind {
+	case "geoip", "geosite":
+	default:
+		return "", false
+	}
+	fileName := fmt.Sprintf("%s-%s.srs", normalizedKind, normalizedValue)
+	return filepath.Join(resolveRuleSetStorageDir(), fileName), true
+}
+
+func resolveBundledRuleSetStorageDirCandidates() []string {
+	baseDirs := resolveBundledInstallDirCandidates("")
+	candidates := make([]string, 0, len(baseDirs))
+	seen := map[string]struct{}{}
+	for _, baseDir := range baseDirs {
+		candidate := filepath.Clean(filepath.Join(baseDir, "rule-set"))
+		key := strings.ToLower(candidate)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		candidates = append(candidates, candidate)
+	}
+	return candidates
+}
+
+func resolveBundledBuiltInRuleSetPaths(kind string, value string) []string {
+	normalizedKind := strings.ToLower(strings.TrimSpace(kind))
+	normalizedValue := normalizeGeoRuleSetValue(value)
+	if normalizedKind == "" || normalizedValue == "" {
+		return nil
+	}
+	switch normalizedKind {
+	case "geoip", "geosite":
+	default:
+		return nil
+	}
+	fileName := fmt.Sprintf("%s-%s.srs", normalizedKind, normalizedValue)
+	candidates := make([]string, 0, 4)
+	seen := map[string]struct{}{}
+	for _, bundledDir := range resolveBundledRuleSetStorageDirCandidates() {
+		if strings.TrimSpace(bundledDir) == "" {
+			continue
+		}
+		candidate := filepath.Join(bundledDir, fileName)
+		key := strings.ToLower(candidate)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		candidates = append(candidates, candidate)
+	}
+	return candidates
+}
+
+func builtInRuleSetPathCandidates(kind string, value string) []string {
+	candidates := make([]string, 0, 4)
+	if localPath, ok := resolveBuiltInRuleSetPath(kind, value); ok {
+		candidates = append(candidates, localPath)
+	}
+	for _, bundledPath := range resolveBundledBuiltInRuleSetPaths(kind, value) {
+		duplicate := false
+		for _, candidate := range candidates {
+			if strings.EqualFold(candidate, bundledPath) {
+				duplicate = true
+				break
+			}
+		}
+		if duplicate {
+			continue
+		}
+		candidates = append(candidates, bundledPath)
+	}
+	return candidates
+}
+
+func copyBundledRuleSetToLocalIfNeeded(kind string, value string) (string, os.FileInfo, bool) {
+	localPath, ok := resolveBuiltInRuleSetPath(kind, value)
+	if !ok {
+		return "", nil, false
+	}
+	if fileInfo, err := os.Stat(localPath); err == nil && !fileInfo.IsDir() && fileInfo.Size() > 0 {
+		return localPath, fileInfo, true
+	}
+	for _, bundledPath := range resolveBundledBuiltInRuleSetPaths(kind, value) {
+		fileInfo, statErr := os.Stat(bundledPath)
+		if statErr != nil || fileInfo.IsDir() || fileInfo.Size() <= 0 {
+			continue
+		}
+		content, readErr := os.ReadFile(bundledPath)
+		if readErr == nil {
+			if mkdirErr := os.MkdirAll(filepath.Dir(localPath), 0o755); mkdirErr == nil {
+				_ = os.WriteFile(localPath, content, 0o644)
+				if copiedInfo, copiedErr := os.Stat(localPath); copiedErr == nil && !copiedInfo.IsDir() && copiedInfo.Size() > 0 {
+					return localPath, copiedInfo, true
+				}
+			}
+		}
+		return bundledPath, fileInfo, true
+	}
+	return "", nil, false
+}
+
+func statBuiltInRuleSetPath(kind string, value string) (string, os.FileInfo, bool) {
+	if localPath, fileInfo, ok := copyBundledRuleSetToLocalIfNeeded(kind, value); ok {
+		return localPath, fileInfo, true
+	}
+	for _, candidate := range builtInRuleSetPathCandidates(kind, value) {
+		fileInfo, statErr := os.Stat(candidate)
+		if statErr != nil || fileInfo.IsDir() || fileInfo.Size() <= 0 {
+			continue
+		}
+		return candidate, fileInfo, true
+	}
+	return "", nil, false
+}
+
 func runtimeNodeTag(nodeID string) string {
 	trimmed := strings.TrimSpace(nodeID)
 	if trimmed == "" {
 		return "node-default"
 	}
 	return "node-" + trimmed
+}
+
+func parseRuntimeNodeIDFromTag(chainTag string) (string, bool) {
+	trimmed := strings.TrimSpace(chainTag)
+	if !strings.HasPrefix(trimmed, "node-") {
+		return "", false
+	}
+	nodeID := strings.TrimSpace(strings.TrimPrefix(trimmed, "node-"))
+	if nodeID == "" {
+		return "", false
+	}
+	return nodeID, true
 }
 
 func toSingBoxLogLevel(level LogLevel) string {
@@ -1170,8 +2389,28 @@ func toSingBoxLogLevel(level LogLevel) string {
 		return "warn"
 	case LogLevelError:
 		return "error"
+	case LogLevelNone:
+		// Closest behavior to "none" in sing-box runtime log levels.
+		return "panic"
 	default:
 		return "error"
+	}
+}
+
+func toClashAPILogLevel(level LogLevel) string {
+	switch normalizeLogLevel(level) {
+	case LogLevelTrace, LogLevelDebug:
+		return "debug"
+	case LogLevelInfo:
+		return "info"
+	case LogLevelWarn:
+		return "warning"
+	case LogLevelError:
+		return "error"
+	case LogLevelNone:
+		return "silent"
+	default:
+		return "info"
 	}
 }
 
@@ -1264,7 +2503,7 @@ func resolveRuntimeNode(snapshot StateSnapshot) (Node, error) {
 	return activeGroup.Nodes[0], nil
 }
 
-func buildNodeOutbound(node Node) (map[string]any, error) {
+func buildNodeOutbound(node Node, muxConfig ProxyMuxConfig) (map[string]any, error) {
 	raw := parseNodeRawConfig(node.RawConfig)
 	if singboxOutbound, ok := toAnyMap(raw["singboxOutbound"]); ok {
 		cloned := cloneMap(singboxOutbound)
@@ -1277,6 +2516,7 @@ func buildNodeOutbound(node Node) (map[string]any, error) {
 		if anyToInt(cloned["server_port"]) <= 0 && node.Port > 0 {
 			cloned["server_port"] = node.Port
 		}
+		applyOutboundMultiplex(cloned, muxConfig)
 		applyOutboundDomainResolver(cloned, anyToString(cloned["server"]))
 		return cloned, nil
 	}
@@ -1320,6 +2560,7 @@ func buildNodeOutbound(node Node) (map[string]any, error) {
 			outbound["alter_id"] = alterID
 		}
 		applyTransportAndTLS(outbound, raw)
+		applyOutboundMultiplex(outbound, muxConfig)
 		applyOutboundDomainResolver(outbound, server)
 		return outbound, nil
 	case "vless":
@@ -1337,6 +2578,7 @@ func buildNodeOutbound(node Node) (map[string]any, error) {
 			outbound["flow"] = flow
 		}
 		applyTransportAndTLS(outbound, raw)
+		applyOutboundMultiplex(outbound, muxConfig)
 		applyOutboundDomainResolver(outbound, server)
 		return outbound, nil
 	case "trojan":
@@ -1351,6 +2593,7 @@ func buildNodeOutbound(node Node) (map[string]any, error) {
 			"password":    password,
 		}
 		applyTransportAndTLS(outbound, raw)
+		applyOutboundMultiplex(outbound, muxConfig)
 		applyOutboundDomainResolver(outbound, server)
 		return outbound, nil
 	case "shadowsocks":
@@ -1372,6 +2615,7 @@ func buildNodeOutbound(node Node) (map[string]any, error) {
 			"method":      method,
 			"password":    password,
 		}
+		applyOutboundMultiplex(outbound, muxConfig)
 		applyOutboundDomainResolver(outbound, server)
 		return outbound, nil
 	case "socks5":
@@ -1439,6 +2683,44 @@ func buildNodeOutbound(node Node) (map[string]any, error) {
 	}
 }
 
+func supportsOutboundMultiplex(outboundType string) bool {
+	switch strings.ToLower(strings.TrimSpace(outboundType)) {
+	case "vmess", "vless", "trojan", "shadowsocks":
+		return true
+	default:
+		return false
+	}
+}
+
+func hasEnabledUDPOverTCP(outbound map[string]any) bool {
+	if outbound == nil {
+		return false
+	}
+	raw, exists := outbound["udp_over_tcp"]
+	if !exists {
+		return false
+	}
+	if disabled, ok := raw.(bool); ok {
+		return !disabled
+	}
+	return true
+}
+
+func buildMuxOutboundConfig(config ProxyMuxConfig) map[string]any {
+	_ = config
+	// Mux is explicitly forbidden in runtime outbounds.
+	return nil
+}
+
+func applyOutboundMultiplex(outbound map[string]any, config ProxyMuxConfig) {
+	if outbound == nil {
+		return
+	}
+	_ = config
+	// Explicitly strip any multiplex stanza from raw node config.
+	delete(outbound, "multiplex")
+}
+
 func applyOutboundDomainResolver(outbound map[string]any, server string) {
 	if strings.TrimSpace(anyToString(outbound["domain_resolver"])) != "" {
 		return
@@ -1462,6 +2744,7 @@ func shouldUseBootstrapResolver(server string) bool {
 
 func applyTransportAndTLS(outbound map[string]any, raw map[string]any) {
 	transport := strings.ToLower(firstNonEmptyString(raw, "transport", "network", "net"))
+	headers := cloneMap(toFlatStringMap(raw["transport_headers"]))
 	switch transport {
 	case "ws", "websocket":
 		ws := map[string]any{
@@ -1471,9 +2754,16 @@ func applyTransportAndTLS(outbound map[string]any, raw map[string]any) {
 			ws["path"] = path
 		}
 		if host := firstNonEmptyString(raw, "host", "authority"); host != "" {
-			ws["headers"] = map[string]any{
-				"Host": host,
-			}
+			headers["Host"] = host
+		}
+		if len(headers) > 0 {
+			ws["headers"] = headers
+		}
+		if maxEarlyData := anyToInt(raw["ws_max_early_data"]); maxEarlyData > 0 {
+			ws["max_early_data"] = maxEarlyData
+		}
+		if headerName := firstNonEmptyString(raw, "ws_early_data_header_name"); headerName != "" {
+			ws["early_data_header_name"] = headerName
 		}
 		outbound["transport"] = ws
 	case "grpc":
@@ -1483,7 +2773,20 @@ func applyTransportAndTLS(outbound map[string]any, raw map[string]any) {
 		if serviceName := firstNonEmptyString(raw, "service_name", "serviceName"); serviceName != "" {
 			grpc["service_name"] = serviceName
 		}
+		if idleTimeout := firstNonEmptyString(raw, "grpc_idle_timeout"); idleTimeout != "" {
+			grpc["idle_timeout"] = idleTimeout
+		}
+		if pingTimeout := firstNonEmptyString(raw, "grpc_ping_timeout"); pingTimeout != "" {
+			grpc["ping_timeout"] = pingTimeout
+		}
+		if permitWithoutStream, ok := anyToBool(raw["grpc_permit_without_stream"]); ok {
+			grpc["permit_without_stream"] = permitWithoutStream
+		}
 		outbound["transport"] = grpc
+	case "quic":
+		outbound["transport"] = map[string]any{
+			"type": "quic",
+		}
 	case "http", "h2":
 		httpTransport := map[string]any{
 			"type": "http",
@@ -1493,6 +2796,18 @@ func applyTransportAndTLS(outbound map[string]any, raw map[string]any) {
 		}
 		if host := firstNonEmptyString(raw, "host", "authority"); host != "" {
 			httpTransport["host"] = []string{host}
+		}
+		if method := firstNonEmptyString(raw, "transport_method"); method != "" {
+			httpTransport["method"] = method
+		}
+		if len(headers) > 0 {
+			httpTransport["headers"] = headers
+		}
+		if idleTimeout := firstNonEmptyString(raw, "http_idle_timeout"); idleTimeout != "" {
+			httpTransport["idle_timeout"] = idleTimeout
+		}
+		if pingTimeout := firstNonEmptyString(raw, "http_ping_timeout"); pingTimeout != "" {
+			httpTransport["ping_timeout"] = pingTimeout
 		}
 		outbound["transport"] = httpTransport
 	case "httpupgrade", "http-upgrade":
@@ -1504,6 +2819,9 @@ func applyTransportAndTLS(outbound map[string]any, raw map[string]any) {
 		}
 		if host := firstNonEmptyString(raw, "host", "authority"); host != "" {
 			upgrade["host"] = host
+		}
+		if len(headers) > 0 {
+			upgrade["headers"] = headers
 		}
 		outbound["transport"] = upgrade
 	}
@@ -1532,6 +2850,21 @@ func applyTransportAndTLS(outbound map[string]any, raw map[string]any) {
 		tlsOptions["insecure"] = insecureValue
 	}
 	outbound["tls"] = tlsOptions
+}
+
+func toFlatStringMap(raw any) map[string]any {
+	value, ok := raw.(map[string]any)
+	if !ok {
+		return map[string]any{}
+	}
+	result := make(map[string]any, len(value))
+	for key, item := range value {
+		text := strings.TrimSpace(anyToString(item))
+		if text != "" {
+			result[key] = text
+		}
+	}
+	return result
 }
 
 func parseNodeRawConfig(rawConfig string) map[string]any {

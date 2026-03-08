@@ -16,8 +16,21 @@ core/*.so
 core/*.dylib
 core/*.test
 core/coverage.out
+core/cmd/waterayd/zz_wateray_server_windows_amd64.syso
 
 # Electron / Node
 ElectronApp/node_modules/
 ElectronApp/out/
 ElectronApp/.electron-vite/
+ElectronApp/out-package/
+ads-server/node_modules/
+ads-server/data/*.sqlite
+ads-server/data/*.sqlite-*
+
+# One-click build outputs
+Bin/
+
+# Runtime cache / generated docs
+core/cache.db
+docs/build/
+scripts/build/__pycache__/

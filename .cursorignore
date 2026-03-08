@@ -1,0 +1,11 @@
+Bin/
+core/bin/
+core/dist/
+core/prebuilt/
+core/cache.db
+docs/build/
+scripts/build/__pycache__/
+ElectronApp/node_modules/
+ElectronApp/.electron-vite/
+ElectronApp/out/
+ElectronApp/out-package/

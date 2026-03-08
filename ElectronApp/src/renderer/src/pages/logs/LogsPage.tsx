@@ -1,12 +1,9 @@
 import {
-  App as AntdApp,
-  Button,
   Card,
   Empty,
   Pagination,
   Select,
   Space,
-  Switch,
   Tabs,
   Tag,
   Typography,
@@ -15,6 +12,8 @@ import { useEffect, useMemo, useState } from "react";
 
 import type { LogLevel, RuntimeLogEntry } from "../../../../shared/daemon";
 import type { DaemonPageProps } from "../../app/types";
+import { SwitchWithLabel } from "../../components/form/SwitchWithLabel";
+import { useAppNotice } from "../../components/notify/AppNoticeProvider";
 import { daemonApi } from "../../services/daemonApi";
 
 type LogTabKey = "proxy" | "core" | "ui";
@@ -81,7 +80,7 @@ function splitLogPages(logs: RuntimeLogEntry[], maxBytesPerPage: number): Runtim
 }
 
 export function LogsPage({ snapshot, loading, runAction }: DaemonPageProps) {
-  const { message } = AntdApp.useApp();
+  const notice = useAppNotice();
   const [activeTab, setActiveTab] = useState<LogTabKey>("proxy");
   const [activePage, setActivePage] = useState<number>(1);
   const [proxyLevelDraft, setProxyLevelDraft] = useState<LogLevel>("info");
@@ -89,7 +88,6 @@ export function LogsPage({ snapshot, loading, runAction }: DaemonPageProps) {
   const [uiLevelDraft, setUiLevelDraft] = useState<LogLevel>("info");
   const [updatingLevel, setUpdatingLevel] = useState(false);
   const [updatingRecordToFile, setUpdatingRecordToFile] = useState(false);
-  const [savingLogs, setSavingLogs] = useState(false);
 
   useEffect(() => {
     if (!snapshot) {
@@ -131,6 +129,23 @@ export function LogsPage({ snapshot, loading, runAction }: DaemonPageProps) {
         return "info";
     }
   }, [activeTab, proxyLevelDraft, coreLevelDraft, uiLevelDraft]);
+
+  const activeRecordToFile = useMemo<boolean>(() => {
+    if (!snapshot) {
+      return true;
+    }
+    const fallback = snapshot.recordLogsToFile ?? true;
+    switch (activeTab) {
+      case "proxy":
+        return snapshot.proxyRecordLogsToFile ?? fallback;
+      case "core":
+        return snapshot.coreRecordLogsToFile ?? fallback;
+      case "ui":
+        return snapshot.uiRecordLogsToFile ?? fallback;
+      default:
+        return fallback;
+    }
+  }, [snapshot, activeTab]);
 
   const logPages = useMemo(
     () => splitLogPages(activeLogs, logPageSizeBytes),
@@ -182,9 +197,9 @@ export function LogsPage({ snapshot, loading, runAction }: DaemonPageProps) {
         default:
           break;
       }
-      message.success("日志等级已更新");
+      notice.success("日志等级已更新");
     } catch (error) {
-      message.error(error instanceof Error ? error.message : "更新日志等级失败");
+      notice.error(error instanceof Error ? error.message : "更新日志等级失败");
       if (snapshot) {
         setProxyLevelDraft(snapshot.proxyLogLevel);
         setCoreLevelDraft(snapshot.coreLogLevel);
@@ -195,41 +210,44 @@ export function LogsPage({ snapshot, loading, runAction }: DaemonPageProps) {
     }
   };
 
-  const updateRecordLogsToFile = async (enabled: boolean) => {
+  const updateRecordLogsToFile = async (tab: LogTabKey, enabled: boolean) => {
     if (updatingRecordToFile) {
       return;
     }
     setUpdatingRecordToFile(true);
     try {
-      await runAction(() =>
-        daemonApi.setSettings({
-          recordLogsToFile: enabled,
-        }),
-      );
-      message.success(enabled ? "已开启记录日志到文件" : "已关闭记录日志到文件");
-    } catch (error) {
-      message.error(error instanceof Error ? error.message : "更新日志文件记录开关失败");
-    } finally {
-      setUpdatingRecordToFile(false);
-    }
-  };
-
-  const saveActiveLogs = async () => {
-    if (savingLogs) {
-      return;
-    }
-    setSavingLogs(true);
-    try {
-      const path = await daemonApi.saveLogs(activeTab);
-      if (path) {
-        message.success(`日志已保存到: ${path}`);
-      } else {
-        message.success("日志已保存");
+      switch (tab) {
+        case "proxy":
+          await runAction(() =>
+            daemonApi.setSettings({
+              proxyRecordLogsToFile: enabled,
+            }),
+          );
+          notice.success(enabled ? "已开启代理日志保存" : "已关闭代理日志保存");
+          break;
+        case "core":
+          await runAction(() =>
+            daemonApi.setSettings({
+              coreRecordLogsToFile: enabled,
+            }),
+          );
+          notice.success(enabled ? "已开启内核日志保存" : "已关闭内核日志保存");
+          break;
+        case "ui":
+          await runAction(() =>
+            daemonApi.setSettings({
+              uiRecordLogsToFile: enabled,
+            }),
+          );
+          notice.success(enabled ? "已开启UI日志保存" : "已关闭UI日志保存");
+          break;
+        default:
+          break;
       }
     } catch (error) {
-      message.error(error instanceof Error ? error.message : "保存日志失败");
+      notice.error(error instanceof Error ? error.message : "更新日志文件记录开关失败");
     } finally {
-      setSavingLogs(false);
+      setUpdatingRecordToFile(false);
     }
   };
 
@@ -278,20 +296,15 @@ export function LogsPage({ snapshot, loading, runAction }: DaemonPageProps) {
               }
             }}
           />
-          <Typography.Text>记录日志到文件</Typography.Text>
-          <Switch
-            checked={snapshot?.recordLogsToFile ?? true}
+          <SwitchWithLabel
+            checked={activeRecordToFile}
             loading={updatingRecordToFile}
             onChange={(checked) => {
-              void updateRecordLogsToFile(checked);
+              void updateRecordLogsToFile(activeTab, checked);
             }}
+            label="保存日志"
           />
-          <Button type="primary" onClick={() => void saveActiveLogs()} loading={savingLogs}>
-            保存日志
-          </Button>
-          <Typography.Text type="secondary">
-            选择 none 将不再记录新日志
-          </Typography.Text>
+          
         </Space>
 
         {activeLogs.length === 0 ? (

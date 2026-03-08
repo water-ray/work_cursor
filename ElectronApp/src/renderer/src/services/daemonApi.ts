@@ -1,17 +1,45 @@
 import type {
+  AddManualNodeRequestPayload,
+  BackgroundTask,
+  ClearProbeDataRequestPayload,
+  ConfigCatalog,
+  ConfigCatalogEntry,
+  CreateConfigBackupRequestPayload,
+  DNSConfig,
+  DNSHealthReport,
   DaemonRequestPayload,
   DaemonSnapshot,
-  DNSStrategy,
+  ExportConfigContentRequestPayload,
+  ExportConfigContentResult,
+  ImportConfigSummary,
   LogLevel,
-  NodeProtocol,
+  LoopbackExemptResult,
+  ImportManualNodesTextRequestPayload,
+  ProbeNodesRequestPayload,
+  ProbeNodesSummary,
+  ProbeSettings,
+  ProxyMuxConfig,
   ProxyMode,
+  ProxyTunStack,
   RuleConfigV2,
+  RuleSetLocalStatus,
+  RuleSetDownloadMode,
+  RestoreConfigRequestPayload,
+  OperationStatus,
+  StartPrecheckResult,
+  RuleSetUpdateSummary,
+  ResetTrafficStatsRequestPayload,
   RoutingMode,
+  TrafficMonitorIntervalSec,
+  UpdateNodeCountriesRequestPayload,
+  UpdateManualNodeRequestPayload,
 } from "../../../shared/daemon";
+import { daemonTransportStore } from "./daemonTransportStore";
 
 function shouldSkipUILog(path: string): boolean {
   return (
     path.startsWith("/v1/state") ||
+    path === "/v1/session/heartbeat" ||
     path === "/v1/logs/ui" ||
     path === "/v1/logs/save" ||
     path === "/v1/logs/stream"
@@ -38,6 +66,7 @@ async function requestSnapshot(
 ): Promise<DaemonSnapshot> {
   const trackUILog = !shouldSkipUILog(payload.path);
   const response = await window.waterayDesktop.daemon.request(payload);
+  daemonTransportStore.mergeResponse(response);
   if (!response.ok || !response.snapshot) {
     if (trackUILog) {
       void appendUILog(
@@ -53,11 +82,41 @@ async function requestSnapshot(
   return response.snapshot;
 }
 
-async function requestWithoutSnapshot(
-  payload: DaemonRequestPayload,
-): Promise<{ savedPath?: string }> {
+async function requestSnapshotWithImportSummary(payload: DaemonRequestPayload): Promise<{
+  snapshot: DaemonSnapshot;
+  summary?: ImportConfigSummary;
+  task?: BackgroundTask;
+  operation?: OperationStatus;
+}> {
   const trackUILog = !shouldSkipUILog(payload.path);
   const response = await window.waterayDesktop.daemon.request(payload);
+  daemonTransportStore.mergeResponse(response);
+  if (!response.ok || !response.snapshot) {
+    if (trackUILog) {
+      void appendUILog(
+        "error",
+        `UI请求失败 ${payload.method} ${payload.path}: ${response.error ?? "daemon request failed"}`,
+      );
+    }
+    throw new Error(response.error ?? "daemon request failed");
+  }
+  if (trackUILog) {
+    void appendUILog("info", `UI请求成功 ${payload.method} ${payload.path}`);
+  }
+  return {
+    snapshot: response.snapshot,
+    summary: response.importSummary,
+    task: response.task,
+    operation: response.operation,
+  };
+}
+
+async function requestWithoutSnapshot(
+  payload: DaemonRequestPayload,
+): Promise<{ savedPath?: string; activeSessions?: number }> {
+  const trackUILog = !shouldSkipUILog(payload.path);
+  const response = await window.waterayDesktop.daemon.request(payload);
+  daemonTransportStore.mergeResponse(response);
   if (!response.ok) {
     if (trackUILog) {
       void appendUILog(
@@ -72,6 +131,7 @@ async function requestWithoutSnapshot(
   }
   return {
     savedPath: response.savedPath,
+    activeSessions: response.activeSessions,
   };
 }
 
@@ -81,6 +141,7 @@ export const daemonApi = {
     return requestSnapshot({
       method: "GET",
       path: `/v1/state?${query}`,
+      timeoutMs: 8000,
     });
   },
   addSubscription(name: string, url: string): Promise<DaemonSnapshot> {
@@ -111,16 +172,185 @@ export const daemonApi = {
       body: { nodeId, groupId },
     });
   },
-  probeNodes(input: {
-    groupId?: string;
-    nodeIds?: string[];
-    url?: string;
-    timeoutMs?: number;
-  }): Promise<DaemonSnapshot> {
-    return requestSnapshot({
+  async probeNodesWithSummary(input: ProbeNodesRequestPayload): Promise<{
+    snapshot: DaemonSnapshot;
+    summary?: ProbeNodesSummary;
+    task?: BackgroundTask;
+  }> {
+    const payload: DaemonRequestPayload = {
       method: "POST",
       path: "/v1/nodes/probe",
       body: input,
+    };
+    const trackUILog = !shouldSkipUILog(payload.path);
+    const response = await window.waterayDesktop.daemon.request(payload);
+    daemonTransportStore.mergeResponse(response);
+    if (!response.ok || !response.snapshot) {
+      if (trackUILog) {
+        void appendUILog(
+          "error",
+          `UI请求失败 ${payload.method} ${payload.path}: ${response.error ?? "daemon request failed"}`,
+        );
+      }
+      throw new Error(response.error ?? "daemon request failed");
+    }
+    if (trackUILog) {
+      void appendUILog("info", `UI请求成功 ${payload.method} ${payload.path}`);
+    }
+    return {
+      snapshot: response.snapshot,
+      summary: response.probeSummary,
+      task: response.task,
+    };
+  },
+  async probeNodes(input: ProbeNodesRequestPayload): Promise<DaemonSnapshot> {
+    const result = await daemonApi.probeNodesWithSummary(input);
+    return result.snapshot;
+  },
+  removeBackgroundTask(taskId: string): Promise<DaemonSnapshot> {
+    return requestSnapshot({
+      method: "DELETE",
+      path: `/v1/tasks/background?taskId=${encodeURIComponent(taskId.trim())}`,
+    });
+  },
+  clearProbeData(input: ClearProbeDataRequestPayload): Promise<DaemonSnapshot> {
+    return requestSnapshot({
+      method: "POST",
+      path: "/v1/nodes/probe/clear",
+      body: input,
+    });
+  },
+  resetTrafficStats(input: ResetTrafficStatsRequestPayload): Promise<DaemonSnapshot> {
+    return requestSnapshot({
+      method: "POST",
+      path: "/v1/nodes/traffic/reset",
+      body: input,
+    });
+  },
+  async updateNodeCountries(input: UpdateNodeCountriesRequestPayload): Promise<{
+    snapshot: DaemonSnapshot;
+    task?: BackgroundTask;
+  }> {
+    const payload: DaemonRequestPayload = {
+      method: "POST",
+      path: "/v1/nodes/country/update",
+      body: input,
+    };
+    const trackUILog = !shouldSkipUILog(payload.path);
+    const response = await window.waterayDesktop.daemon.request(payload);
+    daemonTransportStore.mergeResponse(response);
+    if (!response.ok || !response.snapshot) {
+      if (trackUILog) {
+        void appendUILog(
+          "error",
+          `UI请求失败 ${payload.method} ${payload.path}: ${response.error ?? "daemon request failed"}`,
+        );
+      }
+      throw new Error(response.error ?? "daemon request failed");
+    }
+    if (trackUILog) {
+      void appendUILog("info", `UI请求成功 ${payload.method} ${payload.path}`);
+    }
+    return {
+      snapshot: response.snapshot,
+      task: response.task,
+    };
+  },
+  async getConfigCatalog(): Promise<ConfigCatalog> {
+    const payload: DaemonRequestPayload = {
+      method: "GET",
+      path: "/v1/config/catalog",
+    };
+    const trackUILog = !shouldSkipUILog(payload.path);
+    const response = await window.waterayDesktop.daemon.request(payload);
+    daemonTransportStore.mergeResponse(response);
+    if (!response.ok || !response.configCatalog) {
+      if (trackUILog) {
+        void appendUILog(
+          "error",
+          `UI请求失败 ${payload.method} ${payload.path}: ${response.error ?? "daemon request failed"}`,
+        );
+      }
+      throw new Error(response.error ?? "daemon request failed");
+    }
+    if (trackUILog) {
+      void appendUILog("info", `UI请求成功 ${payload.method} ${payload.path}`);
+    }
+    return response.configCatalog;
+  },
+  async createConfigBackup(
+    input: CreateConfigBackupRequestPayload,
+  ): Promise<ConfigCatalogEntry> {
+    const payload: DaemonRequestPayload = {
+      method: "POST",
+      path: "/v1/config/backup/create",
+      body: input,
+    };
+    const trackUILog = !shouldSkipUILog(payload.path);
+    const response = await window.waterayDesktop.daemon.request(payload);
+    if (!response.ok || !response.configEntry) {
+      if (trackUILog) {
+        void appendUILog(
+          "error",
+          `UI请求失败 ${payload.method} ${payload.path}: ${response.error ?? "daemon request failed"}`,
+        );
+      }
+      throw new Error(response.error ?? "daemon request failed");
+    }
+    if (trackUILog) {
+      void appendUILog("info", `UI请求成功 ${payload.method} ${payload.path}`);
+    }
+    return response.configEntry;
+  },
+  restoreConfig(input: RestoreConfigRequestPayload): Promise<{
+    snapshot: DaemonSnapshot;
+    summary?: ImportConfigSummary;
+    task?: BackgroundTask;
+    operation?: OperationStatus;
+  }> {
+    return requestSnapshotWithImportSummary({
+      method: "POST",
+      path: "/v1/config/restore",
+      body: input,
+    });
+  },
+  async exportConfigContent(
+    input: ExportConfigContentRequestPayload,
+  ): Promise<ExportConfigContentResult> {
+    const payload: DaemonRequestPayload = {
+      method: "POST",
+      path: "/v1/config/export/content",
+      body: input,
+    };
+    const trackUILog = !shouldSkipUILog(payload.path);
+    const response = await window.waterayDesktop.daemon.request(payload);
+    daemonTransportStore.mergeResponse(response);
+    if (!response.ok || !response.exportContent) {
+      if (trackUILog) {
+        void appendUILog(
+          "error",
+          `UI请求失败 ${payload.method} ${payload.path}: ${response.error ?? "daemon request failed"}`,
+        );
+      }
+      throw new Error(response.error ?? "daemon request failed");
+    }
+    if (trackUILog) {
+      void appendUILog("info", `UI请求成功 ${payload.method} ${payload.path}`);
+    }
+    return response.exportContent;
+  },
+  async importConfigContent(content: string): Promise<{
+    snapshot: DaemonSnapshot;
+    summary?: ImportConfigSummary;
+    task?: BackgroundTask;
+    operation?: OperationStatus;
+  }> {
+    return requestSnapshotWithImportSummary({
+      method: "POST",
+      path: "/v1/config/import/content",
+      body: {
+        content,
+      },
     });
   },
   removeGroup(groupId: string): Promise<DaemonSnapshot> {
@@ -140,17 +370,7 @@ export const daemonApi = {
       body: input,
     });
   },
-  addManualNode(input: {
-    groupId: string;
-    name: string;
-    region: string;
-    country?: string;
-    address: string;
-    port: number;
-    transport: string;
-    protocol: NodeProtocol;
-    rawConfig?: string;
-  }): Promise<DaemonSnapshot> {
+  addManualNode(input: AddManualNodeRequestPayload): Promise<DaemonSnapshot> {
     return requestSnapshot({
       method: "POST",
       path: "/v1/nodes/manual",
@@ -158,6 +378,23 @@ export const daemonApi = {
         ...input,
         rawConfig: input.rawConfig ?? "",
       },
+    });
+  },
+  updateManualNode(input: UpdateManualNodeRequestPayload): Promise<DaemonSnapshot> {
+    return requestSnapshot({
+      method: "POST",
+      path: "/v1/nodes/manual/update",
+      body: {
+        ...input,
+        rawConfig: input.rawConfig ?? "",
+      },
+    });
+  },
+  importManualNodesText(input: ImportManualNodesTextRequestPayload): Promise<DaemonSnapshot> {
+    return requestSnapshot({
+      method: "POST",
+      path: "/v1/nodes/manual/import-text",
+      body: input,
     });
   },
   transferNodes(input: {
@@ -212,12 +449,95 @@ export const daemonApi = {
       body: { config },
     });
   },
-  hotReloadRules(): Promise<DaemonSnapshot> {
-    return requestSnapshot({
+  async updateRuleSets(input: {
+    geoip?: string[];
+    geosite?: string[];
+    downloadMode: RuleSetDownloadMode;
+  }): Promise<{
+    snapshot: DaemonSnapshot;
+    summary: RuleSetUpdateSummary;
+    error?: string;
+    task?: BackgroundTask;
+  }> {
+    const payload: DaemonRequestPayload = {
       method: "POST",
-      path: "/v1/rules/reload",
-      body: {},
-    });
+      path: "/v1/rulesets/update",
+      body: {
+        geoip: input.geoip ?? [],
+        geosite: input.geosite ?? [],
+        downloadMode: input.downloadMode,
+      },
+    };
+    const trackUILog = !shouldSkipUILog(payload.path);
+    const response = await window.waterayDesktop.daemon.request(payload);
+    daemonTransportStore.mergeResponse(response);
+    if (!response.snapshot) {
+      if (trackUILog) {
+        void appendUILog(
+          "error",
+          `UI请求失败 ${payload.method} ${payload.path}: ${response.error ?? "daemon request failed"}`,
+        );
+      }
+      throw new Error(response.error ?? "daemon request failed");
+    }
+    if (trackUILog) {
+      if (response.ok) {
+        void appendUILog("info", `UI请求成功 ${payload.method} ${payload.path}`);
+      } else {
+        void appendUILog(
+          "warn",
+          `UI请求部分失败 ${payload.method} ${payload.path}: ${response.error ?? "rule-set update failed"}`,
+        );
+      }
+    }
+    const summary: RuleSetUpdateSummary = response.ruleSetUpdate ?? {
+      requested: (input.geoip?.length ?? 0) + (input.geosite?.length ?? 0),
+      success: 0,
+      failed: 0,
+      updatedTags: [],
+      failedItems: [],
+    };
+    return {
+      snapshot: response.snapshot,
+      summary,
+      error: response.ok ? undefined : (response.error ?? "rule-set update failed"),
+      task: response.task,
+    };
+  },
+  async getRuleSetStatuses(input: {
+    geoip?: string[];
+    geosite?: string[];
+  }): Promise<{
+    snapshot: DaemonSnapshot;
+    statuses: RuleSetLocalStatus[];
+  }> {
+    const payload: DaemonRequestPayload = {
+      method: "POST",
+      path: "/v1/rulesets/status",
+      body: {
+        geoip: input.geoip ?? [],
+        geosite: input.geosite ?? [],
+      },
+    };
+    const trackUILog = !shouldSkipUILog(payload.path);
+    const response = await window.waterayDesktop.daemon.request(payload);
+    daemonTransportStore.mergeResponse(response);
+    if (!response.ok || !response.snapshot) {
+      if (trackUILog) {
+        void appendUILog(
+          "error",
+          `UI请求失败 ${payload.method} ${payload.path}: ${response.error ?? "daemon request failed"}`,
+        );
+      }
+      throw new Error(response.error ?? "daemon request failed");
+    }
+    if (trackUILog) {
+      void appendUILog("info", `UI请求成功 ${payload.method} ${payload.path}`);
+    }
+    return {
+      snapshot: response.snapshot,
+      statuses: response.ruleSetStatuses ?? [],
+    };
   },
   upsertRuleProfile(input: {
     profileId?: string;
@@ -244,35 +564,81 @@ export const daemonApi = {
     });
   },
   setSettings(input: {
+    applyRuntime?: boolean;
     autoConnect?: boolean;
+    trafficMonitorIntervalSec?: TrafficMonitorIntervalSec;
     tunEnabled?: boolean;
     systemProxyEnabled?: boolean;
     proxyMode?: ProxyMode;
+    clearDNSCacheOnRestart?: boolean;
     sniffEnabled?: boolean;
     sniffOverrideDestination?: boolean;
     sniffTimeoutMs?: number;
+    blockQuic?: boolean;
+    blockUdp?: boolean;
+    mux?: ProxyMuxConfig;
     proxyLogLevel?: LogLevel;
     coreLogLevel?: LogLevel;
     uiLogLevel?: LogLevel;
     recordLogsToFile?: boolean;
+    proxyRecordLogsToFile?: boolean;
+    coreRecordLogsToFile?: boolean;
+    uiRecordLogsToFile?: boolean;
     localProxyPort?: number;
+    tunMtu?: number;
+    tunStack?: ProxyTunStack;
     allowExternalConnections?: boolean;
-    dnsRemoteServer?: string;
-    dnsDirectServer?: string;
-    dnsBootstrapServer?: string;
-    dnsStrategy?: DNSStrategy;
-    dnsIndependentCache?: boolean;
-    dnsCacheFileEnabled?: boolean;
-    dnsCacheStoreRDRC?: boolean;
-    dnsFakeIPEnabled?: boolean;
-    dnsFakeIPV4Range?: string;
-    dnsFakeIPV6Range?: string;
+    dns?: DNSConfig;
+    probeSettings?: ProbeSettings;
   }): Promise<DaemonSnapshot> {
     return requestSnapshot({
       method: "POST",
       path: "/v1/settings",
       body: input,
     });
+  },
+  async checkDNSHealth(input?: {
+    domain?: string;
+    timeoutMs?: number;
+  }): Promise<{
+    snapshot: DaemonSnapshot;
+    report: DNSHealthReport;
+    error?: string;
+  }> {
+    const payload: DaemonRequestPayload = {
+      method: "POST",
+      path: "/v1/dns/health",
+      body: {
+        domain: input?.domain ?? "",
+        timeoutMs: input?.timeoutMs ?? 5000,
+      },
+    };
+    const trackUILog = !shouldSkipUILog(payload.path);
+    const response = await window.waterayDesktop.daemon.request(payload);
+    if (!response.snapshot || !response.dnsHealth) {
+      if (trackUILog) {
+        void appendUILog(
+          "error",
+          `UI请求失败 ${payload.method} ${payload.path}: ${response.error ?? "daemon request failed"}`,
+        );
+      }
+      throw new Error(response.error ?? "daemon request failed");
+    }
+    if (trackUILog) {
+      if (response.ok) {
+        void appendUILog("info", `UI请求成功 ${payload.method} ${payload.path}`);
+      } else {
+        void appendUILog(
+          "warn",
+          `UI请求部分失败 ${payload.method} ${payload.path}: ${response.error ?? "dns health check failed"}`,
+        );
+      }
+    }
+    return {
+      snapshot: response.snapshot,
+      report: response.dnsHealth,
+      error: response.ok ? undefined : (response.error ?? "dns health check failed"),
+    };
   },
   clearDNSCache(): Promise<DaemonSnapshot> {
     return requestSnapshot({
@@ -281,12 +647,68 @@ export const daemonApi = {
       body: {},
     });
   },
+  async exemptWindowsLoopback(): Promise<{
+    snapshot: DaemonSnapshot;
+    result: LoopbackExemptResult;
+    error?: string;
+  }> {
+    const payload: DaemonRequestPayload = {
+      method: "POST",
+      path: "/v1/system/loopback/exempt",
+      body: {},
+    };
+    const trackUILog = !shouldSkipUILog(payload.path);
+    const response = await window.waterayDesktop.daemon.request(payload);
+    if (!response.snapshot || !response.loopbackExempt) {
+      if (trackUILog) {
+        void appendUILog(
+          "error",
+          `UI请求失败 ${payload.method} ${payload.path}: ${response.error ?? "daemon request failed"}`,
+        );
+      }
+      throw new Error(response.error ?? "daemon request failed");
+    }
+    if (trackUILog) {
+      if (response.ok) {
+        void appendUILog("info", `UI请求成功 ${payload.method} ${payload.path}`);
+      } else {
+        void appendUILog(
+          "warn",
+          `UI请求部分失败 ${payload.method} ${payload.path}: ${response.error ?? "loopback exempt failed"}`,
+        );
+      }
+    }
+    return {
+      snapshot: response.snapshot,
+      result: response.loopbackExempt,
+      error: response.ok ? undefined : (response.error ?? "loopback exempt failed"),
+    };
+  },
   async setLogStreamEnabled(enabled: boolean): Promise<void> {
     await requestWithoutSnapshot({
       method: "POST",
       path: "/v1/logs/stream",
       body: { enabled },
+      timeoutMs: 5000,
     });
+  },
+  async touchClientSession(sessionId: string, ttlSec = 45): Promise<number> {
+    const result = await requestWithoutSnapshot({
+      method: "POST",
+      path: "/v1/session/heartbeat",
+      body: { sessionId, ttlSec },
+      timeoutMs: 5000,
+    });
+    return Math.max(0, Number(result.activeSessions ?? 0));
+  },
+  async disconnectClientSession(sessionId: string): Promise<number> {
+    const result = await requestWithoutSnapshot({
+      method: "POST",
+      path: "/v1/session/disconnect",
+      body: { sessionId },
+      timeoutMs: 5000,
+    });
+    return Math.max(0, Number(result.activeSessions ?? 0));
   },
   async saveLogs(kind: "proxy" | "core" | "ui"): Promise<string> {
     const result = await requestWithoutSnapshot({
@@ -296,10 +718,46 @@ export const daemonApi = {
     });
     return result.savedPath ?? "";
   },
+  async checkStartPreconditions(): Promise<{
+    snapshot: DaemonSnapshot;
+    result: StartPrecheckResult;
+  }> {
+    const payload: DaemonRequestPayload = {
+      method: "POST",
+      path: "/v1/connection/start/precheck",
+      body: {},
+      timeoutMs: 8000,
+    };
+    const trackUILog = !shouldSkipUILog(payload.path);
+    const response = await window.waterayDesktop.daemon.request(payload);
+    if (!response.ok || !response.snapshot || !response.startPrecheck) {
+      if (trackUILog) {
+        void appendUILog(
+          "error",
+          `UI请求失败 ${payload.method} ${payload.path}: ${response.error ?? "daemon request failed"}`,
+        );
+      }
+      throw new Error(response.error ?? "daemon request failed");
+    }
+    if (trackUILog) {
+      void appendUILog("info", `UI请求成功 ${payload.method} ${payload.path}`);
+    }
+    return {
+      snapshot: response.snapshot,
+      result: response.startPrecheck,
+    };
+  },
   startConnection(): Promise<DaemonSnapshot> {
     return requestSnapshot({
       method: "POST",
       path: "/v1/connection/start",
+      body: {},
+    });
+  },
+  restartConnection(): Promise<DaemonSnapshot> {
+    return requestSnapshot({
+      method: "POST",
+      path: "/v1/connection/restart",
       body: {},
     });
   },

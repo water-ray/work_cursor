@@ -1,13 +1,5 @@
-import {
-  ApiOutlined,
-  GlobalOutlined,
-  HomeOutlined,
-  PartitionOutlined,
-  SettingOutlined,
-  SolutionOutlined,
-  UnorderedListOutlined,
-} from "@ant-design/icons";
 import type { ReactNode } from "react";
+import { BiIcon } from "../../components/icons/BiIcon";
 
 export interface NavRoute {
   key: string;
@@ -20,12 +12,12 @@ export interface NavRoute {
 
 export const navRoutes: NavRoute[] = [
   {
-    key: "dashboard",
-    path: "/dashboard",
-    title: "首页",
-    tip: "快速连接与运行状态总览",
-    label: "首页",
-    icon: <HomeOutlined />,
+    key: "proxy",
+    path: "/proxy",
+    title: "代理",
+    tip: "配置端口、系统代理与虚拟网卡模式",
+    label: "代理",
+    icon: <BiIcon name="globe2" />,
   },
   {
     key: "subscriptions",
@@ -33,23 +25,7 @@ export const navRoutes: NavRoute[] = [
     title: "订阅",
     tip: "管理订阅、分组和节点",
     label: "订阅",
-    icon: <UnorderedListOutlined />,
-  },
-  {
-    key: "proxy",
-    path: "/proxy",
-    title: "代理",
-    tip: "配置端口、系统代理与虚拟网卡模式",
-    label: "代理",
-    icon: <GlobalOutlined />,
-  },
-  {
-    key: "dns",
-    path: "/dns",
-    title: "DNS",
-    tip: "管理远程/直连/节点解析 DNS 与 FakeIP",
-    label: "DNS",
-    icon: <ApiOutlined />,
+    icon: <BiIcon name="list-ul" />,
   },
   {
     key: "rules",
@@ -57,15 +33,32 @@ export const navRoutes: NavRoute[] = [
     title: "规则",
     tip: "配置路由模式和生效分组",
     label: "规则",
-    icon: <PartitionOutlined />,
+    icon: <BiIcon name="diagram-2" />,
   },
+  {
+    key: "dns",
+    path: "/dns",
+    title: "DNS",
+    tip: "管理远程/直连/节点解析 DNS 与 FakeIP",
+    label: "DNS",
+    icon: <BiIcon name="diagram-3" />,
+  },
+ 
   {
     key: "logs",
     path: "/logs",
     title: "日志",
     tip: "查看运行日志",
     label: "日志",
-    icon: <SolutionOutlined />,
+    icon: <BiIcon name="journal-text" />,
+  },
+  {
+    key: "airport",
+    path: "/airport",
+    title: "机场",
+    tip: "访问机场广告与评测页面",
+    label: "机场",
+    icon: <BiIcon name="airplane" />,
   },
   {
     key: "settings",
@@ -73,7 +66,7 @@ export const navRoutes: NavRoute[] = [
     title: "设置",
     tip: "客户端偏好和内核开关",
     label: "设置",
-    icon: <SettingOutlined />,
+    icon: <BiIcon name="gear" />,
   },
 ];
 

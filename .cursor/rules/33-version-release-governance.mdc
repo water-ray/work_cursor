@@ -1,0 +1,23 @@
+---
+description: Unified SemVer governance for version, build, and release files
+globs: "{VERSION,ElectronApp/**/*,core/**/*,scripts/**/*,docs/build/**/*}"
+alwaysApply: false
+---
+
+# Version And Release Governance
+
+- Use repository root `VERSION` as the single source of truth and keep format strictly `X.Y.Z`.
+- Core daemon and Electron frontend must share the same version in every release.
+- SemVer bump rules:
+  - New feature -> bump `MINOR`
+  - Bug fix or optimization/refactor -> bump `PATCH`
+  - Breaking change -> bump `MAJOR`
+- Release stage must run `scripts/release/release_version.py` to sync versions and generate `docs/build/CHANGELOG_LATEST.md`.
+- Build scripts must inject core version from `VERSION` and reject packaging when frontend/backend versions are inconsistent.
+
+## Example
+
+```text
+GOOD: VERSION=1.4.0, package.json=1.4.0, WaterayServer reports 1.4.0, CHANGELOG_LATEST generated.
+BAD: VERSION=1.4.0 but package.json=1.3.9, and release artifacts are built without syncing changelog/version files.
+```

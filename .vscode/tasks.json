@@ -6,7 +6,10 @@
       "type": "shell",
       "command": "npm run dev",
       "options": {
-        "cwd": "${workspaceFolder}/ElectronApp"
+        "cwd": "${workspaceFolder}/ElectronApp",
+        "env": {
+          "WATERAY_APP_MODE": "dev"
+        }
       },
       "group": "build",
       "isBackground": true,
@@ -48,6 +51,22 @@
       }
     },
     {
+      "label": "wateray: run ads server",
+      "type": "shell",
+      "command": "npm run dev",
+      "options": {
+        "cwd": "${workspaceFolder}/ads-server"
+      },
+      "group": "build",
+      "isBackground": true,
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": false
+      }
+    },
+    {
       "label": "wateray: run vpn core",
       "type": "shell",
       "command": "go run -tags with_clash_api,with_gvisor ./cmd/waterayd",
@@ -62,6 +81,90 @@
         "panel": "dedicated",
         "focus": false
       }
+    },
+    {
+      "label": "wateray: build windows client",
+      "type": "shell",
+      "command": "python scripts/build/build_windows_client.py",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": "build",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": false
+      }
+    },
+    {
+      "label": "wateray: release dry-run (patch)",
+      "type": "shell",
+      "command": "python scripts/release/release_version.py patch --dry-run",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": "build",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": false
+      }
+    },
+    {
+      "label": "wateray: release patch",
+      "type": "shell",
+      "command": "python scripts/release/release_version.py patch",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": "build",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": false
+      }
+    },
+    {
+      "label": "wateray: release minor",
+      "type": "shell",
+      "command": "python scripts/release/release_version.py minor",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": "build",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": false
+      }
+    },
+    {
+      "label": "wateray: release major",
+      "type": "shell",
+      "command": "python scripts/release/release_version.py major",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": "build",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": false
+      }
+    },
+    {
+      "label": "wateray: release patch + build windows client",
+      "dependsOn": [
+        "wateray: release patch",
+        "wateray: build windows client"
+      ],
+      "dependsOrder": "sequence",
+      "problemMatcher": []
     },
     {
       "label": "wateray: run desktop stack",

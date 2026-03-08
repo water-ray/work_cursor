@@ -1,4 +1,5 @@
 import "antd/dist/reset.css";
+import "bootstrap-icons/font/bootstrap-icons.css";
 import "./styles/global.css";
 
 import React from "react";

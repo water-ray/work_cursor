@@ -1,6 +1,7 @@
 import { App as AntdApp, ConfigProvider, theme } from "antd";
 import { HashRouter } from "react-router-dom";
 
+import { AppNoticeProvider } from "../components/notify/AppNoticeProvider";
 import { AppShell } from "./layout/AppShell";
 
 export function App() {
@@ -15,9 +16,11 @@ export function App() {
       }}
     >
       <AntdApp>
-        <HashRouter>
-          <AppShell />
-        </HashRouter>
+        <AppNoticeProvider>
+          <HashRouter>
+            <AppShell />
+          </HashRouter>
+        </AppNoticeProvider>
       </AntdApp>
     </ConfigProvider>
   );

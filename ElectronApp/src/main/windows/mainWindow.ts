@@ -2,6 +2,7 @@ import { BrowserWindow } from "electron";
 import { join } from "node:path";
 
 import { bindWindowStateEvents } from "../ipc/windowIpc";
+import { applyWindowProcessIcon } from "../services/appIcon";
 
 export function createMainWindow(): BrowserWindow {
   const window = new BrowserWindow({
@@ -21,6 +22,9 @@ export function createMainWindow(): BrowserWindow {
   });
 
   bindWindowStateEvents(window);
+  if (process.platform === "win32") {
+    void applyWindowProcessIcon(window);
+  }
 
   const rendererURL = process.env.ELECTRON_RENDERER_URL;
   if (rendererURL) {

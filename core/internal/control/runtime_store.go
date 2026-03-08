@@ -5,135 +5,567 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"math"
+	"net"
+	"net/http"
+	neturl "net/url"
 	"os"
 	"path/filepath"
+	"reflect"
+	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 const maxRuntimeLogEntries = 4000
 const maxRuntimeLogMemoryBytes = 1 * 1024 * 1024
 const maxPushSubscriberQueue = 256
+const currentSnapshotSchemaVersion = 20
+const defaultUnifiedSemVerVersion = "0.1.0"
+
+var strictSemVerPattern = regexp.MustCompile(`^\d+\.\d+\.\d+$`)
+
 const (
-	defaultRuleProbeIntervalSec = 180
-	minRuleProbeIntervalSec     = 30
-	maxRuleProbeIntervalSec     = 3600
-	defaultRuleProfileID        = "rule-profile-default"
-	defaultRuleProfileName      = "Default Rules"
+	defaultRuleProbeIntervalSec      = 180
+	minRuleProbeIntervalSec          = 30
+	maxRuleProbeIntervalSec          = 3600
+	defaultRuleProfileID             = "rule-profile-default"
+	defaultRuleProfileName           = "Default Rules"
+	defaultProbeConcurrency          = 5
+	minProbeConcurrency              = 1
+	maxProbeConcurrency              = 64
+	defaultProbeTimeoutSec           = 5
+	defaultProbeIntervalMin          = 180
+	defaultProbeRealConnectURL       = "https://www.google.com/generate_204"
+	defaultProbeNodeInfoQueryURL     = "https://api.ip.sb/geoip"
+	defaultClientSessionTTLSec       = 45
+	minClientSessionTTLSec           = 10
+	maxClientSessionTTLSec           = 300
+	defaultTrafficMonitorIntervalSec = 0
+	trafficStatsPersistIntervalSec   = 30
 )
 
 type RuntimeStore struct {
-	mu                 sync.RWMutex
-	parser             *SubscriptionParser
-	runtime            *proxyRuntime
-	state              StateSnapshot
-	stateFile          string
-	autoProbeStop      chan struct{}
-	pushSubscribers    map[int]chan DaemonPushEvent
-	pushSubscriberID   int
-	logPushEnabled     bool
-	logSessionDateDir  string
-	logSessionFileName string
-	logRootDir         string
-	lastRuleReloadSig  string
+	mu                       sync.RWMutex
+	parser                   *SubscriptionParser
+	runtime                  *proxyRuntime
+	applyManager             *runtimeApplyManager
+	runtimeCoordinator       *RuntimeCoordinator
+	state                    StateSnapshot
+	stateFile                string
+	autoProbeStop            chan struct{}
+	pushSubscribers          map[int]chan DaemonPushEvent
+	pushSubscriberID         int
+	clientSessions           map[string]int64
+	persistQueue             chan StateSnapshot
+	logPushEnabled           bool
+	logSessionDateDir        string
+	logSessionFileName       string
+	logRootDir               string
+	resolvedCoreVersion      string
+	connectionStatsStop      chan struct{}
+	lastTrafficSampleAtMS    int64
+	lastTrafficUploadBytes   int64
+	lastTrafficDownloadBytes int64
+	lastTrafficNodeCounters  map[string]trafficNodeCounter
+	trafficStatsDirty        bool
+	lastTrafficPersistMS     int64
+	taskProxyPort            int
+	taskQueue                *runtimeTaskQueue
+	operationRegistry        *runtimeOperationRegistry
 }
 
+type trafficNodeCounter struct {
+	UploadBytes   int64
+	DownloadBytes int64
+}
+
+type stateBootstrapSource string
+
+const (
+	stateBootstrapSourceAppState       stateBootstrapSource = "app_state"
+	stateBootstrapSourceBundledDefault stateBootstrapSource = "bundled_default"
+	stateBootstrapSourceKernelDefault  stateBootstrapSource = "kernel_default"
+)
+
 func NewRuntimeStore(runtimeLabel string, coreVersion string) *RuntimeStore {
+	resolvedCoreVersion := normalizeCoreVersionValue(coreVersion)
+	nowMS := time.Now().UnixMilli()
 	store := &RuntimeStore{
-		parser:          NewSubscriptionParser(),
-		stateFile:       resolveStateFile(),
-		state:           defaultSnapshot(runtimeLabel, coreVersion),
-		pushSubscribers: map[int]chan DaemonPushEvent{},
+		parser:                  NewSubscriptionParser(),
+		stateFile:               resolveStateFile(),
+		state:                   defaultSnapshot(runtimeLabel, resolvedCoreVersion),
+		pushSubscribers:         map[int]chan DaemonPushEvent{},
+		clientSessions:          map[string]int64{},
+		persistQueue:            make(chan StateSnapshot, 1),
+		lastTrafficNodeCounters: map[string]trafficNodeCounter{},
+		resolvedCoreVersion:     resolvedCoreVersion,
 	}
 	store.initLogSession(time.Now())
 	store.runtime = newProxyRuntime(store.onProxyRuntimeLog)
-	if err := store.load(); err != nil {
-		store.state = defaultSnapshot(runtimeLabel, coreVersion)
+	store.applyManager = newRuntimeApplyManager(store.runtime)
+	store.runtimeCoordinator = newRuntimeCoordinator(
+		store.runtime,
+		store.applyManager,
+		store.onRuntimeCoordinatorLockWait,
+	)
+	store.taskQueue = newRuntimeTaskQueue(store)
+	store.operationRegistry = newRuntimeOperationRegistry(store)
+	go store.runPersistLoop()
+	loadSource := stateBootstrapSourceKernelDefault
+	if source, err := store.load(); err != nil {
+		store.state = defaultSnapshot(runtimeLabel, resolvedCoreVersion)
+		store.appendCoreLogLocked(
+			LogLevelWarn,
+			fmt.Sprintf("bootstrap state load failed, fallback kernel defaults: %v", err),
+		)
+	} else {
+		loadSource = source
 	}
+	store.ensureValidLocked()
+	if err := store.ensureTaskProxyPortLocked(store.state.LocalProxyPort); err != nil {
+		store.appendCoreLogLocked(LogLevelWarn, fmt.Sprintf("allocate internal helper proxy port failed: %v", err))
+	}
+	store.runtime.ConfigureInternalProxyPort(store.taskProxyPort)
+	store.appendCoreLogLocked(LogLevelInfo, fmt.Sprintf("bootstrap state source: %s", loadSource))
+	store.state.CoreVersion = store.resolveCoreVersionFallbackLocked()
+	store.state.DaemonStartedAtMS = nowMS
+	store.state.ProxyStartedAtMS = 0
+	store.state.ProxyVersion = currentProxyCoreVersion()
+	store.refreshSessionObservabilityLocked(nowMS)
+	// Proxy selection is runtime-only and always defaults to off after daemon restart.
+	applyProxyModeToState(&store.state, ProxyModeOff)
 	// Runtime process is transient and should not be restored as connected.
 	store.state.ConnectionStage = ConnectionIdle
-	store.ensureValidLocked()
+	store.state.ConnectionStage = ConnectionConnecting
+	bootstrapSnapshot := buildMinimalProbeRuntimeSnapshot(cloneSnapshot(store.state))
+	store.appendCoreLogLocked(
+		LogLevelInfo,
+		fmt.Sprintf(
+			"bootstrap runtime requested: minimal mode %s",
+			describeMinimalProbeRuntimeSnapshot(bootstrapSnapshot, store.taskProxyPort),
+		),
+	)
+	_ = store.saveLocked()
+	bootstrapPrepared, prepareErr := store.runtime.PrepareRuntimeConfigWithControllerOptions(
+		bootstrapSnapshot,
+		defaultClashAPIController,
+		true,
+		false,
+		store.taskProxyPort,
+	)
+	bootstrapErr := prepareErr
+	if bootstrapErr == nil {
+		bootstrapErr = store.runtime.StartPrepared(bootstrapPrepared)
+	}
+	if proxyErr := clearSystemHTTPProxy(); bootstrapErr == nil {
+		bootstrapErr = proxyErr
+	}
+	if bootstrapErr != nil {
+		store.state.ConnectionStage = ConnectionError
+		store.appendCoreLogLocked(LogLevelError, fmt.Sprintf("bootstrap runtime failed: %v", bootstrapErr))
+	} else {
+		store.state.ConnectionStage = ConnectionConnected
+		store.appendCoreLogLocked(
+			LogLevelInfo,
+			fmt.Sprintf(
+				"bootstrap runtime started: minimal mode %s",
+				describeMinimalProbeRuntimeSnapshot(bootstrapSnapshot, store.taskProxyPort),
+			),
+		)
+	}
 	_ = store.saveLocked()
 	store.autoProbeStop = make(chan struct{})
+	store.connectionStatsStop = make(chan struct{})
 	go store.runRuleAutoProbeLoop()
+	go store.runConnectionsStatsLoop()
 	return store
+}
+
+func buildMinimalProbeRuntimeSnapshot(snapshot StateSnapshot) StateSnapshot {
+	current := cloneSnapshot(snapshot)
+	minimal := defaultSnapshot(current.RuntimeLabel, current.CoreVersion)
+	minimal.RuntimeLabel = current.RuntimeLabel
+	minimal.CoreVersion = current.CoreVersion
+	minimal.ProxyVersion = current.ProxyVersion
+	minimal.SchemaVersion = current.SchemaVersion
+	minimal.StateRevision = current.StateRevision
+	minimal.DaemonStartedAtMS = current.DaemonStartedAtMS
+	minimal.SystemType = current.SystemType
+	minimal.RuntimeAdmin = current.RuntimeAdmin
+	minimal.Groups = current.Groups
+	minimal.ActiveGroupID = current.ActiveGroupID
+	minimal.SelectedNodeID = current.SelectedNodeID
+	minimal.ProbeSettings = normalizeProbeSettings(current.ProbeSettings)
+	if dnsConfig, err := normalizeDNSConfig(current.DNS); err == nil {
+		minimal.DNS = dnsConfig
+	} else {
+		minimal.DNS = defaultDNSConfig()
+	}
+	minimal.ProxyLogLevel = current.ProxyLogLevel
+	minimal.CoreLogLevel = current.CoreLogLevel
+	minimal.UILogLevel = current.UILogLevel
+	minimal.SniffEnabled = false
+	minimal.SniffOverrideDest = false
+	minimal.BlockQUIC = false
+	minimal.BlockUDP = false
+	minimal.Mux = defaultProxyMuxConfig()
+	applyProxyModeToState(&minimal, ProxyModeOff)
+	minimal.ConnectionStage = ConnectionConnected
+	return minimal
+}
+
+func countNodesInGroups(groups []NodeGroup) int {
+	total := 0
+	for _, group := range groups {
+		total += len(group.Nodes)
+	}
+	return total
+}
+
+func describeMinimalProbeRuntimeSnapshot(snapshot StateSnapshot, helperPort int) string {
+	groupCount := len(snapshot.Groups)
+	nodeCount := countNodesInGroups(snapshot.Groups)
+	activeGroupID := strings.TrimSpace(snapshot.ActiveGroupID)
+	if activeGroupID == "" {
+		activeGroupID = "-"
+	}
+	selectedNodeID := strings.TrimSpace(snapshot.SelectedNodeID)
+	if selectedNodeID == "" {
+		selectedNodeID = "-"
+	}
+	return fmt.Sprintf(
+		"helper_port=%d groups=%d nodes=%d active_group=%s selected_node=%s",
+		helperPort,
+		groupCount,
+		nodeCount,
+		activeGroupID,
+		selectedNodeID,
+	)
+}
+
+func (s *RuntimeStore) ensureMinimalProbeRuntimeReady(reason string, snapshot StateSnapshot) error {
+	s.mu.Lock()
+	s.ensureValidLocked()
+	if err := s.ensureTaskProxyPortLocked(snapshot.LocalProxyPort); err != nil {
+		s.mu.Unlock()
+		return fmt.Errorf("allocate internal helper proxy port failed: %w", err)
+	}
+	taskProxyPort := s.taskProxyPort
+	s.runtime.ConfigureInternalProxyPort(taskProxyPort)
+	s.mu.Unlock()
+
+	minimalSnapshot := buildMinimalProbeRuntimeSnapshot(snapshot)
+	s.LogCore(
+		LogLevelInfo,
+		fmt.Sprintf(
+			"refresh minimal runtime requested: reason=%s %s",
+			strings.TrimSpace(reason),
+			describeMinimalProbeRuntimeSnapshot(minimalSnapshot, taskProxyPort),
+		),
+	)
+	return s.runtimeCoordinatorOrDefault().WithRuntime(
+		reason,
+		func(runtime *proxyRuntime) error {
+			if runtime == nil {
+				return errors.New("probe runtime is not available")
+			}
+			prepared, err := runtime.PrepareRuntimeConfigWithControllerOptions(
+				minimalSnapshot,
+				defaultClashAPIController,
+				true,
+				false,
+				taskProxyPort,
+			)
+			if err != nil {
+				return fmt.Errorf("prepare probe-only runtime failed: %w", err)
+			}
+			if err := runtime.StartPrepared(prepared); err != nil {
+				return fmt.Errorf("start probe-only runtime failed: %w", err)
+			}
+			s.LogCore(
+				LogLevelInfo,
+				fmt.Sprintf(
+					"refresh minimal runtime success: reason=%s %s",
+					strings.TrimSpace(reason),
+					describeMinimalProbeRuntimeSnapshot(minimalSnapshot, taskProxyPort),
+				),
+			)
+			return nil
+		},
+	)
 }
 
 func defaultSnapshot(runtimeLabel string, coreVersion string) StateSnapshot {
 	now := time.Now().UnixMilli()
+	resolvedCoreVersion := normalizeCoreVersionValue(coreVersion)
+	proxyVersion := currentProxyCoreVersion()
 	defaultRuleConfig := defaultRuleConfigV2()
+	environment := detectRuntimeEnvironment()
 	return StateSnapshot{
-		SchemaVersion:       9,
-		StateRevision:       1,
-		ConnectionStage:     ConnectionIdle,
-		RoutingMode:         RoutingModeRecommended,
-		ProxyMode:           ProxyModeSystem,
-		SniffEnabled:        defaultSniffEnabled,
-		SniffOverrideDest:   defaultSniffOverrideDestination,
-		SniffTimeoutMS:      defaultSniffTimeoutMS,
-		ProxyLogLevel:       LogLevelInfo,
-		CoreLogLevel:        LogLevelInfo,
-		UILogLevel:          LogLevelInfo,
-		RecordLogsToFile:    true,
-		ProxyLogs:           []RuntimeLogEntry{},
-		CoreLogs:            []RuntimeLogEntry{},
-		UILogs:              []RuntimeLogEntry{},
-		Subscriptions:       []SubscriptionSource{},
-		Groups:              []NodeGroup{},
-		ActiveGroupID:       "",
-		SelectedNodeID:      "",
-		AutoConnect:         true,
-		TunEnabled:          false,
-		SystemProxyEnabled:  true,
-		LocalProxyPort:      defaultLocalMixedListenPort,
-		AllowExternal:       false,
-		DNSRemoteServer:     defaultDNSRemoteServer,
-		DNSDirectServer:     defaultDNSDirectServer,
-		DNSBootstrapServer:  defaultDNSBootstrapServer,
-		DNSStrategy:         defaultDNSStrategy,
-		DNSIndependentCache: true,
-		DNSCacheFileEnabled: true,
-		DNSCacheStoreRDRC:   true,
-		DNSFakeIPEnabled:    true,
-		DNSFakeIPV4Range:    defaultDNSFakeIPV4Range,
-		DNSFakeIPV6Range:    defaultDNSFakeIPV6Range,
+		SchemaVersion:             currentSnapshotSchemaVersion,
+		StateRevision:             1,
+		ConnectionStage:           ConnectionIdle,
+		RoutingMode:               RoutingModeRecommended,
+		ProxyMode:                 ProxyModeOff,
+		ConfiguredProxyMode:       ProxyModeTun,
+		ClearDNSCacheOnRestart:    false,
+		SniffEnabled:              defaultSniffEnabled,
+		SniffOverrideDest:         defaultSniffOverrideDestination,
+		SniffTimeoutMS:            defaultSniffTimeoutMS,
+		BlockQUIC:                 true,
+		BlockUDP:                  false,
+		Mux:                       defaultProxyMuxConfig(),
+		ProxyLogLevel:             LogLevelNone,
+		CoreLogLevel:              LogLevelError,
+		UILogLevel:                LogLevelError,
+		RecordLogsToFile:          false,
+		ProxyRecordToFile:         false,
+		CoreRecordToFile:          false,
+		UIRecordToFile:            false,
+		ProxyLogs:                 []RuntimeLogEntry{},
+		CoreLogs:                  []RuntimeLogEntry{},
+		UILogs:                    []RuntimeLogEntry{},
+		Subscriptions:             []SubscriptionSource{},
+		Groups:                    []NodeGroup{},
+		ActiveGroupID:             "",
+		SelectedNodeID:            "",
+		AutoConnect:               true,
+		TrafficMonitorIntervalSec: defaultTrafficMonitorIntervalSec,
+		ProbeSettings:             defaultProbeSettings(),
+		TunEnabled:                false,
+		SystemProxyEnabled:        false,
+		LocalProxyPort:            59527,
+		TunMTU:                    defaultTunMTU,
+		TunStack:                  ProxyTunStackSystem,
+		AllowExternal:             false,
+		DNS:                       defaultDNSConfig(),
 		RuleProfiles: []RuleProfile{
 			{
 				ID:            defaultRuleProfileID,
 				Name:          defaultRuleProfileName,
 				SourceKind:    RuleProfileSourceManual,
 				LastUpdatedMS: now,
-				Config:        defaultRuleConfig,
+				Config:        cloneRuleConfigV2(defaultRuleConfig),
 			},
 		},
-		ActiveRuleProfileID: defaultRuleProfileID,
-		RuleConfigV2:        defaultRuleConfig,
-		CoreVersion:         coreVersion,
-		RuntimeLabel:        runtimeLabel,
+		ActiveRuleProfileID:   defaultRuleProfileID,
+		RuleConfigV2:          cloneRuleConfigV2(defaultRuleConfig),
+		SystemType:            environment.SystemType,
+		RuntimeAdmin:          environment.RuntimeAdmin,
+		CoreVersion:           resolvedCoreVersion,
+		ProxyVersion:          proxyVersion,
+		RuntimeLabel:          runtimeLabel,
+		DaemonStartedAtMS:     now,
+		ProxyStartedAtMS:      0,
+		ActiveClientSessions:  0,
+		LastClientHeartbeatMS: 0,
+		ActivePushSubscribers: 0,
+		ProbeRuntimeTasks:     []ProbeRuntimeTask{},
+		BackgroundTasks:       []BackgroundTask{},
 	}
 }
 
+func normalizeCoreVersionValue(raw string) string {
+	value := strings.TrimSpace(raw)
+	value = strings.TrimPrefix(value, "v")
+	if strictSemVerPattern.MatchString(value) {
+		return value
+	}
+	return defaultUnifiedSemVerVersion
+}
+
+func isCoreVersionSemVer(raw string) bool {
+	value := strings.TrimSpace(raw)
+	value = strings.TrimPrefix(value, "v")
+	return strictSemVerPattern.MatchString(value)
+}
+
+func (s *RuntimeStore) resolveCoreVersionFallbackLocked() string {
+	if isCoreVersionSemVer(s.resolvedCoreVersion) {
+		return normalizeCoreVersionValue(s.resolvedCoreVersion)
+	}
+	if isCoreVersionSemVer(s.state.CoreVersion) {
+		return normalizeCoreVersionValue(s.state.CoreVersion)
+	}
+	return defaultUnifiedSemVerVersion
+}
+
+func defaultProbeSettings() ProbeSettings {
+	return ProbeSettings{
+		Concurrency:            defaultProbeConcurrency,
+		TimeoutSec:             defaultProbeTimeoutSec,
+		ProbeIntervalMin:       defaultProbeIntervalMin,
+		RealConnectTestURL:     defaultProbeRealConnectURL,
+		NodeInfoQueryURL:       defaultProbeNodeInfoQueryURL,
+		AutoProbeOnActiveGroup: true,
+	}
+}
+
+func isAllowedTrafficMonitorIntervalSec(value int) bool {
+	switch value {
+	case 0, 1, 2, 5:
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeTrafficMonitorIntervalSec(value int) int {
+	if isAllowedTrafficMonitorIntervalSec(value) {
+		return value
+	}
+	return defaultTrafficMonitorIntervalSec
+}
+
+func normalizeProbeType(value ProbeType) ProbeType {
+	return ProbeType(strings.ToLower(strings.TrimSpace(string(value))))
+}
+
+func isValidProbeType(value ProbeType) bool {
+	switch normalizeProbeType(value) {
+	case ProbeTypeNodeLatency, ProbeTypeRealConnect:
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeProbeTypeList(values []ProbeType) []ProbeType {
+	seen := map[ProbeType]struct{}{}
+	result := make([]ProbeType, 0, len(values))
+	for _, value := range values {
+		normalized := normalizeProbeType(value)
+		if !isValidProbeType(normalized) {
+			continue
+		}
+		if _, exists := seen[normalized]; exists {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		result = append(result, normalized)
+	}
+	if len(result) > 0 {
+		return result
+	}
+	return []ProbeType{ProbeTypeNodeLatency, ProbeTypeRealConnect}
+}
+
+func isAllowedProbeTimeoutSec(value int) bool {
+	switch value {
+	case 3, 5, 10, 15, 30, 60:
+		return true
+	default:
+		return false
+	}
+}
+
+func isAllowedProbeIntervalMin(value int) bool {
+	switch value {
+	case 30, 60, 180, 300:
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeProbeSettings(raw ProbeSettings) ProbeSettings {
+	normalized := defaultProbeSettings()
+	if raw.Concurrency > 0 {
+		switch {
+		case raw.Concurrency < minProbeConcurrency:
+			normalized.Concurrency = minProbeConcurrency
+		case raw.Concurrency > maxProbeConcurrency:
+			normalized.Concurrency = maxProbeConcurrency
+		default:
+			normalized.Concurrency = raw.Concurrency
+		}
+	}
+	if isAllowedProbeTimeoutSec(raw.TimeoutSec) {
+		normalized.TimeoutSec = raw.TimeoutSec
+	}
+	if isAllowedProbeIntervalMin(raw.ProbeIntervalMin) {
+		normalized.ProbeIntervalMin = raw.ProbeIntervalMin
+	}
+	if value := strings.TrimSpace(raw.RealConnectTestURL); value != "" {
+		normalized.RealConnectTestURL = value
+	}
+	if value := strings.TrimSpace(raw.NodeInfoQueryURL); value != "" {
+		normalized.NodeInfoQueryURL = value
+	}
+	normalized.AutoProbeOnActiveGroup = raw.AutoProbeOnActiveGroup
+	return normalized
+}
+
 func defaultRuleConfigV2() RuleConfigV2 {
+	defaultRules := []RuleItemV2{
+		{
+			ID:      "rule-mmagvyvf-am4mfi-copy",
+			Name:    "广告拦截",
+			Enabled: true,
+			Match: RuleMatch{
+				Domain:  RuleDomainMatch{},
+				GeoSite: []string{"category-ads-all"},
+				Process: RuleProcessMatch{},
+			},
+			Action: RuleAction{
+				Type:         RuleActionTypeReject,
+				TargetPolicy: "reject",
+			},
+		},
+		{
+			ID:      "rule-1772410994155",
+			Name:    "谷歌浏览器",
+			Enabled: true,
+			Match: RuleMatch{
+				Domain: RuleDomainMatch{},
+				Process: RuleProcessMatch{
+					NameContains: []string{"chrome.exe"},
+				},
+			},
+			Action: RuleAction{
+				Type:         RuleActionTypeRoute,
+				TargetPolicy: "proxy",
+			},
+		},
+		{
+			ID:      "rule-mm8vmugw-dx15l2",
+			Name:    "谷歌",
+			Enabled: true,
+			Match: RuleMatch{
+				Domain:  RuleDomainMatch{},
+				GeoSite: []string{"google"},
+				Process: RuleProcessMatch{},
+			},
+			Action: RuleAction{
+				Type:         RuleActionTypeRoute,
+				TargetPolicy: "proxy",
+			},
+		},
+	}
 	return RuleConfigV2{
-		Version:          2,
+		Version:          3,
 		ProbeIntervalSec: defaultRuleProbeIntervalSec,
-		ApplyMode:        RuleApplyModeProxy,
+		OnMissMode:       RuleMissModeDirect,
+		Groups: []RuleGroup{
+			{
+				ID:         "default",
+				Name:       "默认分组",
+				OnMissMode: RuleMissModeDirect,
+				Locked:     true,
+				Rules:      append([]RuleItemV2{}, defaultRules...),
+			},
+		},
+		ActiveGroupID: "default",
 		Defaults: RuleDefaults{
 			OnMatch: "proxy",
 			OnMiss:  "direct",
 		},
-		BaseRules:     []BaseRuleItem{},
-		ComposedRules: []ComposedRuleItem{},
-		ComposedRuleGroups: []ComposedRuleGroup{
-			{
-				ID:    "default",
-				Name:  "默认分组",
-				Mode:  RuleApplyModeProxy,
-				Items: []ComposedRuleItem{},
-			},
-		},
-		ActiveComposedRuleGroupID: "default",
 		PolicyGroups: []RulePolicyGroup{
 			{
 				ID:      "direct",
@@ -153,18 +585,113 @@ func defaultRuleConfigV2() RuleConfigV2 {
 				Type:    RulePolicyGroupTypeBuiltin,
 				Builtin: RulePolicyBuiltinReject,
 			},
+			{
+				ID:   "活动订阅",
+				Name: "活动订阅",
+				Type: RulePolicyGroupTypeNodePool,
+				NodePool: &RuleNodePool{
+					Enabled:            true,
+					Nodes:              []RuleNodeRef{},
+					NodeSelectStrategy: RuleNodeSelectFastest,
+					FallbackMode:       RuleNodePoolFallbackReject,
+					AvailableNodeIDs:   []string{},
+				},
+			},
+			{
+				ID:   "香港",
+				Name: "香港",
+				Type: RulePolicyGroupTypeNodePool,
+				NodePool: &RuleNodePool{
+					Enabled: true,
+					Nodes: []RuleNodeRef{
+						{
+							Node: "HK",
+							Type: "country",
+						},
+					},
+					NodeSelectStrategy: RuleNodeSelectFastest,
+					FallbackMode:       RuleNodePoolFallbackReject,
+					AvailableNodeIDs:   []string{},
+				},
+			},
+			{
+				ID:   "美国",
+				Name: "美国",
+				Type: RulePolicyGroupTypeNodePool,
+				NodePool: &RuleNodePool{
+					Enabled: true,
+					Nodes: []RuleNodeRef{
+						{
+							Node: "US",
+							Type: "country",
+						},
+					},
+					NodeSelectStrategy: RuleNodeSelectFastest,
+					FallbackMode:       RuleNodePoolFallbackReject,
+					AvailableNodeIDs:   []string{},
+				},
+			},
+			{
+				ID:   "日本",
+				Name: "日本",
+				Type: RulePolicyGroupTypeNodePool,
+				NodePool: &RuleNodePool{
+					Enabled: true,
+					Nodes: []RuleNodeRef{
+						{
+							Node: "JP",
+							Type: "country",
+						},
+					},
+					NodeSelectStrategy: RuleNodeSelectFastest,
+					FallbackMode:       RuleNodePoolFallbackReject,
+					AvailableNodeIDs:   []string{},
+				},
+			},
+			{
+				ID:   "亚洲",
+				Name: "亚洲",
+				Type: RulePolicyGroupTypeNodePool,
+				NodePool: &RuleNodePool{
+					Enabled: true,
+					Nodes: []RuleNodeRef{
+						{
+							Node: "HK",
+							Type: "country",
+						},
+						{
+							Node: "TW",
+							Type: "country",
+						},
+						{
+							Node: "JP",
+							Type: "country",
+						},
+						{
+							Node: "KR",
+							Type: "country",
+						},
+					},
+					NodeSelectStrategy: RuleNodeSelectFastest,
+					FallbackMode:       RuleNodePoolFallbackReject,
+					AvailableNodeIDs:   []string{},
+				},
+			},
 		},
 		Providers: RuleProviders{
 			RuleSets: []RuleSetProvider{},
 		},
-		Rules: []RuleItemV2{},
+		Rules: append([]RuleItemV2{}, defaultRules...),
 	}
 }
 
 func (s *RuntimeStore) GetState(_ context.Context) (StateSnapshot, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return cloneSnapshot(s.state), nil
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.refreshSessionObservabilityLocked(time.Now().UnixMilli())
+	snapshot := cloneSnapshot(s.state)
+	snapshot.Operations = s.currentOperationSnapshot()
+	return snapshot, nil
 }
 
 func (s *RuntimeStore) SubscribePushEvents() (int, <-chan DaemonPushEvent) {
@@ -174,6 +701,7 @@ func (s *RuntimeStore) SubscribePushEvents() (int, <-chan DaemonPushEvent) {
 	subID := s.pushSubscriberID
 	ch := make(chan DaemonPushEvent, maxPushSubscriberQueue)
 	s.pushSubscribers[subID] = ch
+	s.refreshSessionObservabilityLocked(time.Now().UnixMilli())
 	return subID, ch
 }
 
@@ -185,12 +713,18 @@ func (s *RuntimeStore) UnsubscribePushEvents(subscriberID int) {
 		return
 	}
 	delete(s.pushSubscribers, subscriberID)
+	if len(s.pushSubscribers) == 0 {
+		clear(s.clientSessions)
+		s.state.LastClientHeartbeatMS = 0
+	}
+	s.refreshSessionObservabilityLocked(time.Now().UnixMilli())
 	close(ch)
 }
 
 func (s *RuntimeStore) SnapshotPushEvent() DaemonPushEvent {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.refreshSessionObservabilityLocked(time.Now().UnixMilli())
 	snapshot := cloneSnapshot(s.state)
 	if !s.logPushEnabled {
 		stripRuntimeLogs(&snapshot)
@@ -218,7 +752,6 @@ func (s *RuntimeStore) AddSubscription(_ context.Context, req AddSubscriptionReq
 			Kind:  "manual",
 			Nodes: []Node{},
 		})
-		s.state.ActiveGroupID = groupID
 		s.appendCoreLogLocked(LogLevelInfo, fmt.Sprintf("create manual group: %s", name))
 		s.ensureValidLocked()
 		_ = s.saveLocked()
@@ -242,7 +775,6 @@ func (s *RuntimeStore) AddSubscription(_ context.Context, req AddSubscriptionReq
 		SubscriptionID: subID,
 		Nodes:          []Node{},
 	})
-	s.state.ActiveGroupID = groupID
 	s.appendCoreLogLocked(LogLevelInfo, fmt.Sprintf("add subscription: %s", name))
 	s.ensureValidLocked()
 	_ = s.saveLocked()
@@ -340,12 +872,11 @@ func (s *RuntimeStore) UpdateGroup(_ context.Context, req UpdateGroupRequest) (S
 	return cloneSnapshot(s.state), nil
 }
 
-func (s *RuntimeStore) PullSubscriptionByGroup(ctx context.Context, req PullSubscriptionRequest) (StateSnapshot, error) {
+func (s *RuntimeStore) pullSubscriptionByGroupNow(ctx context.Context, req PullSubscriptionRequest, handle runtimeTaskHandle) (StateSnapshot, error) {
 	groupID := strings.TrimSpace(req.GroupID)
 	if groupID == "" {
 		return StateSnapshot{}, errors.New("groupId is required")
 	}
-
 	s.mu.Lock()
 	groupIndex := s.indexGroupByIDLocked(groupID)
 	if groupIndex < 0 {
@@ -365,13 +896,8 @@ func (s *RuntimeStore) PullSubscriptionByGroup(ctx context.Context, req PullSubs
 	subscription := s.state.Subscriptions[subIndex]
 	s.mu.Unlock()
 
+	handle.UpdateProgress("拉取并解析订阅内容")
 	parseResult, err := s.parser.FetchAndParse(ctx, subscription.URL, group.ID)
-	for _, detail := range parseResult.DebugLogs {
-		s.LogCore(
-			LogLevelInfo,
-			fmt.Sprintf("pull subscription debug: group=%s(%s) %s", group.Name, groupID, detail),
-		)
-	}
 	if err != nil {
 		s.LogCore(
 			LogLevelError,
@@ -380,6 +906,7 @@ func (s *RuntimeStore) PullSubscriptionByGroup(ctx context.Context, req PullSubs
 		return StateSnapshot{}, err
 	}
 
+	handle.UpdateProgress("写入订阅节点与状态")
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -388,7 +915,10 @@ func (s *RuntimeStore) PullSubscriptionByGroup(ctx context.Context, req PullSubs
 	if groupIndex < 0 || subIndex < 0 {
 		return StateSnapshot{}, errors.New("state changed, retry")
 	}
-	s.state.Groups[groupIndex].Nodes = parseResult.Nodes
+	s.state.Groups[groupIndex].Nodes = migrateNodeTrafficTotals(
+		s.state.Groups[groupIndex].Nodes,
+		parseResult.Nodes,
+	)
 	s.state.Subscriptions[subIndex].Status = strings.TrimSpace(parseResult.Status)
 	s.state.Subscriptions[subIndex].LastUpdatedMS = time.Now().UnixMilli()
 	s.appendCoreLogLocked(
@@ -400,7 +930,68 @@ func (s *RuntimeStore) PullSubscriptionByGroup(ctx context.Context, req PullSubs
 	return cloneSnapshot(s.state), nil
 }
 
-func (s *RuntimeStore) SelectActiveGroup(_ context.Context, req SelectGroupRequest) (StateSnapshot, error) {
+type nodeTrafficTotals struct {
+	TotalDownloadMB float64
+	TotalUploadMB   float64
+	TodayDownloadMB float64
+	TodayUploadMB   float64
+}
+
+func hasNodeTrafficTotals(totals nodeTrafficTotals) bool {
+	return totals.TotalDownloadMB > 0 ||
+		totals.TotalUploadMB > 0 ||
+		totals.TodayDownloadMB > 0 ||
+		totals.TodayUploadMB > 0
+}
+
+func migrateNodeTrafficTotals(previousNodes []Node, nextNodes []Node) []Node {
+	if len(previousNodes) == 0 || len(nextNodes) == 0 {
+		return nextNodes
+	}
+	trafficBySignature := make(map[string]nodeTrafficTotals, len(previousNodes))
+	trafficByID := make(map[string]nodeTrafficTotals, len(previousNodes))
+	for _, node := range previousNodes {
+		totals := nodeTrafficTotals{
+			TotalDownloadMB: node.TotalDownloadMB,
+			TotalUploadMB:   node.TotalUploadMB,
+			TodayDownloadMB: node.TodayDownloadMB,
+			TodayUploadMB:   node.TodayUploadMB,
+		}
+		if !hasNodeTrafficTotals(totals) {
+			continue
+		}
+		if signature := buildNodeConfigSignature(node); signature != "" {
+			trafficBySignature[signature] = totals
+		}
+		if nodeID := strings.TrimSpace(node.ID); nodeID != "" {
+			trafficByID[nodeID] = totals
+		}
+	}
+	if len(trafficBySignature) == 0 && len(trafficByID) == 0 {
+		return nextNodes
+	}
+	for index := range nextNodes {
+		node := &nextNodes[index]
+		if signature := buildNodeConfigSignature(*node); signature != "" {
+			if totals, ok := trafficBySignature[signature]; ok {
+				node.TotalDownloadMB = totals.TotalDownloadMB
+				node.TotalUploadMB = totals.TotalUploadMB
+				node.TodayDownloadMB = totals.TodayDownloadMB
+				node.TodayUploadMB = totals.TodayUploadMB
+				continue
+			}
+		}
+		if totals, ok := trafficByID[strings.TrimSpace(node.ID)]; ok {
+			node.TotalDownloadMB = totals.TotalDownloadMB
+			node.TotalUploadMB = totals.TotalUploadMB
+			node.TodayDownloadMB = totals.TodayDownloadMB
+			node.TodayUploadMB = totals.TodayUploadMB
+		}
+	}
+	return nextNodes
+}
+
+func (s *RuntimeStore) selectActiveGroupNow(_ context.Context, req SelectGroupRequest) (StateSnapshot, error) {
 	groupID := strings.TrimSpace(req.GroupID)
 	if groupID == "" {
 		return StateSnapshot{}, errors.New("groupId is required")
@@ -431,24 +1022,25 @@ func (s *RuntimeStore) SelectActiveGroup(_ context.Context, req SelectGroupReque
 		hotSwitchErr = s.applyRulePoolSelectionsHot(snapshot)
 		if hotSwitchErr == nil {
 			s.mu.Lock()
-			defer s.mu.Unlock()
 			s.state.ConnectionStage = ConnectionConnected
 			s.appendCoreLogLocked(
 				LogLevelInfo,
 				fmt.Sprintf("switch active group success: group=%s mode=hot_switch", groupID),
 			)
 			_ = s.saveLocked()
-			return cloneSnapshot(s.state), nil
+			result := cloneSnapshot(s.state)
+			shouldEnqueue := hasReferencedNodePoolRule(s.state)
+			s.mu.Unlock()
+			if shouldEnqueue {
+				s.enqueueReferencedNodePoolRefresh("select_active_group")
+			}
+			return result, nil
 		}
 	}
 
-	runtimeErr := s.runtime.Start(snapshot)
-	if proxyErr := syncSystemProxy(snapshot); runtimeErr == nil {
-		runtimeErr = proxyErr
-	}
+	runtimeErr := s.applyRuntimeWithRollback(snapshot, previous)
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if runtimeErr != nil {
 		s.state.ConnectionStage = ConnectionError
 		if hotSwitchErr != nil {
@@ -459,7 +1051,9 @@ func (s *RuntimeStore) SelectActiveGroup(_ context.Context, req SelectGroupReque
 		}
 		s.appendCoreLogLocked(LogLevelError, fmt.Sprintf("switch active group failed: %v", runtimeErr))
 		_ = s.saveLocked()
-		return cloneSnapshot(s.state), runtimeErr
+		result := cloneSnapshot(s.state)
+		s.mu.Unlock()
+		return result, runtimeErr
 	}
 	s.state.ConnectionStage = ConnectionConnected
 	if hotSwitchErr != nil {
@@ -470,15 +1064,22 @@ func (s *RuntimeStore) SelectActiveGroup(_ context.Context, req SelectGroupReque
 	}
 	s.appendCoreLogLocked(LogLevelInfo, fmt.Sprintf("switch active group success: group=%s mode=reload", groupID))
 	_ = s.saveLocked()
-	return cloneSnapshot(s.state), nil
+	result := cloneSnapshot(s.state)
+	shouldEnqueue := hasReferencedNodePoolRule(s.state)
+	s.mu.Unlock()
+	if shouldEnqueue {
+		s.enqueueReferencedNodePoolRefresh("select_active_group")
+	}
+	return result, nil
 }
 
-func (s *RuntimeStore) SelectNode(_ context.Context, req SelectNodeRequest) (StateSnapshot, error) {
+func (s *RuntimeStore) selectNodeNow(_ context.Context, req SelectNodeRequest) (StateSnapshot, error) {
 	nodeID := strings.TrimSpace(req.NodeID)
 	if nodeID == "" {
 		return StateSnapshot{}, errors.New("nodeId is required")
 	}
 	s.mu.Lock()
+	previous := cloneSnapshot(s.state)
 	if req.GroupID != "" {
 		if s.indexGroupByIDLocked(req.GroupID) < 0 {
 			s.mu.Unlock()
@@ -506,30 +1107,11 @@ func (s *RuntimeStore) SelectNode(_ context.Context, req SelectNodeRequest) (Sta
 		return snapshot, nil
 	}
 
-	switchErr := s.runtime.SwitchSelectedNode(nodeID)
+	switchErr := s.applyRulePoolSelectionsHot(snapshot)
 	if switchErr != nil {
-		startErr := s.runtime.Start(snapshot)
-		if startErr == nil {
-			if proxyErr := syncSystemProxy(snapshot); proxyErr != nil {
-				startErr = proxyErr
-			}
-		}
+		startErr := s.applyRuntimeWithRollback(snapshot, previous)
 		if startErr != nil {
 			switchErr = startErr
-		}
-	} else {
-		closeErr := s.runtime.CloseAllConnections()
-		if closeErr != nil {
-			// Fallback to runtime restart to force-drop stale keep-alive/quic sessions.
-			startErr := s.runtime.Start(snapshot)
-			if startErr == nil {
-				if proxyErr := syncSystemProxy(snapshot); proxyErr != nil {
-					startErr = proxyErr
-				}
-			}
-			if startErr != nil {
-				switchErr = fmt.Errorf("flush old connections failed (%v), and restart failed: %w", closeErr, startErr)
-			}
 		}
 	}
 
@@ -542,91 +1124,319 @@ func (s *RuntimeStore) SelectNode(_ context.Context, req SelectNodeRequest) (Sta
 		return cloneSnapshot(s.state), switchErr
 	}
 	s.state.ConnectionStage = ConnectionConnected
-	s.appendCoreLogLocked(LogLevelInfo, fmt.Sprintf("switch node success: node=%s, old connections closed", nodeID))
+	s.appendCoreLogLocked(LogLevelInfo, fmt.Sprintf("switch node success: node=%s mode=hot_switch", nodeID))
 	_ = s.saveLocked()
 	return cloneSnapshot(s.state), nil
 }
 
-func (s *RuntimeStore) ProbeNodes(_ context.Context, req ProbeNodesRequest) (StateSnapshot, error) {
+func (s *RuntimeStore) probeNodesSync(ctx context.Context, req ProbeNodesRequest) (StateSnapshot, ProbeNodesSummary, error) {
+	if s.taskQueue == nil {
+		return s.probeNodesNow(ctx, req, runtimeTaskHandle{})
+	}
+	options := s.buildProbeTaskOptions(req)
+	type probeTaskResult struct {
+		snapshot StateSnapshot
+		summary  ProbeNodesSummary
+		err      error
+	}
+	resultCh := make(chan probeTaskResult, 1)
+	s.taskQueue.EnqueueLatest(
+		options,
+		func(handle runtimeTaskHandle) error {
+			snapshot, summary, err := s.probeNodesNow(ctx, req, handle)
+			resultCh <- probeTaskResult{
+				snapshot: snapshot,
+				summary:  summary,
+				err:      err,
+			}
+			return err
+		},
+	)
+	select {
+	case result := <-resultCh:
+		return result.snapshot, result.summary, result.err
+	case <-ctx.Done():
+		return StateSnapshot{}, ProbeNodesSummary{}, ctx.Err()
+	}
+}
+
+func (s *RuntimeStore) probeNodesNow(_ context.Context, req ProbeNodesRequest, handle runtimeTaskHandle) (StateSnapshot, ProbeNodesSummary, error) {
+	summary := ProbeNodesSummary{}
 	groupID := strings.TrimSpace(req.GroupID)
-	timeoutMS := req.TimeoutMS
-	if timeoutMS <= 0 || timeoutMS > 30000 {
-		timeoutMS = 5000
-	}
-	probeURL := strings.TrimSpace(req.URL)
-	if probeURL == "" {
-		probeURL = "https://www.gstatic.com/generate_204"
-	}
+	handle.UpdateProgress("检查探测目标节点")
 
 	s.mu.Lock()
 	s.ensureValidLocked()
-	if s.state.ProxyMode == ProxyModeOff {
-		snapshot := cloneSnapshot(s.state)
-		s.mu.Unlock()
-		return snapshot, errors.New("proxy mode is off")
-	}
 	snapshot := cloneSnapshot(s.state)
 	targetNodes, err := collectProbeNodes(snapshot, groupID, req.NodeIDs)
 	if err != nil {
 		s.mu.Unlock()
-		return StateSnapshot{}, err
+		return StateSnapshot{}, summary, err
 	}
-	wasConnected := s.state.ConnectionStage == ConnectionConnected
+	summary.Requested = len(targetNodes)
+	probeSettings := normalizeProbeSettings(s.state.ProbeSettings)
 	s.mu.Unlock()
 
-	startedTempRuntime := false
-	if !wasConnected {
-		if err := s.runtime.Start(snapshot); err != nil {
-			return StateSnapshot{}, fmt.Errorf("start runtime for probe failed: %w", err)
+	plan := buildProbeExecutionPlan(req, probeSettings)
+	requiresLatencyRefresh := containsProbeType(plan.probeTypes, ProbeTypeNodeLatency)
+	probeLatencyRequested := containsProbeType(plan.probeTypes, ProbeTypeNodeLatency)
+	probeRealConnectRequested := containsProbeType(plan.probeTypes, ProbeTypeRealConnect)
+	nowMS := time.Now().UnixMilli()
+
+	resultByNodeID := make(map[string]nodeProbeUpdate, len(targetNodes))
+	delayProbeNodes := make([]Node, 0, len(targetNodes))
+	runtimeNodeStates := make([]ProbeRuntimeNodeState, 0, len(targetNodes))
+	for _, node := range targetNodes {
+		update := nodeProbeUpdate{}
+		needDelayProbe := false
+
+		shouldProbeLatency := probeLatencyRequested &&
+			shouldExecuteProbeByInterval(node, ProbeTypeNodeLatency, plan.probeIntervalMin, nowMS)
+		shouldProbeRealConnect := probeRealConnectRequested &&
+			shouldExecuteProbeByInterval(node, ProbeTypeRealConnect, plan.probeIntervalMin, nowMS)
+
+		if shouldProbeLatency || shouldProbeRealConnect {
+			needDelayProbe = true
+			pendingStages := make([]ProbeRuntimeStage, 0, 2)
+			if shouldProbeLatency {
+				pendingStages = append(pendingStages, ProbeRuntimeStageNodeLatency)
+			}
+			if shouldProbeRealConnect {
+				pendingStages = append(pendingStages, ProbeRuntimeStageRealConnect)
+			}
+			runtimeNodeStates = append(runtimeNodeStates, ProbeRuntimeNodeState{
+				NodeID:        node.ID,
+				PendingStages: pendingStages,
+			})
 		}
-		startedTempRuntime = true
+		if needDelayProbe {
+			summary.FreshProbeCount++
+		} else {
+			summary.CachedResultCount++
+		}
+
+		if probeLatencyRequested && !shouldProbeLatency {
+			update.hasLatency = true
+			update.latencyMS = node.LatencyMS
+			update.hasLatencyAt = true
+			update.latencyAtMS = node.LatencyProbedAtMS
+		}
+		if probeRealConnectRequested && !shouldProbeRealConnect {
+			update.hasRealConnect = true
+			update.realConnectMS = node.ProbeRealConnectMS
+			update.hasRealConnectAt = true
+			update.realConnectAtMS = node.RealConnectProbedAtMS
+		}
+
+		if needDelayProbe {
+			delayProbeNodes = append(delayProbeNodes, node)
+		}
+		resultByNodeID[node.ID] = update
+	}
+	requiresDelayProbe := len(delayProbeNodes) > 0
+	requiresProbeRuntime := requiresDelayProbe
+	probeRuntimeTaskRegistered := false
+	if len(runtimeNodeStates) > 0 {
+		probeRuntimeTaskRegistered = s.beginProbeRuntimeTask(handle, runtimeNodeStates)
 		defer func() {
-			_ = s.runtime.Stop()
+			if probeRuntimeTaskRegistered {
+				s.finishProbeRuntimeTask(handle.ID())
+			}
 		}()
 	}
+	realtimeUpdatedAny := false
+	var skippedRealConnectDueToLatency int64
+	var reprobedLatencyBeforeRealConnect int64
 
-	probeResults := make(map[string]int, len(targetNodes))
+	if requiresProbeRuntime {
+		handle.UpdateProgress("执行真实探测")
+		if snapshot.ProxyMode == ProxyModeOff {
+			s.LogCore(
+				LogLevelInfo,
+				fmt.Sprintf(
+					"probe nodes requires minimal runtime refresh: total=%d group=%s",
+					len(delayProbeNodes),
+					func() string {
+						if groupID == "" {
+							return "all"
+						}
+						return groupID
+					}(),
+				),
+			)
+			if err := s.ensureMinimalProbeRuntimeReady("prepare_probe_only_runtime", snapshot); err != nil {
+				return StateSnapshot{}, summary, err
+			}
+		}
+		probeErr := s.runtimeCoordinatorOrDefault().WithRuntimeRead(
+			"probe_nodes",
+			func(runtime *proxyRuntime) error {
+				if runtime == nil {
+					return errors.New("probe runtime is not available")
+				}
+
+				if requiresDelayProbe {
+					type delayProbeResult struct {
+						nodeID string
+						update nodeProbeUpdate
+					}
+					workerCount := plan.concurrency
+					if workerCount <= 0 {
+						workerCount = defaultProbeConcurrency
+					}
+					if workerCount > len(delayProbeNodes) {
+						workerCount = len(delayProbeNodes)
+					}
+					nodeQueue := make(chan Node)
+					resultQueue := make(chan delayProbeResult, len(delayProbeNodes))
+					var waitGroup sync.WaitGroup
+					for workerIndex := 0; workerIndex < workerCount; workerIndex++ {
+						waitGroup.Add(1)
+						go func() {
+							defer waitGroup.Done()
+							for node := range nodeQueue {
+								update := nodeProbeUpdate{}
+								shouldProbeLatency := probeLatencyRequested &&
+									shouldExecuteProbeByInterval(node, ProbeTypeNodeLatency, plan.probeIntervalMin, nowMS)
+								shouldProbeRealConnect := probeRealConnectRequested &&
+									shouldExecuteProbeByInterval(node, ProbeTypeRealConnect, plan.probeIntervalMin, nowMS)
+								latencyExpired := shouldExecuteProbeByInterval(
+									node,
+									ProbeTypeNodeLatency,
+									plan.probeIntervalMin,
+									nowMS,
+								)
+								if shouldProbeLatency {
+									delayMS, runErr := runtime.ProbeNodeDelay(node.ID, plan.latencyProbeURL, plan.timeoutMS)
+									if runErr != nil {
+										delayMS = -1
+									}
+									update.hasLatency = true
+									update.latencyMS = delayMS
+									update.hasLatencyAt = true
+									update.latencyAtMS = nowMS
+								}
+								if shouldProbeRealConnect {
+									var reprobedLatency bool
+									var skippedDueToLatency bool
+									update, reprobedLatency, skippedDueToLatency = executeRealConnectProbeWithLatencyGate(
+										node,
+										update,
+										latencyExpired,
+										plan,
+										nowMS,
+										runtime.ProbeNodeDelay,
+										runtime.ProbeNodeRealConnect,
+									)
+									if reprobedLatency {
+										atomic.AddInt64(&reprobedLatencyBeforeRealConnect, 1)
+									}
+									if skippedDueToLatency {
+										atomic.AddInt64(&skippedRealConnectDueToLatency, 1)
+									}
+								}
+								resultQueue <- delayProbeResult{
+									nodeID: node.ID,
+									update: update,
+								}
+							}
+						}()
+					}
+					go func() {
+						for _, node := range delayProbeNodes {
+							nodeQueue <- node
+						}
+						close(nodeQueue)
+					}()
+					go func() {
+						waitGroup.Wait()
+						close(resultQueue)
+					}()
+					for result := range resultQueue {
+						existing := resultByNodeID[result.nodeID]
+						existing.merge(result.update)
+						resultByNodeID[result.nodeID] = existing
+						if s.applyProbeNodeUpdateRealtime(handle.ID(), result.nodeID, result.update) {
+							realtimeUpdatedAny = true
+						}
+					}
+				}
+
+				return nil
+			},
+		)
+		if probeErr != nil {
+			return StateSnapshot{}, summary, probeErr
+		}
+	}
+
 	successCount := 0
 	failCount := 0
-	for _, node := range targetNodes {
-		delayMS, probeErr := s.runtime.ProbeNodeDelay(node.ID, probeURL, timeoutMS)
-		if probeErr != nil {
-			probeResults[node.ID] = 0
+	skipFinalizeUpdate := !requiresProbeRuntime
+	summary.SkippedRealConnectDueToLatency = int(atomic.LoadInt64(&skippedRealConnectDueToLatency))
+	summary.ReprobedLatencyBeforeRealConnect = int(atomic.LoadInt64(&reprobedLatencyBeforeRealConnect))
+	if summary.FreshProbeCount <= 0 {
+		handle.UpdateProgress("沿用缓存返回探测结果")
+	} else if summary.CachedResultCount > 0 {
+		handle.UpdateProgress(
+			fmt.Sprintf(
+				"真实探测 %d，沿用缓存 %d",
+				summary.FreshProbeCount,
+				summary.CachedResultCount,
+			),
+		)
+	}
+	s.mu.Lock()
+	updatedAny := realtimeUpdatedAny
+	updatedInFinalize := false
+	for nodeID, update := range resultByNodeID {
+		if probeNodeUpdateSucceeded(update, plan.probeTypes) {
+			successCount++
+		} else {
 			failCount++
+		}
+		if skipFinalizeUpdate {
 			continue
 		}
-		probeResults[node.ID] = delayMS
-		successCount++
+		updated := updateNodeProbeMetricsLocked(s.state.Groups, nodeID, update)
+		if updated {
+			updatedAny = true
+			updatedInFinalize = true
+		}
+	}
+	summary.Succeeded = successCount
+	summary.Failed = failCount
+	if updatedInFinalize {
+		_ = s.saveLocked()
 	}
 
 	groupLabel := groupID
 	if groupLabel == "" {
 		groupLabel = "all"
 	}
-
-	s.mu.Lock()
-	for groupIndex := range s.state.Groups {
-		for nodeIndex := range s.state.Groups[groupIndex].Nodes {
-			nodeID := s.state.Groups[groupIndex].Nodes[nodeIndex].ID
-			delayMS, exists := probeResults[nodeID]
-			if !exists {
-				continue
-			}
-			s.state.Groups[groupIndex].Nodes[nodeIndex].LatencyMS = delayMS
-		}
+	typeLabels := make([]string, 0, len(plan.probeTypes))
+	for _, probeType := range plan.probeTypes {
+		typeLabels = append(typeLabels, string(probeType))
 	}
-	needHotReload := s.state.ConnectionStage == ConnectionConnected &&
+	needHotReload := requiresLatencyRefresh &&
+		updatedAny &&
+		s.state.ConnectionStage == ConnectionConnected &&
 		s.state.ProxyMode != ProxyModeOff &&
-		hasEnabledFastestRule(s.state)
+		hasReferencedNodePoolRule(s.state)
 	s.appendCoreLogLocked(
 		LogLevelInfo,
 		fmt.Sprintf(
-			"probe nodes finished: total=%d success=%d failed=%d group=%s temporary_runtime=%t",
+			"probe nodes finished: total=%d success=%d failed=%d skipped_realconnect_due_to_latency=%d reprobed_latency_before_realconnect=%d group=%s probe_types=%s timeout_ms=%d concurrency=%d interval_min=%d",
 			len(targetNodes),
 			successCount,
 			failCount,
+			summary.SkippedRealConnectDueToLatency,
+			summary.ReprobedLatencyBeforeRealConnect,
 			groupLabel,
-			startedTempRuntime,
+			strings.Join(typeLabels, ","),
+			plan.timeoutMS,
+			plan.concurrency,
+			plan.probeIntervalMin,
 		),
 	)
 	current := cloneSnapshot(s.state)
@@ -637,10 +1447,7 @@ func (s *RuntimeStore) ProbeNodes(_ context.Context, req ProbeNodesRequest) (Sta
 		hotSwitchErr := s.applyRulePoolSelectionsHot(current)
 		reloadErr := error(nil)
 		if hotSwitchErr != nil {
-			reloadErr = s.runtime.Start(current)
-			if proxyErr := syncSystemProxy(current); reloadErr == nil {
-				reloadErr = proxyErr
-			}
+			reloadErr = s.applyRuntimeWithRollback(current, current)
 		}
 		s.mu.Lock()
 		defer s.mu.Unlock()
@@ -651,7 +1458,7 @@ func (s *RuntimeStore) ProbeNodes(_ context.Context, req ProbeNodesRequest) (Sta
 				fmt.Sprintf("probe hot-switch failed (%v), and reload failed: %v", hotSwitchErr, reloadErr),
 			)
 			_ = s.saveLocked()
-			return cloneSnapshot(s.state), reloadErr
+			return cloneSnapshot(s.state), summary, reloadErr
 		}
 		if hotSwitchErr != nil {
 			s.appendCoreLogLocked(
@@ -661,18 +1468,1242 @@ func (s *RuntimeStore) ProbeNodes(_ context.Context, req ProbeNodesRequest) (Sta
 		}
 		s.state.ConnectionStage = ConnectionConnected
 		_ = s.saveLocked()
+		return cloneSnapshot(s.state), summary, nil
+	}
+	return current, summary, nil
+}
+
+func (s *RuntimeStore) buildProbeTaskOptions(req ProbeNodesRequest) runtimeTaskOptions {
+	s.mu.RLock()
+	snapshot := cloneSnapshot(s.state)
+	s.mu.RUnlock()
+	groupID := strings.TrimSpace(req.GroupID)
+	groupName := groupID
+	if groupID == "" {
+		groupName = "全部节点"
+	} else if group := findGroupByID(snapshot.Groups, groupID); group != nil {
+		groupName = strings.TrimSpace(group.Name)
+		if groupName == "" {
+			groupName = groupID
+		}
+	}
+	probeTypes := resolveProbeTypesFromRequest(req)
+	scopeKey, typeLabel := resolveProbeTaskScopeAndTitle(probeTypes)
+	return runtimeTaskOptions{
+		TaskType:     BackgroundTaskTypeNodeProbe,
+		ScopeKey:     scopeKey,
+		Title:        fmt.Sprintf("%s：%s", typeLabel, groupName),
+		ProgressText: "等待节点探测",
+		SuccessText:  "节点探测完成",
+	}
+}
+
+func resolveProbeTaskScopeAndTitle(probeTypes []ProbeType) (string, string) {
+	if containsProbeType(probeTypes, ProbeTypeRealConnect) {
+		return "node_probe:real_connect", "真连评分探测"
+	}
+	return "node_probe:node_latency", "延迟探测"
+}
+
+func isValidProbeRuntimeStage(value ProbeRuntimeStage) bool {
+	switch value {
+	case ProbeRuntimeStageNodeLatency, ProbeRuntimeStageRealConnect, ProbeRuntimeStageCountryUpdate:
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeProbeRuntimeStages(values []ProbeRuntimeStage) []ProbeRuntimeStage {
+	result := make([]ProbeRuntimeStage, 0, len(values))
+	seen := map[ProbeRuntimeStage]struct{}{}
+	for _, value := range values {
+		normalized := ProbeRuntimeStage(strings.TrimSpace(string(value)))
+		if !isValidProbeRuntimeStage(normalized) {
+			continue
+		}
+		if _, exists := seen[normalized]; exists {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		result = append(result, normalized)
+	}
+	return result
+}
+
+func normalizeProbeRuntimeNodeStates(values []ProbeRuntimeNodeState) []ProbeRuntimeNodeState {
+	result := make([]ProbeRuntimeNodeState, 0, len(values))
+	for _, value := range values {
+		nodeID := strings.TrimSpace(value.NodeID)
+		pendingStages := normalizeProbeRuntimeStages(value.PendingStages)
+		if nodeID == "" || len(pendingStages) == 0 {
+			continue
+		}
+		result = append(result, ProbeRuntimeNodeState{
+			NodeID:        nodeID,
+			PendingStages: pendingStages,
+		})
+	}
+	return result
+}
+
+func probeRuntimeStagesFromUpdate(update nodeProbeUpdate) []ProbeRuntimeStage {
+	stages := make([]ProbeRuntimeStage, 0, 2)
+	if update.hasLatency {
+		stages = append(stages, ProbeRuntimeStageNodeLatency)
+	}
+	if update.hasRealConnect {
+		stages = append(stages, ProbeRuntimeStageRealConnect)
+	}
+	return stages
+}
+
+func removeProbeRuntimeTaskLocked(tasks []ProbeRuntimeTask, taskID string) ([]ProbeRuntimeTask, bool) {
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" || len(tasks) == 0 {
+		return tasks, false
+	}
+	for index, task := range tasks {
+		if strings.TrimSpace(task.TaskID) != taskID {
+			continue
+		}
+		next := append([]ProbeRuntimeTask{}, tasks[:index]...)
+		next = append(next, tasks[index+1:]...)
+		return next, true
+	}
+	return tasks, false
+}
+
+func upsertProbeRuntimeTaskLocked(tasks []ProbeRuntimeTask, task ProbeRuntimeTask) ([]ProbeRuntimeTask, bool) {
+	task.TaskID = strings.TrimSpace(task.TaskID)
+	task.Title = strings.TrimSpace(task.Title)
+	task.NodeStates = normalizeProbeRuntimeNodeStates(task.NodeStates)
+	if task.TaskID == "" || len(task.NodeStates) == 0 {
+		return tasks, false
+	}
+	for index, existing := range tasks {
+		if strings.TrimSpace(existing.TaskID) != task.TaskID {
+			continue
+		}
+		if reflect.DeepEqual(existing, task) {
+			return tasks, false
+		}
+		next := append([]ProbeRuntimeTask{}, tasks...)
+		next[index] = task
+		return next, true
+	}
+	return append(append([]ProbeRuntimeTask{}, tasks...), task), true
+}
+
+func clearProbeRuntimeNodeStagesLocked(
+	tasks []ProbeRuntimeTask,
+	taskID string,
+	nodeID string,
+	stages []ProbeRuntimeStage,
+) ([]ProbeRuntimeTask, bool) {
+	taskID = strings.TrimSpace(taskID)
+	nodeID = strings.TrimSpace(nodeID)
+	stages = normalizeProbeRuntimeStages(stages)
+	if taskID == "" || nodeID == "" || len(stages) == 0 || len(tasks) == 0 {
+		return tasks, false
+	}
+	stageSet := map[ProbeRuntimeStage]struct{}{}
+	for _, stage := range stages {
+		stageSet[stage] = struct{}{}
+	}
+	nextTasks := append([]ProbeRuntimeTask{}, tasks...)
+	changed := false
+	for taskIndex, task := range nextTasks {
+		if strings.TrimSpace(task.TaskID) != taskID {
+			continue
+		}
+		nextNodeStates := make([]ProbeRuntimeNodeState, 0, len(task.NodeStates))
+		for _, nodeState := range task.NodeStates {
+			if strings.TrimSpace(nodeState.NodeID) != nodeID {
+				nextNodeStates = append(nextNodeStates, nodeState)
+				continue
+			}
+			remainingStages := make([]ProbeRuntimeStage, 0, len(nodeState.PendingStages))
+			for _, pendingStage := range nodeState.PendingStages {
+				if _, removed := stageSet[pendingStage]; removed {
+					changed = true
+					continue
+				}
+				remainingStages = append(remainingStages, pendingStage)
+			}
+			if len(remainingStages) == 0 {
+				continue
+			}
+			nodeState.PendingStages = remainingStages
+			nextNodeStates = append(nextNodeStates, nodeState)
+		}
+		if !changed {
+			return tasks, false
+		}
+		if len(nextNodeStates) == 0 {
+			nextTasks = append(nextTasks[:taskIndex], nextTasks[taskIndex+1:]...)
+			return nextTasks, true
+		}
+		task.NodeStates = nextNodeStates
+		nextTasks[taskIndex] = task
+		return nextTasks, true
+	}
+	return tasks, false
+}
+
+func (s *RuntimeStore) beginProbeRuntimeTask(
+	handle runtimeTaskHandle,
+	nodeStates []ProbeRuntimeNodeState,
+) bool {
+	taskID := strings.TrimSpace(handle.ID())
+	normalizedNodeStates := normalizeProbeRuntimeNodeStates(nodeStates)
+	if s == nil || taskID == "" || len(normalizedNodeStates) == 0 {
+		return false
+	}
+	taskType := BackgroundTaskTypeNodeProbe
+	title := "节点探测"
+	if task := s.taskSnapshotByID(taskID); task != nil {
+		taskType = task.Type
+		if strings.TrimSpace(task.Title) != "" {
+			title = strings.TrimSpace(task.Title)
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	nextTasks, changed := upsertProbeRuntimeTaskLocked(s.state.ProbeRuntimeTasks, ProbeRuntimeTask{
+		TaskID:     taskID,
+		TaskType:   taskType,
+		Title:      title,
+		NodeStates: normalizedNodeStates,
+	})
+	if !changed {
+		return false
+	}
+	s.state.ProbeRuntimeTasks = nextTasks
+	_ = s.saveLocked()
+	return true
+}
+
+func (s *RuntimeStore) clearProbeRuntimeNodeStages(
+	taskID string,
+	nodeID string,
+	stages []ProbeRuntimeStage,
+) bool {
+	taskID = strings.TrimSpace(taskID)
+	nodeID = strings.TrimSpace(nodeID)
+	if s == nil || taskID == "" || nodeID == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	nextTasks, changed := clearProbeRuntimeNodeStagesLocked(s.state.ProbeRuntimeTasks, taskID, nodeID, stages)
+	if !changed {
+		return false
+	}
+	s.state.ProbeRuntimeTasks = nextTasks
+	_ = s.saveLocked()
+	return true
+}
+
+func (s *RuntimeStore) finishProbeRuntimeTask(taskID string) bool {
+	taskID = strings.TrimSpace(taskID)
+	if s == nil || taskID == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	nextTasks, changed := removeProbeRuntimeTaskLocked(s.state.ProbeRuntimeTasks, taskID)
+	if !changed {
+		return false
+	}
+	s.state.ProbeRuntimeTasks = nextTasks
+	_ = s.saveLocked()
+	return true
+}
+
+type probeExecutionPlan struct {
+	probeTypes          []ProbeType
+	timeoutMS           int
+	concurrency         int
+	probeIntervalMin    int
+	latencyProbeURL     string
+	realConnectProbeURL string
+}
+
+type nodeProbeUpdate struct {
+	hasLatency       bool
+	latencyMS        int
+	hasLatencyAt     bool
+	latencyAtMS      int64
+	hasRealConnect   bool
+	realConnectMS    int
+	hasRealConnectAt bool
+	realConnectAtMS  int64
+}
+
+func (u *nodeProbeUpdate) merge(other nodeProbeUpdate) {
+	if other.hasLatency {
+		u.hasLatency = true
+		u.latencyMS = other.latencyMS
+	}
+	if other.hasLatencyAt {
+		u.hasLatencyAt = true
+		u.latencyAtMS = other.latencyAtMS
+	}
+	if other.hasRealConnect {
+		u.hasRealConnect = true
+		u.realConnectMS = other.realConnectMS
+	}
+	if other.hasRealConnectAt {
+		u.hasRealConnectAt = true
+		u.realConnectAtMS = other.realConnectAtMS
+	}
+}
+
+func buildProbeExecutionPlan(req ProbeNodesRequest, probeSettings ProbeSettings) probeExecutionPlan {
+	timeoutMS := req.TimeoutMS
+	if timeoutMS <= 0 {
+		timeoutMS = probeSettings.TimeoutSec * 1000
+	}
+	if timeoutMS <= 0 || timeoutMS > 120000 {
+		timeoutMS = defaultProbeTimeoutSec * 1000
+	}
+	concurrency := probeSettings.Concurrency
+	if concurrency < minProbeConcurrency {
+		concurrency = defaultProbeConcurrency
+	}
+	if concurrency > maxProbeConcurrency {
+		concurrency = maxProbeConcurrency
+	}
+	probeIntervalMin := probeSettings.ProbeIntervalMin
+	if !isAllowedProbeIntervalMin(probeIntervalMin) {
+		probeIntervalMin = defaultProbeIntervalMin
+	}
+	probeTypes := resolveProbeTypesFromRequest(req)
+	if len(probeTypes) == 0 {
+		probeTypes = []ProbeType{ProbeTypeNodeLatency}
+	}
+
+	latencyProbeURL := strings.TrimSpace(req.URL)
+	if latencyProbeURL == "" {
+		latencyProbeURL = "https://www.gstatic.com/generate_204"
+	}
+	realConnectProbeURL := strings.TrimSpace(probeSettings.RealConnectTestURL)
+	if realConnectProbeURL == "" {
+		realConnectProbeURL = defaultProbeRealConnectURL
+	}
+	return probeExecutionPlan{
+		probeTypes:          probeTypes,
+		timeoutMS:           timeoutMS,
+		concurrency:         concurrency,
+		probeIntervalMin:    probeIntervalMin,
+		latencyProbeURL:     latencyProbeURL,
+		realConnectProbeURL: realConnectProbeURL,
+	}
+}
+
+func resolveProbeTypesFromRequest(req ProbeNodesRequest) []ProbeType {
+	rawValues := make([]ProbeType, 0, len(req.ProbeTypes)+1)
+	if normalized := normalizeProbeType(req.ProbeType); isValidProbeType(normalized) {
+		rawValues = append(rawValues, normalized)
+	}
+	rawValues = append(rawValues, req.ProbeTypes...)
+	result := make([]ProbeType, 0, len(rawValues))
+	seen := map[ProbeType]struct{}{}
+	for _, value := range rawValues {
+		normalized := normalizeProbeType(value)
+		if !isValidProbeType(normalized) {
+			continue
+		}
+		if _, exists := seen[normalized]; exists {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		result = append(result, normalized)
+	}
+	return result
+}
+
+func containsProbeType(values []ProbeType, target ProbeType) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+func resolveNodeProbeTimestampMS(node Node, probeType ProbeType) int64 {
+	switch probeType {
+	case ProbeTypeNodeLatency:
+		return node.LatencyProbedAtMS
+	case ProbeTypeRealConnect:
+		return node.RealConnectProbedAtMS
+	default:
+		return 0
+	}
+}
+
+func executeRealConnectProbeWithLatencyGate(
+	node Node,
+	update nodeProbeUpdate,
+	latencyExpired bool,
+	plan probeExecutionPlan,
+	nowMS int64,
+	runDelay func(nodeID string, probeURL string, timeoutMS int) (int, error),
+	runRealConnect func(nodeID string, probeURL string, timeoutMS int) (int, error),
+) (nodeProbeUpdate, bool, bool) {
+	latencyMS := node.LatencyMS
+	if update.hasLatency {
+		latencyMS = update.latencyMS
+	}
+	reprobedLatency := !update.hasLatency && (latencyMS <= 0 || latencyExpired)
+	if reprobedLatency {
+		delayMS := -1
+		if runDelay != nil {
+			if value, err := runDelay(node.ID, plan.latencyProbeURL, plan.timeoutMS); err == nil {
+				delayMS = value
+			}
+		}
+		update.hasLatency = true
+		update.latencyMS = delayMS
+		update.hasLatencyAt = true
+		update.latencyAtMS = nowMS
+		latencyMS = delayMS
+	}
+	if latencyMS <= 0 {
+		update.hasRealConnect = true
+		update.realConnectMS = -1
+		update.hasRealConnectAt = true
+		update.realConnectAtMS = nowMS
+		return update, reprobedLatency, true
+	}
+	realConnectMS := -1
+	if runRealConnect != nil {
+		if value, err := runRealConnect(node.ID, plan.realConnectProbeURL, plan.timeoutMS); err == nil {
+			realConnectMS = value
+		}
+	}
+	update.hasRealConnect = true
+	update.realConnectMS = realConnectMS
+	update.hasRealConnectAt = true
+	update.realConnectAtMS = nowMS
+	return update, reprobedLatency, false
+}
+
+func shouldExecuteProbeByInterval(node Node, probeType ProbeType, intervalMin int, nowMS int64) bool {
+	if !isAllowedProbeIntervalMin(intervalMin) {
+		intervalMin = defaultProbeIntervalMin
+	}
+	lastProbeAtMS := resolveNodeProbeTimestampMS(node, probeType)
+	if lastProbeAtMS <= 0 {
+		return true
+	}
+	intervalMS := int64(intervalMin) * int64(time.Minute/time.Millisecond)
+	if intervalMS <= 0 {
+		return true
+	}
+	if nowMS <= 0 {
+		nowMS = time.Now().UnixMilli()
+	}
+	if nowMS < lastProbeAtMS {
+		return false
+	}
+	return nowMS-lastProbeAtMS >= intervalMS
+}
+
+func probeNodeUpdateSucceeded(update nodeProbeUpdate, probeTypes []ProbeType) bool {
+	for _, probeType := range probeTypes {
+		switch probeType {
+		case ProbeTypeNodeLatency:
+			if !update.hasLatency || update.latencyMS <= 0 {
+				return false
+			}
+		case ProbeTypeRealConnect:
+			if !update.hasRealConnect || update.realConnectMS <= 0 {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func updateNodeProbeMetricsLocked(groups []NodeGroup, nodeID string, update nodeProbeUpdate) bool {
+	for groupIndex := range groups {
+		for nodeIndex := range groups[groupIndex].Nodes {
+			if groups[groupIndex].Nodes[nodeIndex].ID != nodeID {
+				continue
+			}
+			node := &groups[groupIndex].Nodes[nodeIndex]
+			changed := false
+			if update.hasLatency {
+				if node.LatencyMS != update.latencyMS {
+					node.LatencyMS = update.latencyMS
+					changed = true
+				}
+			}
+			if update.hasLatencyAt {
+				if node.LatencyProbedAtMS != update.latencyAtMS {
+					node.LatencyProbedAtMS = update.latencyAtMS
+					changed = true
+				}
+			}
+			if update.hasRealConnect {
+				if node.ProbeRealConnectMS != update.realConnectMS {
+					node.ProbeRealConnectMS = update.realConnectMS
+					changed = true
+				}
+			}
+			if update.hasRealConnectAt {
+				if node.RealConnectProbedAtMS != update.realConnectAtMS {
+					node.RealConnectProbedAtMS = update.realConnectAtMS
+					changed = true
+				}
+			}
+			nextScore := computeNodeProbeScore(*node)
+			if node.ProbeScore != nextScore {
+				node.ProbeScore = nextScore
+				changed = true
+			}
+			return changed
+		}
+	}
+	return false
+}
+
+func (s *RuntimeStore) applyProbeNodeUpdateRealtime(taskID string, nodeID string, update nodeProbeUpdate) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	updated := updateNodeProbeMetricsLocked(s.state.Groups, nodeID, update)
+	nextTasks, pendingChanged := clearProbeRuntimeNodeStagesLocked(
+		s.state.ProbeRuntimeTasks,
+		taskID,
+		nodeID,
+		probeRuntimeStagesFromUpdate(update),
+	)
+	if pendingChanged {
+		s.state.ProbeRuntimeTasks = nextTasks
+	}
+	if !updated && !pendingChanged {
+		return false
+	}
+	_ = s.saveLocked()
+	return true
+}
+
+const (
+	probeScoreLatencyGoodMS     = 80
+	probeScoreLatencyBadMS      = 600
+	probeScoreRealConnectGoodMS = 250
+	probeScoreRealConnectBadMS  = 2000
+	probeScoreLatencyWeight     = 0.35
+	probeScoreRealConnectWeight = 0.65
+	probeScoreLatencyOnlyCap    = 55.0
+	probeScoreRealOnlyCap       = 80.0
+)
+
+func normalizeProbeLatencyDimensionScore(ms int, goodMS int, badMS int) float64 {
+	if ms <= 0 || badMS <= goodMS {
+		return 0
+	}
+	if ms <= goodMS {
+		return 100
+	}
+	if ms >= badMS {
+		return 0
+	}
+	return (float64(badMS-ms) / float64(badMS-goodMS)) * 100
+}
+
+func roundProbeScore(value float64) float64 {
+	if value < 0 {
+		value = 0
+	}
+	if value > 100 {
+		value = 100
+	}
+	return math.Round(value*10) / 10
+}
+
+func computeNodeProbeScore(node Node) float64 {
+	hasLatencyMeasurement := node.LatencyMS > 0
+	hasRealConnectMeasurement := node.ProbeRealConnectMS > 0
+	latencyScore := normalizeProbeLatencyDimensionScore(
+		node.LatencyMS,
+		probeScoreLatencyGoodMS,
+		probeScoreLatencyBadMS,
+	)
+	realConnectScore := normalizeProbeLatencyDimensionScore(
+		node.ProbeRealConnectMS,
+		probeScoreRealConnectGoodMS,
+		probeScoreRealConnectBadMS,
+	)
+	switch {
+	case !hasLatencyMeasurement && !hasRealConnectMeasurement:
+		return 0
+	case hasLatencyMeasurement && !hasRealConnectMeasurement:
+		return roundProbeScore(math.Min(probeScoreLatencyOnlyCap, latencyScore))
+	case !hasLatencyMeasurement && hasRealConnectMeasurement:
+		return roundProbeScore(math.Min(probeScoreRealOnlyCap, realConnectScore))
+	default:
+		return roundProbeScore(
+			latencyScore*probeScoreLatencyWeight +
+				realConnectScore*probeScoreRealConnectWeight,
+		)
+	}
+}
+
+func (s *RuntimeStore) ClearProbeData(_ context.Context, req ClearProbeDataRequest) (StateSnapshot, error) {
+	groupID := strings.TrimSpace(req.GroupID)
+	nodeIDSet := map[string]struct{}{}
+	for _, rawNodeID := range req.NodeIDs {
+		nodeID := strings.TrimSpace(rawNodeID)
+		if nodeID == "" {
+			continue
+		}
+		nodeIDSet[nodeID] = struct{}{}
+	}
+	probeTypes := normalizeProbeTypeList(req.ProbeTypes)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ensureValidLocked()
+
+	groupIndexes := make([]int, 0, len(s.state.Groups))
+	if groupID == "" {
+		for groupIndex := range s.state.Groups {
+			groupIndexes = append(groupIndexes, groupIndex)
+		}
+	} else {
+		groupIndex := s.indexGroupByIDLocked(groupID)
+		if groupIndex < 0 {
+			return StateSnapshot{}, errors.New("group not found")
+		}
+		groupIndexes = append(groupIndexes, groupIndex)
+	}
+
+	matchedNodes := 0
+	changedNodes := 0
+	for _, groupIndex := range groupIndexes {
+		for nodeIndex := range s.state.Groups[groupIndex].Nodes {
+			node := &s.state.Groups[groupIndex].Nodes[nodeIndex]
+			if len(nodeIDSet) > 0 {
+				if _, ok := nodeIDSet[node.ID]; !ok {
+					continue
+				}
+			}
+			matchedNodes++
+			if clearNodeProbeDataByTypes(node, probeTypes) {
+				changedNodes++
+			}
+		}
+	}
+	if matchedNodes == 0 {
+		if len(nodeIDSet) > 0 {
+			return StateSnapshot{}, errors.New("target nodes not found")
+		}
+		return StateSnapshot{}, errors.New("no nodes available to clear")
+	}
+
+	groupLabel := groupID
+	if groupLabel == "" {
+		groupLabel = "all"
+	}
+	typeLabels := make([]string, 0, len(probeTypes))
+	for _, probeType := range probeTypes {
+		typeLabels = append(typeLabels, string(probeType))
+	}
+	s.appendCoreLogLocked(
+		LogLevelInfo,
+		fmt.Sprintf(
+			"clear probe data finished: group=%s matched=%d changed=%d probe_types=%s",
+			groupLabel,
+			matchedNodes,
+			changedNodes,
+			strings.Join(typeLabels, ","),
+		),
+	)
+	_ = s.saveLocked()
+	return cloneSnapshot(s.state), nil
+}
+
+func (s *RuntimeStore) ResetTrafficStats(_ context.Context, req ResetTrafficStatsRequest) (StateSnapshot, error) {
+	groupID := strings.TrimSpace(req.GroupID)
+	nodeIDSet := map[string]struct{}{}
+	for _, rawNodeID := range req.NodeIDs {
+		nodeID := strings.TrimSpace(rawNodeID)
+		if nodeID == "" {
+			continue
+		}
+		nodeIDSet[nodeID] = struct{}{}
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ensureValidLocked()
+
+	groupIndexes := make([]int, 0, len(s.state.Groups))
+	if groupID == "" {
+		for groupIndex := range s.state.Groups {
+			groupIndexes = append(groupIndexes, groupIndex)
+		}
+	} else {
+		groupIndex := s.indexGroupByIDLocked(groupID)
+		if groupIndex < 0 {
+			return StateSnapshot{}, errors.New("group not found")
+		}
+		groupIndexes = append(groupIndexes, groupIndex)
+	}
+
+	matchedNodes := 0
+	changedNodes := 0
+	for _, groupIndex := range groupIndexes {
+		for nodeIndex := range s.state.Groups[groupIndex].Nodes {
+			node := &s.state.Groups[groupIndex].Nodes[nodeIndex]
+			if len(nodeIDSet) > 0 {
+				if _, ok := nodeIDSet[node.ID]; !ok {
+					continue
+				}
+			}
+			matchedNodes++
+			if resetNodeTrafficStats(node) {
+				changedNodes++
+			}
+		}
+	}
+	if matchedNodes == 0 {
+		if len(nodeIDSet) > 0 {
+			return StateSnapshot{}, errors.New("target nodes not found")
+		}
+		return StateSnapshot{}, errors.New("no nodes available to reset traffic")
+	}
+
+	groupLabel := groupID
+	if groupLabel == "" {
+		groupLabel = "all"
+	}
+	s.appendCoreLogLocked(
+		LogLevelInfo,
+		fmt.Sprintf(
+			"reset traffic stats finished: group=%s matched=%d changed=%d",
+			groupLabel,
+			matchedNodes,
+			changedNodes,
+		),
+	)
+	s.resetTrafficSamplingBaselineLocked()
+	_ = s.saveLocked()
+	return cloneSnapshot(s.state), nil
+}
+
+const updateNodeCountryTimeoutMS = 15000
+
+type nodeCountryUpdateResult struct {
+	nodeID  string
+	country string
+	err     error
+	trace   *nodeCountryFetchTrace
+}
+
+type nodeCountryFetchTrace struct {
+	requestURL       string
+	proxyPort        int
+	statusCode       int
+	responseSnippet  string
+	extractedCountry string
+	matchedField     string
+	matchedRawValue  string
+}
+
+func (s *RuntimeStore) updateNodeCountriesNow(
+	ctx context.Context,
+	req UpdateNodeCountriesRequest,
+	handle runtimeTaskHandle,
+) (StateSnapshot, error) {
+	nodeIDSet := map[string]struct{}{}
+	for _, rawNodeID := range req.NodeIDs {
+		nodeID := strings.TrimSpace(rawNodeID)
+		if nodeID == "" {
+			continue
+		}
+		nodeIDSet[nodeID] = struct{}{}
+	}
+	if len(nodeIDSet) == 0 {
+		return StateSnapshot{}, errors.New("nodeIds is required")
+	}
+
+	s.mu.Lock()
+	s.ensureValidLocked()
+	probeSettings := normalizeProbeSettings(s.state.ProbeSettings)
+	s.mu.Unlock()
+
+	handle.UpdateProgress("探测目标节点可用性")
+	probeSnapshot, _, probeErr := s.probeNodesNow(context.Background(), ProbeNodesRequest{
+		NodeIDs:    req.NodeIDs,
+		ProbeTypes: []ProbeType{ProbeTypeNodeLatency, ProbeTypeRealConnect},
+		TimeoutMS:  probeSettings.TimeoutSec * 1000,
+	}, handle)
+	if probeErr != nil {
+		return StateSnapshot{}, fmt.Errorf("probe node availability before update country failed: %w", probeErr)
+	}
+	targetNodes, err := collectProbeNodes(probeSnapshot, "", req.NodeIDs)
+	if err != nil {
+		return StateSnapshot{}, err
+	}
+	unavailableNodeIDs := collectUnavailableNodeIDsForCountryUpdate(targetNodes)
+	if len(unavailableNodeIDs) > 0 {
+		return StateSnapshot{}, fmt.Errorf(
+			"update country requires reachable nodes with valid probe score: %s",
+			strings.Join(unavailableNodeIDs, ","),
+		)
+	}
+	snapshot := probeSnapshot
+	queryURL := strings.TrimSpace(probeSettings.NodeInfoQueryURL)
+	if queryURL == "" {
+		queryURL = defaultProbeNodeInfoQueryURL
+	}
+	timeoutMS := probeSettings.TimeoutSec * 1000
+	if timeoutMS <= 0 {
+		timeoutMS = updateNodeCountryTimeoutMS
+	}
+	countryRuntimeNodeStates := make([]ProbeRuntimeNodeState, 0, len(targetNodes))
+	for _, node := range targetNodes {
+		countryRuntimeNodeStates = append(countryRuntimeNodeStates, ProbeRuntimeNodeState{
+			NodeID:        node.ID,
+			PendingStages: []ProbeRuntimeStage{ProbeRuntimeStageCountryUpdate},
+		})
+	}
+	countryRuntimeTaskRegistered := s.beginProbeRuntimeTask(handle, countryRuntimeNodeStates)
+	if countryRuntimeTaskRegistered {
+		defer s.finishProbeRuntimeTask(handle.ID())
+	}
+	results := []nodeCountryUpdateResult{}
+	detectMode := "main_runtime_helper"
+	detectReason := "reuse_main_runtime_internal_helper"
+	handle.UpdateProgress("通过节点代理请求国家信息")
+	s.mu.Lock()
+	if err := s.ensureTaskProxyPortLocked(snapshot.LocalProxyPort); err != nil {
+		s.mu.Unlock()
+		return StateSnapshot{}, fmt.Errorf("allocate internal helper proxy port failed: %w", err)
+	}
+	taskProxyPort := s.taskProxyPort
+	s.runtime.ConfigureInternalProxyPort(taskProxyPort)
+	s.mu.Unlock()
+	detectErr := s.runtimeCoordinatorOrDefault().WithRuntimeRead(
+		"update_node_countries",
+		func(runtime *proxyRuntime) error {
+			results = detectNodeCountriesWithActiveRuntime(
+				ctx,
+				runtime,
+				targetNodes,
+				queryURL,
+				taskProxyPort,
+				timeoutMS,
+				snapshot.SelectedNodeID,
+			)
+			return nil
+		},
+	)
+	if detectErr != nil {
+		s.mu.Lock()
+		s.appendCoreLogLocked(
+			LogLevelWarn,
+			fmt.Sprintf(
+				"update node countries runtime execution failed: total=%d query_url=%s timeout_ms=%d error=%v",
+				len(targetNodes),
+				queryURL,
+				timeoutMS,
+				detectErr,
+			),
+		)
+		_ = s.saveLocked()
+		s.mu.Unlock()
+		return StateSnapshot{}, detectErr
+	}
+
+	handle.UpdateProgress("写回节点国家信息")
+	successCount := 0
+	changedCount := 0
+	failedCount := 0
+	var firstErr error
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, result := range results {
+		if result.err != nil {
+			failedCount++
+			if firstErr == nil {
+				firstErr = result.err
+			}
+			if result.trace != nil {
+				s.appendCoreLogLocked(
+					LogLevelWarn,
+					fmt.Sprintf(
+						"update node country http failed: node=%s url=%s proxy_port=%d status=%d field=%s raw=%s extracted=%s body=%s error=%v",
+						result.nodeID,
+						result.trace.requestURL,
+						result.trace.proxyPort,
+						result.trace.statusCode,
+						result.trace.matchedField,
+						result.trace.matchedRawValue,
+						result.trace.extractedCountry,
+						result.trace.responseSnippet,
+						result.err,
+					),
+				)
+			}
+			continue
+		}
+		successCount++
+		if result.trace != nil {
+			s.appendCoreLogLocked(
+				LogLevelInfo,
+				fmt.Sprintf(
+					"update node country http success: node=%s url=%s proxy_port=%d status=%d field=%s raw=%s extracted=%s body=%s",
+					result.nodeID,
+					result.trace.requestURL,
+					result.trace.proxyPort,
+					result.trace.statusCode,
+					result.trace.matchedField,
+					result.trace.matchedRawValue,
+					result.trace.extractedCountry,
+					result.trace.responseSnippet,
+				),
+			)
+		}
+		if applyNodeCountryUpdateLocked(s.state.Groups, result.nodeID, result.country) {
+			changedCount++
+		}
+	}
+	s.appendCoreLogLocked(
+		LogLevelInfo,
+		fmt.Sprintf(
+			"update node countries finished: total=%d success=%d failed=%d changed=%d query_url=%s timeout_ms=%d mode=%s reason=%s",
+			len(targetNodes),
+			successCount,
+			failedCount,
+			changedCount,
+			queryURL,
+			timeoutMS,
+			detectMode,
+			detectReason,
+		),
+	)
+	if changedCount > 0 {
+		_ = s.saveLocked()
 		return cloneSnapshot(s.state), nil
 	}
-	return current, nil
+	if successCount > 0 {
+		return cloneSnapshot(s.state), nil
+	}
+	if firstErr != nil {
+		return StateSnapshot{}, firstErr
+	}
+	return StateSnapshot{}, errors.New("update node countries failed")
+}
+
+func collectUnavailableNodeIDsForCountryUpdate(nodes []Node) []string {
+	unavailableNodeIDs := make([]string, 0)
+	for _, node := range nodes {
+		if isRulePoolNodeAvailableByProbe(node) {
+			continue
+		}
+		unavailableNodeIDs = append(unavailableNodeIDs, node.ID)
+	}
+	return unavailableNodeIDs
+}
+
+func applyNodeCountryUpdateLocked(groups []NodeGroup, nodeID string, country string) bool {
+	normalizedCountry := normalizeCountry(country)
+	if normalizedCountry == "" {
+		return false
+	}
+	for groupIndex := range groups {
+		for nodeIndex := range groups[groupIndex].Nodes {
+			if groups[groupIndex].Nodes[nodeIndex].ID != nodeID {
+				continue
+			}
+			node := &groups[groupIndex].Nodes[nodeIndex]
+			changed := false
+			if node.Country != normalizedCountry {
+				node.Country = normalizedCountry
+				changed = true
+			}
+			if strings.TrimSpace(node.Region) == "" {
+				node.Region = normalizedCountry
+				changed = true
+			}
+			return changed
+		}
+	}
+	return false
+}
+
+func detectNodeCountriesWithActiveRuntime(
+	ctx context.Context,
+	runtime *proxyRuntime,
+	nodes []Node,
+	queryURL string,
+	proxyPort int,
+	timeoutMS int,
+	restoreNodeID string,
+) []nodeCountryUpdateResult {
+	if runtime == nil {
+		results := make([]nodeCountryUpdateResult, 0, len(nodes))
+		for _, node := range nodes {
+			results = append(results, nodeCountryUpdateResult{
+				nodeID: node.ID,
+				err:    errors.New("runtime is not available"),
+			})
+		}
+		return results
+	}
+	restoreNodeID = strings.TrimSpace(restoreNodeID)
+	if restoreNodeID != "" {
+		defer func() {
+			_ = runtime.SwitchSelectedNode(restoreNodeID)
+		}()
+	}
+	results := make([]nodeCountryUpdateResult, 0, len(nodes))
+	for _, node := range nodes {
+		if ctx != nil && ctx.Err() != nil {
+			results = append(results, nodeCountryUpdateResult{
+				nodeID: node.ID,
+				err:    ctx.Err(),
+			})
+			continue
+		}
+		if err := runtime.SwitchSelectedNode(node.ID); err != nil {
+			results = append(results, nodeCountryUpdateResult{
+				nodeID: node.ID,
+				err:    fmt.Errorf("switch selected node failed: %w", err),
+			})
+			continue
+		}
+		country, trace, err := fetchCountryCodeThroughProxy(queryURL, proxyPort, timeoutMS)
+		results = append(results, nodeCountryUpdateResult{
+			nodeID:  node.ID,
+			country: country,
+			err:     err,
+			trace:   trace,
+		})
+	}
+	return results
+}
+
+func fetchCountryCodeThroughProxy(queryURL string, proxyPort int, timeoutMS int) (string, *nodeCountryFetchTrace, error) {
+	requestURL := strings.TrimSpace(queryURL)
+	if requestURL == "" {
+		requestURL = defaultProbeNodeInfoQueryURL
+	}
+	if timeoutMS <= 0 {
+		timeoutMS = updateNodeCountryTimeoutMS
+	}
+	trace := &nodeCountryFetchTrace{
+		requestURL: requestURL,
+		proxyPort:  proxyPort,
+	}
+	proxyURL, err := neturl.Parse(
+		"http://" + net.JoinHostPort(defaultLocalMixedListenAddress, strconv.Itoa(proxyPort)),
+	)
+	if err != nil {
+		return "", trace, fmt.Errorf("build proxy url failed: %w", err)
+	}
+	client := &http.Client{
+		Timeout: time.Duration(timeoutMS) * time.Millisecond,
+		Transport: &http.Transport{
+			Proxy:             http.ProxyURL(proxyURL),
+			DisableKeepAlives: true,
+		},
+	}
+	request, err := http.NewRequest(http.MethodGet, requestURL, nil)
+	if err != nil {
+		return "", trace, fmt.Errorf("create node info request failed: %w", err)
+	}
+	request.Header.Set("Accept", "application/json")
+	response, err := client.Do(request)
+	if err != nil {
+		return "", trace, fmt.Errorf("query node info failed: %w", err)
+	}
+	defer response.Body.Close()
+	trace.statusCode = response.StatusCode
+	body, err := io.ReadAll(io.LimitReader(response.Body, 64*1024))
+	if err != nil {
+		return "", trace, fmt.Errorf("read node info response failed: %w", err)
+	}
+	trace.responseSnippet = summarizeNodeInfoResponseBody(body)
+	if response.StatusCode != http.StatusOK {
+		return "", trace, fmt.Errorf("query node info failed: status=%d body=%s", response.StatusCode, trace.responseSnippet)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return "", trace, fmt.Errorf("decode node info response failed: %w", err)
+	}
+	country, matchedField, matchedRawValue := extractCountryCodeFromNodeInfoPayload(payload)
+	trace.extractedCountry = country
+	trace.matchedField = matchedField
+	trace.matchedRawValue = matchedRawValue
+	if country == "" {
+		return "", trace, errors.New("country field is empty")
+	}
+	return country, trace, nil
+}
+
+func extractCountryCodeFromNodeInfoPayload(payload map[string]any) (string, string, string) {
+	return extractCountryCodeFromNodeInfoValue(payload, 0)
+}
+
+func extractCountryCodeFromNodeInfoValue(value any, depth int) (string, string, string) {
+	if depth > 5 || value == nil {
+		return "", "", ""
+	}
+	payload, ok := value.(map[string]any)
+	if !ok || len(payload) == 0 {
+		if values, ok := value.([]any); ok {
+			for _, item := range values {
+				if country, field, raw := extractCountryCodeFromNodeInfoValue(item, depth+1); country != "" {
+					return country, field, raw
+				}
+			}
+		}
+		return "", "", ""
+	}
+	keys := []string{"country_code", "countryCode", "country", "country_name", "region"}
+	for _, key := range keys {
+		if raw, exists := payload[key]; exists {
+			rawValue := nodeInfoValueToString(raw)
+			if country := normalizeCountry(rawValue); country != "" {
+				return country, key, rawValue
+			}
+		}
+	}
+	for _, nested := range payload {
+		if country, field, raw := extractCountryCodeFromNodeInfoValue(nested, depth+1); country != "" {
+			return country, field, raw
+		}
+	}
+	return "", "", ""
+}
+
+func nodeInfoValueToString(value any) string {
+	switch typed := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return strings.TrimSpace(typed)
+	default:
+		return strings.TrimSpace(fmt.Sprint(typed))
+	}
+}
+
+func summarizeNodeInfoResponseBody(body []byte) string {
+	text := strings.TrimSpace(string(body))
+	if text == "" {
+		return ""
+	}
+	text = strings.Join(strings.Fields(text), " ")
+	if len(text) > 320 {
+		return text[:320] + "..."
+	}
+	return text
+}
+
+func (s *RuntimeStore) ensureTaskProxyPortLocked(mainPort int) error {
+	if s == nil {
+		return errors.New("runtime store is not initialized")
+	}
+	if s.taskProxyPort > 0 && s.taskProxyPort != mainPort {
+		return nil
+	}
+	portValue, err := pickAvailableTCPPort()
+	if err != nil {
+		return err
+	}
+	for portValue == mainPort {
+		portValue, err = pickAvailableTCPPort()
+		if err != nil {
+			return err
+		}
+	}
+	s.taskProxyPort = portValue
+	return nil
+}
+
+func pickAvailableTCPPort() (int, error) {
+	listener, err := net.Listen("tcp", net.JoinHostPort(defaultLocalMixedListenAddress, "0"))
+	if err != nil {
+		return 0, err
+	}
+	defer listener.Close()
+	address, ok := listener.Addr().(*net.TCPAddr)
+	if !ok || address.Port <= 0 {
+		return 0, errors.New("invalid tcp addr")
+	}
+	return address.Port, nil
+}
+
+func resetNodeTrafficStats(node *Node) bool {
+	if node == nil {
+		return false
+	}
+	changed := false
+	if node.TotalDownloadMB != 0 {
+		node.TotalDownloadMB = 0
+		changed = true
+	}
+	if node.TotalUploadMB != 0 {
+		node.TotalUploadMB = 0
+		changed = true
+	}
+	if node.TodayDownloadMB != 0 {
+		node.TodayDownloadMB = 0
+		changed = true
+	}
+	if node.TodayUploadMB != 0 {
+		node.TodayUploadMB = 0
+		changed = true
+	}
+	return changed
+}
+
+func clearNodeProbeDataByTypes(node *Node, probeTypes []ProbeType) bool {
+	if node == nil {
+		return false
+	}
+	changed := false
+	for _, probeType := range probeTypes {
+		switch probeType {
+		case ProbeTypeNodeLatency:
+			if node.LatencyMS != 0 {
+				node.LatencyMS = 0
+				changed = true
+			}
+			if node.LatencyProbedAtMS != 0 {
+				node.LatencyProbedAtMS = 0
+				changed = true
+			}
+		case ProbeTypeRealConnect:
+			if node.ProbeRealConnectMS != 0 {
+				node.ProbeRealConnectMS = 0
+				changed = true
+			}
+			if node.RealConnectProbedAtMS != 0 {
+				node.RealConnectProbedAtMS = 0
+				changed = true
+			}
+		}
+	}
+	nextScore := computeNodeProbeScore(*node)
+	if node.ProbeScore != nextScore {
+		node.ProbeScore = nextScore
+		changed = true
+	}
+	return changed
 }
 
 func (s *RuntimeStore) AddManualNode(_ context.Context, req AddManualNodeRequest) (StateSnapshot, error) {
 	groupID := strings.TrimSpace(req.GroupID)
 	if groupID == "" {
 		return StateSnapshot{}, errors.New("groupId is required")
-	}
-	if strings.TrimSpace(req.Name) == "" || strings.TrimSpace(req.Address) == "" || req.Port <= 0 {
-		return StateSnapshot{}, errors.New("name/address/port is required")
 	}
 
 	s.mu.Lock()
@@ -685,51 +2716,194 @@ func (s *RuntimeStore) AddManualNode(_ context.Context, req AddManualNodeRequest
 	if s.state.Groups[groupIndex].Kind != "manual" {
 		return StateSnapshot{}, errors.New("manual node only allowed in manual group")
 	}
-	protocol := req.Protocol
-	if strings.TrimSpace(string(protocol)) == "" {
-		protocol = NodeProtocol("vless")
+	node, err := buildManualNode(
+		req.Name,
+		req.Region,
+		req.Country,
+		req.Address,
+		req.Port,
+		req.Transport,
+		req.Protocol,
+		req.RawConfig,
+		fmt.Sprintf("%s-node-%d", groupID, time.Now().UnixMilli()),
+	)
+	if err != nil {
+		return StateSnapshot{}, err
 	}
-	transport := strings.TrimSpace(req.Transport)
-	if transport == "" {
-		transport = "tcp"
-	}
-	region := strings.TrimSpace(req.Region)
-	if region == "" {
-		region = guessRegion(req.Name, req.Address)
-	}
-	country := normalizeCountry(req.Country)
-	if country == "" {
-		country = normalizeCountry(req.Region)
-	}
-	if country == "" {
-		country = normalizeCountry(region)
-	}
-	if region == "" {
-		region = country
-	}
-
 	now := time.Now().UnixMilli()
-	node := Node{
-		ID:              fmt.Sprintf("%s-node-%d", groupID, now),
-		Name:            strings.TrimSpace(req.Name),
-		Region:          region,
-		Country:         country,
-		Protocol:        protocol,
-		LatencyMS:       0,
-		Address:         strings.TrimSpace(req.Address),
-		Port:            req.Port,
-		Transport:       transport,
-		TotalDownloadMB: 0,
-		TotalUploadMB:   0,
-		TodayDownloadMB: 0,
-		TodayUploadMB:   0,
-		RawConfig:       req.RawConfig,
-	}
+	node.ID = fmt.Sprintf("%s-node-%d", groupID, now)
 	s.state.Groups[groupIndex].Nodes = append(s.state.Groups[groupIndex].Nodes, node)
-	s.state.ActiveGroupID = groupID
 	s.ensureValidLocked()
 	_ = s.saveLocked()
 	return cloneSnapshot(s.state), nil
+}
+
+func (s *RuntimeStore) UpdateManualNode(_ context.Context, req UpdateManualNodeRequest) (StateSnapshot, error) {
+	groupID := strings.TrimSpace(req.GroupID)
+	nodeID := strings.TrimSpace(req.NodeID)
+	if groupID == "" || nodeID == "" {
+		return StateSnapshot{}, errors.New("groupId/nodeId is required")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	groupIndex := s.indexGroupByIDLocked(groupID)
+	if groupIndex < 0 {
+		return StateSnapshot{}, errors.New("group not found")
+	}
+	if s.state.Groups[groupIndex].Kind != "manual" {
+		return StateSnapshot{}, errors.New("manual node only allowed in manual group")
+	}
+
+	nodeIndex := -1
+	for index, node := range s.state.Groups[groupIndex].Nodes {
+		if strings.TrimSpace(node.ID) == nodeID {
+			nodeIndex = index
+			break
+		}
+	}
+	if nodeIndex < 0 {
+		return StateSnapshot{}, errors.New("node not found")
+	}
+
+	updatedNode, err := buildManualNode(
+		req.Name,
+		req.Region,
+		req.Country,
+		req.Address,
+		req.Port,
+		req.Transport,
+		req.Protocol,
+		req.RawConfig,
+		nodeID,
+	)
+	if err != nil {
+		return StateSnapshot{}, err
+	}
+	existingNode := s.state.Groups[groupIndex].Nodes[nodeIndex]
+	updatedNode.TotalDownloadMB = existingNode.TotalDownloadMB
+	updatedNode.TotalUploadMB = existingNode.TotalUploadMB
+	updatedNode.TodayDownloadMB = existingNode.TodayDownloadMB
+	updatedNode.TodayUploadMB = existingNode.TodayUploadMB
+	updatedNode.Favorite = existingNode.Favorite
+	s.state.Groups[groupIndex].Nodes[nodeIndex] = updatedNode
+	s.ensureValidLocked()
+	_ = s.saveLocked()
+	return cloneSnapshot(s.state), nil
+}
+
+func (s *RuntimeStore) ImportManualNodesText(ctx context.Context, req ImportManualNodesTextRequest) (StateSnapshot, error) {
+	groupID := strings.TrimSpace(req.GroupID)
+	content := strings.TrimSpace(req.Content)
+	if groupID == "" {
+		return StateSnapshot{}, errors.New("groupId is required")
+	}
+	if content == "" {
+		return StateSnapshot{}, errors.New("content is required")
+	}
+
+	parseResult, err := s.parser.ParseText(ctx, content, groupID)
+	if err != nil {
+		return StateSnapshot{}, err
+	}
+	if len(parseResult.Nodes) == 0 {
+		return StateSnapshot{}, errors.New("no supported nodes parsed")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	groupIndex := s.indexGroupByIDLocked(groupID)
+	if groupIndex < 0 {
+		return StateSnapshot{}, errors.New("group not found")
+	}
+	if s.state.Groups[groupIndex].Kind != "manual" {
+		return StateSnapshot{}, errors.New("manual node import only allowed in manual group")
+	}
+
+	baseTS := time.Now().UnixMilli()
+	importedNodes := make([]Node, 0, len(parseResult.Nodes))
+	for index, parsedNode := range parseResult.Nodes {
+		node, buildErr := buildManualNode(
+			parsedNode.Name,
+			parsedNode.Region,
+			parsedNode.Country,
+			parsedNode.Address,
+			parsedNode.Port,
+			parsedNode.Transport,
+			parsedNode.Protocol,
+			parsedNode.RawConfig,
+			fmt.Sprintf("%s-node-%d-%d", groupID, baseTS, index),
+		)
+		if buildErr != nil {
+			return StateSnapshot{}, buildErr
+		}
+		importedNodes = append(importedNodes, node)
+	}
+
+	s.state.Groups[groupIndex].Nodes = append(s.state.Groups[groupIndex].Nodes, importedNodes...)
+	s.ensureValidLocked()
+	_ = s.saveLocked()
+	return cloneSnapshot(s.state), nil
+}
+
+func buildManualNode(
+	name string,
+	region string,
+	country string,
+	address string,
+	port int,
+	transport string,
+	protocol NodeProtocol,
+	rawConfig string,
+	nodeID string,
+) (Node, error) {
+	if strings.TrimSpace(name) == "" || strings.TrimSpace(address) == "" || port <= 0 {
+		return Node{}, errors.New("name/address/port is required")
+	}
+	resolvedProtocol := protocol
+	if strings.TrimSpace(string(resolvedProtocol)) == "" {
+		resolvedProtocol = NodeProtocol("vless")
+	}
+	resolvedTransport := strings.TrimSpace(transport)
+	if resolvedTransport == "" {
+		resolvedTransport = "tcp"
+	}
+	resolvedRegion := strings.TrimSpace(region)
+	if resolvedRegion == "" {
+		resolvedRegion = guessRegion(name, address)
+	}
+	resolvedCountry := normalizeCountry(country)
+	if resolvedCountry == "" {
+		resolvedCountry = normalizeCountry(region)
+	}
+	if resolvedCountry == "" {
+		resolvedCountry = normalizeCountry(resolvedRegion)
+	}
+	if resolvedRegion == "" {
+		resolvedRegion = resolvedCountry
+	}
+	return Node{
+		ID:                    strings.TrimSpace(nodeID),
+		Name:                  strings.TrimSpace(name),
+		Region:                resolvedRegion,
+		Country:               resolvedCountry,
+		Protocol:              resolvedProtocol,
+		LatencyMS:             0,
+		ProbeRealConnectMS:    0,
+		ProbeScore:            0,
+		LatencyProbedAtMS:     0,
+		RealConnectProbedAtMS: 0,
+		Address:               strings.TrimSpace(address),
+		Port:                  port,
+		Transport:             resolvedTransport,
+		TotalDownloadMB:       0,
+		TotalUploadMB:         0,
+		TodayDownloadMB:       0,
+		TodayUploadMB:         0,
+		RawConfig:             rawConfig,
+	}, nil
 }
 
 func (s *RuntimeStore) TransferNodes(_ context.Context, req TransferNodesRequest) (StateSnapshot, error) {
@@ -956,65 +3130,32 @@ func (s *RuntimeStore) SetRuleConfigV2(_ context.Context, req SetRuleConfigV2Req
 	s.state.RuleProfiles[activeProfileIndex].LastUpdatedMS = time.Now().UnixMilli()
 	s.state.RuleConfigV2 = cloneRuleConfigV2(config)
 	s.ensureValidLocked()
+	wasRuntimeActive := s.state.ConnectionStage == ConnectionConnected && s.state.ProxyMode != ProxyModeOff
 	s.appendCoreLogLocked(
 		LogLevelInfo,
 		fmt.Sprintf(
-			"set rule config v2: profile=%s base_rules=%d composed_groups=%d active_group=%s composed_rules=%d resolved_rules=%d policies=%d providers=%d apply_mode=state_only",
+			"set rule config v2: profile=%s groups=%d active_group=%s resolved_rules=%d policies=%d providers=%d on_miss=%s",
 			s.state.ActiveRuleProfileID,
-			len(s.state.RuleConfigV2.BaseRules),
-			len(s.state.RuleConfigV2.ComposedRuleGroups),
-			s.state.RuleConfigV2.ActiveComposedRuleGroupID,
-			len(s.state.RuleConfigV2.ComposedRules),
+			len(s.state.RuleConfigV2.Groups),
+			s.state.RuleConfigV2.ActiveGroupID,
 			len(s.state.RuleConfigV2.Rules),
 			len(s.state.RuleConfigV2.PolicyGroups),
 			len(s.state.RuleConfigV2.Providers.RuleSets),
+			s.state.RuleConfigV2.OnMissMode,
 		),
 	)
-	_ = s.saveLocked()
-	return cloneSnapshot(s.state), nil
-}
-
-func (s *RuntimeStore) HotReloadRules(_ context.Context) (StateSnapshot, error) {
-	s.mu.Lock()
-	s.ensureValidLocked()
-	if s.state.ProxyMode == ProxyModeOff || s.state.ConnectionStage != ConnectionConnected {
-		snapshot := cloneSnapshot(s.state)
-		s.mu.Unlock()
-		return snapshot, errors.New("代理未启动")
-	}
-	current := cloneSnapshot(s.state)
-	nextSig := buildRuleReloadSignature(current.RuleConfigV2)
-	if nextSig != "" && nextSig == s.lastRuleReloadSig {
-		snapshot := cloneSnapshot(s.state)
-		s.mu.Unlock()
-		return snapshot, errors.New("无需更新：活动规则数据与激活分组未变化")
-	}
-	s.mu.Unlock()
-
-	runtimeErr := s.runtime.Start(current)
-	if proxyErr := syncSystemProxy(current); runtimeErr == nil {
-		runtimeErr = proxyErr
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if runtimeErr != nil {
-		s.state.ConnectionStage = ConnectionError
-		s.appendCoreLogLocked(LogLevelError, fmt.Sprintf("hot reload rules failed: %v", runtimeErr))
-		_ = s.saveLocked()
-		return cloneSnapshot(s.state), runtimeErr
-	}
-	s.state.ConnectionStage = ConnectionConnected
-	s.lastRuleReloadSig = nextSig
-	s.appendCoreLogLocked(
-		LogLevelInfo,
-		fmt.Sprintf(
-			"hot reload rules success: active_group=%s resolved_rules=%d",
-			s.state.RuleConfigV2.ActiveComposedRuleGroupID,
-			len(s.state.RuleConfigV2.Rules),
-		),
+	status := newRuntimeApplyStatus(
+		RuntimeApplyOperationSetRuleConfig,
+		RuntimeApplyStrategyNoop,
+		"rule_config",
+		true,
+		false,
+		nil,
+		wasRuntimeActive,
 	)
+	s.setLastRuntimeApplyLocked(status)
 	_ = s.saveLocked()
+	s.publishRuntimeApplyPushLocked(status)
 	return cloneSnapshot(s.state), nil
 }
 
@@ -1072,10 +3213,7 @@ func (s *RuntimeStore) UpsertRuleProfile(_ context.Context, req UpsertRuleProfil
 
 	var runtimeErr error
 	if wasConnected && shouldApplyRuntime {
-		runtimeErr = s.runtime.Start(current)
-		if proxyErr := syncSystemProxy(current); runtimeErr == nil {
-			runtimeErr = proxyErr
-		}
+		runtimeErr = s.applyRuntimeWithRollback(current, previous)
 	}
 
 	s.mu.Lock()
@@ -1126,10 +3264,7 @@ func (s *RuntimeStore) SelectRuleProfile(_ context.Context, req SelectRuleProfil
 
 	var runtimeErr error
 	if wasConnected && current.ProxyMode != ProxyModeOff {
-		runtimeErr = s.runtime.Start(current)
-		if proxyErr := syncSystemProxy(current); runtimeErr == nil {
-			runtimeErr = proxyErr
-		}
+		runtimeErr = s.applyRuntimeWithRollback(current, previous)
 	}
 
 	s.mu.Lock()
@@ -1187,10 +3322,7 @@ func (s *RuntimeStore) RemoveRuleProfile(_ context.Context, profileID string) (S
 
 	var runtimeErr error
 	if wasConnected && removedActive && current.ProxyMode != ProxyModeOff {
-		runtimeErr = s.runtime.Start(current)
-		if proxyErr := syncSystemProxy(current); runtimeErr == nil {
-			runtimeErr = proxyErr
-		}
+		runtimeErr = s.applyRuntimeWithRollback(current, previous)
 	}
 
 	s.mu.Lock()
@@ -1212,8 +3344,19 @@ func (s *RuntimeStore) RemoveRuleProfile(_ context.Context, profileID string) (S
 func (s *RuntimeStore) SetSettings(_ context.Context, req SetSettingsRequest) (StateSnapshot, error) {
 	s.mu.Lock()
 	previous := cloneSnapshot(s.state)
+	applyRuntime := req.ApplyRuntime == nil || *req.ApplyRuntime
 	if req.AutoConnect != nil {
 		s.state.AutoConnect = *req.AutoConnect
+	}
+	if req.TrafficMonitorIntervalSec != nil {
+		nextTrafficMonitorIntervalSec := normalizeTrafficMonitorIntervalSec(*req.TrafficMonitorIntervalSec)
+		if nextTrafficMonitorIntervalSec != s.state.TrafficMonitorIntervalSec {
+			s.state.TrafficMonitorIntervalSec = nextTrafficMonitorIntervalSec
+			s.resetTrafficSamplingBaselineLocked()
+		}
+	}
+	if req.ProbeSettings != nil {
+		s.state.ProbeSettings = normalizeProbeSettings(*req.ProbeSettings)
 	}
 	if req.LocalProxyPort != nil {
 		if *req.LocalProxyPort <= 0 || *req.LocalProxyPort > 65535 {
@@ -1221,6 +3364,21 @@ func (s *RuntimeStore) SetSettings(_ context.Context, req SetSettingsRequest) (S
 			return StateSnapshot{}, errors.New("localProxyPort must be between 1 and 65535")
 		}
 		s.state.LocalProxyPort = *req.LocalProxyPort
+	}
+	if req.TunMTU != nil {
+		if *req.TunMTU < minTunMTU || *req.TunMTU > maxTunMTU {
+			s.mu.Unlock()
+			return StateSnapshot{}, fmt.Errorf("tunMtu must be between %d and %d", minTunMTU, maxTunMTU)
+		}
+		s.state.TunMTU = *req.TunMTU
+	}
+	if req.TunStack != nil {
+		stack := normalizeProxyTunStack(*req.TunStack)
+		if !isValidProxyTunStack(stack) {
+			s.mu.Unlock()
+			return StateSnapshot{}, errors.New("invalid tun stack")
+		}
+		s.state.TunStack = stack
 	}
 	if req.AllowExternal != nil {
 		s.state.AllowExternal = *req.AllowExternal
@@ -1238,82 +3396,54 @@ func (s *RuntimeStore) SetSettings(_ context.Context, req SetSettingsRequest) (S
 		}
 		s.state.SniffTimeoutMS = *req.SniffTimeoutMS
 	}
-	if req.DNSRemoteServer != nil {
-		value := strings.TrimSpace(*req.DNSRemoteServer)
-		if value == "" {
+	if req.BlockQUIC != nil {
+		s.state.BlockQUIC = *req.BlockQUIC
+	}
+	if req.BlockUDP != nil {
+		s.state.BlockUDP = *req.BlockUDP
+	}
+	if req.Mux != nil {
+		s.state.Mux = normalizeProxyMuxConfig(*req.Mux)
+	}
+	if req.DNS != nil {
+		normalizedDNS, dnsErr := normalizeDNSConfig(*req.DNS)
+		if dnsErr != nil {
 			s.mu.Unlock()
-			return StateSnapshot{}, errors.New("dnsRemoteServer is required")
+			return StateSnapshot{}, dnsErr
 		}
-		s.state.DNSRemoteServer = value
-	}
-	if req.DNSDirectServer != nil {
-		value := strings.TrimSpace(*req.DNSDirectServer)
-		if value == "" {
-			s.mu.Unlock()
-			return StateSnapshot{}, errors.New("dnsDirectServer is required")
-		}
-		s.state.DNSDirectServer = value
-	}
-	if req.DNSBootstrapServer != nil {
-		value := strings.TrimSpace(*req.DNSBootstrapServer)
-		if value == "" {
-			s.mu.Unlock()
-			return StateSnapshot{}, errors.New("dnsBootstrapServer is required")
-		}
-		s.state.DNSBootstrapServer = value
-	}
-	if req.DNSStrategy != nil {
-		strategy := normalizeDNSStrategy(*req.DNSStrategy)
-		if !isValidDNSStrategy(strategy) {
-			s.mu.Unlock()
-			return StateSnapshot{}, errors.New("invalid dns strategy")
-		}
-		s.state.DNSStrategy = strategy
-	}
-	if req.DNSIndependentCache != nil {
-		s.state.DNSIndependentCache = *req.DNSIndependentCache
-	}
-	if req.DNSCacheFileEnabled != nil {
-		s.state.DNSCacheFileEnabled = *req.DNSCacheFileEnabled
-	}
-	if req.DNSCacheStoreRDRC != nil {
-		s.state.DNSCacheStoreRDRC = *req.DNSCacheStoreRDRC
-	}
-	if req.DNSFakeIPEnabled != nil {
-		s.state.DNSFakeIPEnabled = *req.DNSFakeIPEnabled
-	}
-	if req.DNSFakeIPV4Range != nil {
-		value := strings.TrimSpace(*req.DNSFakeIPV4Range)
-		if value == "" {
-			s.mu.Unlock()
-			return StateSnapshot{}, errors.New("dnsFakeIPV4Range is required")
-		}
-		s.state.DNSFakeIPV4Range = value
-	}
-	if req.DNSFakeIPV6Range != nil {
-		value := strings.TrimSpace(*req.DNSFakeIPV6Range)
-		if value == "" {
-			s.mu.Unlock()
-			return StateSnapshot{}, errors.New("dnsFakeIPV6Range is required")
-		}
-		s.state.DNSFakeIPV6Range = value
+		s.state.DNS = normalizedDNS
 	}
 
+	requestedMode := ProxyModeOff
+	hasRequestedMode := false
 	if req.ProxyMode != nil {
 		mode := normalizeProxyMode(*req.ProxyMode)
 		if !isValidProxyMode(mode) {
 			s.mu.Unlock()
 			return StateSnapshot{}, errors.New("invalid proxy mode")
 		}
-		applyProxyModeToState(&s.state, mode)
-	} else {
+		requestedMode = mode
+		hasRequestedMode = true
+	} else if req.TunEnabled != nil || req.SystemProxyEnabled != nil {
+		tunEnabled := s.state.TunEnabled
+		systemProxyEnabled := s.state.SystemProxyEnabled
 		if req.TunEnabled != nil {
-			s.state.TunEnabled = *req.TunEnabled
+			tunEnabled = *req.TunEnabled
 		}
 		if req.SystemProxyEnabled != nil {
-			s.state.SystemProxyEnabled = *req.SystemProxyEnabled
+			systemProxyEnabled = *req.SystemProxyEnabled
 		}
-		applyProxyModeToState(&s.state, inferProxyMode(s.state.TunEnabled, s.state.SystemProxyEnabled))
+		requestedMode = inferProxyMode(tunEnabled, systemProxyEnabled)
+		hasRequestedMode = true
+	}
+	if hasRequestedMode {
+		s.state.ConfiguredProxyMode = normalizeConfiguredProxyMode(requestedMode)
+		if applyRuntime {
+			applyProxyModeToState(&s.state, requestedMode)
+		}
+	}
+	if req.ClearDNSCacheOnRestart != nil {
+		s.state.ClearDNSCacheOnRestart = *req.ClearDNSCacheOnRestart
 	}
 	if req.ProxyLogLevel != nil {
 		level := normalizeLogLevel(*req.ProxyLogLevel)
@@ -1340,74 +3470,180 @@ func (s *RuntimeStore) SetSettings(_ context.Context, req SetSettingsRequest) (S
 		s.state.UILogLevel = level
 	}
 	if req.RecordLogsToFile != nil {
-		s.state.RecordLogsToFile = *req.RecordLogsToFile
+		s.state.ProxyRecordToFile = *req.RecordLogsToFile
+		s.state.CoreRecordToFile = *req.RecordLogsToFile
+		s.state.UIRecordToFile = *req.RecordLogsToFile
 	}
-	s.state.ProxyLogs = trimRuntimeLogsByPolicy(s.state.ProxyLogs, s.state.RecordLogsToFile)
-	s.state.CoreLogs = trimRuntimeLogsByPolicy(s.state.CoreLogs, s.state.RecordLogsToFile)
-	s.state.UILogs = trimRuntimeLogsByPolicy(s.state.UILogs, s.state.RecordLogsToFile)
+	if req.ProxyRecordToFile != nil {
+		s.state.ProxyRecordToFile = *req.ProxyRecordToFile
+	}
+	if req.CoreRecordToFile != nil {
+		s.state.CoreRecordToFile = *req.CoreRecordToFile
+	}
+	if req.UIRecordToFile != nil {
+		s.state.UIRecordToFile = *req.UIRecordToFile
+	}
+	syncRecordLogsToFileCompatibility(&s.state)
+	s.state.ProxyLogs = trimRuntimeLogsByPolicy(s.state.ProxyLogs, s.state.ProxyRecordToFile)
+	s.state.CoreLogs = trimRuntimeLogsByPolicy(s.state.CoreLogs, s.state.CoreRecordToFile)
+	s.state.UILogs = trimRuntimeLogsByPolicy(s.state.UILogs, s.state.UIRecordToFile)
 
 	s.ensureValidLocked()
-	s.appendCoreLogLocked(
-		LogLevelInfo,
-		fmt.Sprintf(
-			"apply settings: proxyMode=%s listen=%d external=%t sniff(enabled=%t override=%t timeout=%dms) levels(proxy=%s core=%s ui=%s) recordLogsToFile=%t",
-			s.state.ProxyMode,
-			s.state.LocalProxyPort,
-			s.state.AllowExternal,
-			s.state.SniffEnabled,
-			s.state.SniffOverrideDest,
-			s.state.SniffTimeoutMS,
-			s.state.ProxyLogLevel,
-			s.state.CoreLogLevel,
-			s.state.UILogLevel,
-			s.state.RecordLogsToFile,
-		),
-	)
+	if shouldRecordLog(LogLevelInfo, normalizeLogLevel(s.state.CoreLogLevel)) {
+		s.appendCoreLogLocked(
+			LogLevelInfo,
+			fmt.Sprintf(
+				"apply settings: runtimeProxyMode=%s configuredProxyMode=%s applyRuntime=%t listen=%d external=%t tun(mtu=%d stack=%s) sniff(enabled=%t override=%t timeout=%dms) guards(quic=%t udp=%t) clearDNSCacheOnRestart=%t mux(enabled=%t protocol=%s max_conn=%d min_streams=%d max_streams=%d padding=%t brutal=%t up=%d down=%d) levels(proxy=%s core=%s ui=%s) recordLogsToFile(global=%t proxy=%t core=%t ui=%t)",
+				s.state.ProxyMode,
+				s.state.ConfiguredProxyMode,
+				applyRuntime,
+				s.state.LocalProxyPort,
+				s.state.AllowExternal,
+				s.state.TunMTU,
+				s.state.TunStack,
+				s.state.SniffEnabled,
+				s.state.SniffOverrideDest,
+				s.state.SniffTimeoutMS,
+				s.state.BlockQUIC,
+				s.state.BlockUDP,
+				s.state.ClearDNSCacheOnRestart,
+				s.state.Mux.Enabled,
+				s.state.Mux.Protocol,
+				s.state.Mux.MaxConnections,
+				s.state.Mux.MinStreams,
+				s.state.Mux.MaxStreams,
+				s.state.Mux.Padding,
+				s.state.Mux.Brutal.Enabled,
+				s.state.Mux.Brutal.UpMbps,
+				s.state.Mux.Brutal.DownMbps,
+				s.state.ProxyLogLevel,
+				s.state.CoreLogLevel,
+				s.state.UILogLevel,
+				s.state.RecordLogsToFile,
+				s.state.ProxyRecordToFile,
+				s.state.CoreRecordToFile,
+				s.state.UIRecordToFile,
+			),
+		)
+	}
+	if err := s.ensureTaskProxyPortLocked(s.state.LocalProxyPort); err == nil {
+		s.runtime.ConfigureInternalProxyPort(s.taskProxyPort)
+	}
 	current := cloneSnapshot(s.state)
 	wasConnected := previous.ConnectionStage == ConnectionConnected
+	changeSet := buildSettingsRuntimeChangeSet(previous, current)
+	changeSummary := changeSet.summary()
+	wasRuntimeActive := wasConnected && previous.ProxyMode != ProxyModeOff
+	if !applyRuntime || !wasRuntimeActive || !changeSet.hasRuntimeChange() {
+		reason := changeSummary
+		if !applyRuntime {
+			reason = "apply_runtime_disabled"
+		} else if !wasRuntimeActive {
+			reason = "proxy_not_running_saved_only"
+		}
+		status := newRuntimeApplyStatus(
+			RuntimeApplyOperationSetSettings,
+			RuntimeApplyStrategyNoop,
+			reason,
+			true,
+			false,
+			nil,
+		)
+		s.setLastRuntimeApplyLocked(status)
+		_ = s.saveLocked()
+		s.publishRuntimeApplyPushLocked(status)
+		snapshot := cloneSnapshot(s.state)
+		s.mu.Unlock()
+		return snapshot, nil
+	}
 	_ = s.saveLocked()
 	s.mu.Unlock()
 
-	var runtimeErr error
-	if !wasConnected {
-		if current.ProxyMode != ProxyModeSystem {
-			runtimeErr = clearSystemHTTPProxy()
-		}
-		if runtimeErr == nil {
-			return current, nil
-		}
-	} else {
-		needStop := current.ProxyMode == ProxyModeOff
-		needReload := shouldReloadRuntimeForSettings(previous, current)
-
-		switch {
-		case needStop:
-			runtimeErr = s.runtime.Stop()
-		case needReload:
-			runtimeErr = s.runtime.Start(current)
-		}
-		if proxyErr := syncSystemProxy(current); runtimeErr == nil {
-			runtimeErr = proxyErr
-		}
-	}
+	applyResult, runtimeErr := s.runtimeCoordinatorOrDefault().ApplySettings(previous, current, wasConnected)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if runtimeErr != nil {
+		strategy := toSnapshotRuntimeApplyStrategy(applyResult.Strategy)
+		var applyErr *runtimeApplyError
+		if errors.As(runtimeErr, &applyErr) && applyErr.rollbackApplied {
+			s.state = cloneSnapshot(previous)
+			s.state.ConnectionStage = ConnectionConnected
+			status := newRuntimeApplyStatus(
+				RuntimeApplyOperationSetSettings,
+				strategy,
+				changeSummary,
+				false,
+				true,
+				runtimeErr,
+			)
+			s.setLastRuntimeApplyLocked(status)
+			s.appendCoreLogLocked(
+				LogLevelWarn,
+				fmt.Sprintf("settings apply failed and rolled back: %v", runtimeErr),
+			)
+			_ = s.saveLocked()
+			s.publishRuntimeApplyPushLocked(status)
+			return cloneSnapshot(s.state), runtimeErr
+		}
 		s.state.ConnectionStage = ConnectionError
+		status := newRuntimeApplyStatus(
+			RuntimeApplyOperationSetSettings,
+			strategy,
+			changeSummary,
+			false,
+			false,
+			runtimeErr,
+		)
+		s.setLastRuntimeApplyLocked(status)
 		_ = s.saveLocked()
+		s.publishRuntimeApplyPushLocked(status)
 		return cloneSnapshot(s.state), runtimeErr
 	}
-
-	if !wasConnected {
-		return cloneSnapshot(s.state), nil
+	s.state.ConnectionStage = ConnectionConnected
+	updateProxyStartedAtAfterSettingsApply(&s.state, previous, applyResult.Strategy)
+	status := newRuntimeApplyStatus(
+		RuntimeApplyOperationSetSettings,
+		toSnapshotRuntimeApplyStrategy(applyResult.Strategy),
+		applyResult.ChangeSet.summary(),
+		true,
+		false,
+		nil,
+	)
+	s.setLastRuntimeApplyLocked(status)
+	if applyResult.ProxyLogHotUpdated {
+		s.appendCoreLogLocked(
+			LogLevelInfo,
+			fmt.Sprintf("proxy log level updated by hot patch: level=%s", current.ProxyLogLevel),
+		)
 	}
-	if current.ProxyMode == ProxyModeOff {
-		s.state.ConnectionStage = ConnectionIdle
-	} else {
-		s.state.ConnectionStage = ConnectionConnected
+	if applyResult.ProxyLogFallbackFast {
+		s.appendCoreLogLocked(
+			LogLevelWarn,
+			fmt.Sprintf(
+				"proxy log level hot patch failed, fallback fast restart success: level=%s",
+				current.ProxyLogLevel,
+			),
+		)
+	}
+	if shouldRecordLog(LogLevelInfo, normalizeLogLevel(s.state.CoreLogLevel)) {
+		s.appendCoreLogLocked(
+			LogLevelInfo,
+			fmt.Sprintf(
+				"settings runtime apply: strategy=%s changes=%s",
+				applyResult.Strategy,
+				applyResult.ChangeSet.summary(),
+			),
+		)
+	}
+	if strings.TrimSpace(applyResult.PlanReason) != "" {
+		s.appendCoreLogLocked(
+			LogLevelInfo,
+			fmt.Sprintf("settings apply planner reason: %s", applyResult.PlanReason),
+		)
 	}
 	_ = s.saveLocked()
+	s.publishRuntimeApplyPushLocked(status)
 	return cloneSnapshot(s.state), nil
 }
 
@@ -1429,8 +3665,11 @@ func (s *RuntimeStore) ClearDNSCache(_ context.Context) (StateSnapshot, error) {
 
 	cachePath := resolveDNSCacheFilePath()
 	removedCacheFile := false
+	cacheFileBusy := false
 	if err := os.Remove(cachePath); err != nil {
-		if !os.IsNotExist(err) {
+		if isFileInUseError(err) {
+			cacheFileBusy = true
+		} else if !os.IsNotExist(err) {
 			issues = append(issues, fmt.Sprintf("remove cache file failed: %v", err))
 		} else {
 			removedCacheFile = true
@@ -1444,13 +3683,20 @@ func (s *RuntimeStore) ClearDNSCache(_ context.Context) (StateSnapshot, error) {
 	s.appendCoreLogLocked(
 		LogLevelInfo,
 		fmt.Sprintf(
-			"clear dns cache requested: connected=%t fakeip_flushed=%t cache_file_cleared=%t path=%s",
+			"clear dns cache requested: connected=%t fakeip_flushed=%t cache_file_cleared=%t cache_file_busy=%t path=%s",
 			isConnected,
 			flushedFakeIP,
 			removedCacheFile,
+			cacheFileBusy,
 			cachePath,
 		),
 	)
+	if cacheFileBusy {
+		s.appendCoreLogLocked(
+			LogLevelWarn,
+			"dns cache file is in use by runtime; skip deleting cache file now and it will be replaced after next runtime restart",
+		)
+	}
 	_ = s.saveLocked()
 	if len(issues) > 0 {
 		return cloneSnapshot(s.state), errors.New(strings.Join(issues, "; "))
@@ -1458,84 +3704,1339 @@ func (s *RuntimeStore) ClearDNSCache(_ context.Context) (StateSnapshot, error) {
 	return cloneSnapshot(s.state), nil
 }
 
-func (s *RuntimeStore) Start(_ context.Context) (StateSnapshot, error) {
+func (s *RuntimeStore) CheckDNSHealth(
+	ctx context.Context,
+	req DNSHealthCheckRequest,
+) (StateSnapshot, DNSHealthReport, error) {
+	domain := strings.TrimSpace(req.Domain)
+	if domain == "" {
+		domain = "www.gstatic.com"
+	}
+	timeoutMS := req.TimeoutMS
+	if timeoutMS < 500 || timeoutMS > 20000 {
+		timeoutMS = 5000
+	}
+	timeout := time.Duration(timeoutMS) * time.Millisecond
+
+	s.mu.RLock()
+	snapshot := cloneSnapshot(s.state)
+	s.mu.RUnlock()
+
+	dnsConfig, dnsErr := normalizeDNSConfig(snapshot.DNS)
+	if dnsErr != nil {
+		dnsConfig = defaultDNSConfig()
+	}
+	checkTargets := []struct {
+		targetName string
+		serverTag  string
+		endpoint   DNSResolverEndpoint
+	}{
+		{
+			targetName: "remote",
+			serverTag:  "remote",
+			endpoint:   dnsConfig.Remote,
+		},
+		{
+			targetName: "direct",
+			serverTag:  "direct",
+			endpoint:   dnsConfig.Direct,
+		},
+		{
+			targetName: "bootstrap",
+			serverTag:  bootstrapDNSServerTag,
+			endpoint:   dnsConfig.Bootstrap,
+		},
+	}
+	results := make([]DNSHealthCheckResult, 0, len(checkTargets))
+	passed := true
+	for _, target := range checkTargets {
+		startedAt := time.Now()
+		ips, checkErr := s.runtime.CheckDNSResolver(ctx, target.endpoint, domain, timeout)
+		latencyMS := time.Since(startedAt).Milliseconds()
+		result := DNSHealthCheckResult{
+			Target:    target.targetName,
+			ServerTag: target.serverTag,
+			Reachable: checkErr == nil,
+			LatencyMS: latencyMS,
+			ResolvedIP: func() []string {
+				if checkErr != nil {
+					return nil
+				}
+				return ips
+			}(),
+		}
+		if checkErr != nil {
+			result.Error = checkErr.Error()
+			passed = false
+		}
+		results = append(results, result)
+	}
+
+	report := DNSHealthReport{
+		Domain:      domain,
+		TimeoutMS:   timeoutMS,
+		CheckedAtMS: time.Now().UnixMilli(),
+		Passed:      passed,
+		Results:     results,
+	}
+
+	s.mu.Lock()
+	if passed {
+		s.appendCoreLogLocked(
+			LogLevelInfo,
+			fmt.Sprintf("dns health check passed: domain=%s timeoutMs=%d", domain, timeoutMS),
+		)
+	} else {
+		failDetails := make([]string, 0, len(results))
+		for _, item := range results {
+			if item.Reachable {
+				continue
+			}
+			failDetails = append(failDetails, fmt.Sprintf("%s=%s", item.ServerTag, item.Error))
+		}
+		s.appendCoreLogLocked(
+			LogLevelWarn,
+			fmt.Sprintf(
+				"dns health check failed: domain=%s timeoutMs=%d details=%s",
+				domain,
+				timeoutMS,
+				strings.Join(failDetails, " | "),
+			),
+		)
+	}
+	_ = s.saveLocked()
+	out := cloneSnapshot(s.state)
+	s.mu.Unlock()
+
+	if !passed {
+		return out, report, errors.New("dns health check failed")
+	}
+	return out, report, nil
+}
+
+func (s *RuntimeStore) ExemptWindowsLoopback(ctx context.Context) (StateSnapshot, LoopbackExemptResult, error) {
 	s.mu.Lock()
 	s.ensureValidLocked()
-	if s.state.ConnectionStage == ConnectionConnected {
+	snapshot := cloneSnapshot(s.state)
+	systemType := strings.ToLower(strings.TrimSpace(s.state.SystemType))
+	runtimeAdmin := s.state.RuntimeAdmin
+	s.mu.Unlock()
+
+	if systemType != "windows" {
+		return snapshot, LoopbackExemptResult{}, errors.New("loopback exemption is only supported on windows")
+	}
+	if !runtimeAdmin {
+		return snapshot, LoopbackExemptResult{}, errors.New("loopback exemption requires administrator privileges")
+	}
+
+	result, exemptErr := exemptWindowsLoopbackRestrictions(ctx)
+
+	s.mu.Lock()
+	if exemptErr != nil {
+		s.appendCoreLogLocked(
+			LogLevelError,
+			fmt.Sprintf(
+				"windows loopback exemption failed: total=%d success=%d failed=%d err=%v",
+				result.Total,
+				result.Succeeded,
+				result.Failed,
+				exemptErr,
+			),
+		)
+	} else {
+		s.appendCoreLogLocked(
+			LogLevelInfo,
+			fmt.Sprintf(
+				"windows loopback exemption finished: total=%d success=%d failed=%d",
+				result.Total,
+				result.Succeeded,
+				result.Failed,
+			),
+		)
+	}
+	_ = s.saveLocked()
+	out := cloneSnapshot(s.state)
+	s.mu.Unlock()
+
+	return out, result, exemptErr
+}
+
+type builtInRuleSetUpdateTarget struct {
+	Tag   string
+	Kind  string
+	Value string
+	URL   string
+	Path  string
+}
+
+func collectBuiltInRuleSetUpdateTargetsByValues(
+	geoIPValues []string,
+	geoSiteValues []string,
+) []builtInRuleSetUpdateTarget {
+	targetsByTag := map[string]builtInRuleSetUpdateTarget{}
+	appendTarget := func(kind string, rawValue string) {
+		value := normalizeGeoRuleSetValue(rawValue)
+		if value == "" {
+			return
+		}
+		if kind == "geoip" && value == "private" {
+			return
+		}
+		pathValue, ok := resolveBuiltInRuleSetPath(kind, value)
+		if !ok {
+			return
+		}
+		tag := fmt.Sprintf("wateray-%s-%s", kind, value)
+		if _, exists := targetsByTag[tag]; exists {
+			return
+		}
+		urlValue := ""
+		switch kind {
+		case "geoip":
+			urlValue = fmt.Sprintf(geoIPRuleSetURLTemplate, value)
+		case "geosite":
+			urlValue = fmt.Sprintf(geoSiteRuleSetURLTemplate, value)
+		default:
+			return
+		}
+		targetsByTag[tag] = builtInRuleSetUpdateTarget{
+			Tag:   tag,
+			Kind:  kind,
+			Value: value,
+			URL:   urlValue,
+			Path:  pathValue,
+		}
+	}
+
+	for _, rawValue := range geoIPValues {
+		appendTarget("geoip", rawValue)
+	}
+	for _, rawValue := range geoSiteValues {
+		appendTarget("geosite", rawValue)
+	}
+
+	tags := make([]string, 0, len(targetsByTag))
+	for tag := range targetsByTag {
+		tags = append(tags, tag)
+	}
+	sort.Strings(tags)
+	result := make([]builtInRuleSetUpdateTarget, 0, len(tags))
+	for _, tag := range tags {
+		result = append(result, targetsByTag[tag])
+	}
+	return result
+}
+
+func collectBuiltInRuleSetUpdateTargets(config RuleConfigV2) []builtInRuleSetUpdateTarget {
+	geoIPValues := make([]string, 0)
+	geoSiteValues := make([]string, 0)
+	for _, rule := range config.Rules {
+		if !rule.Enabled {
+			continue
+		}
+		geoIPValues = append(geoIPValues, rule.Match.GeoIP...)
+		geoSiteValues = append(geoSiteValues, rule.Match.GeoSite...)
+	}
+	return collectBuiltInRuleSetUpdateTargetsByValues(geoIPValues, geoSiteValues)
+}
+
+func collectBuiltInRuleSetUpdateTargetsByRequest(
+	config RuleConfigV2,
+	req UpdateBuiltInRuleSetsRequest,
+) []builtInRuleSetUpdateTarget {
+	if len(req.GeoIP) == 0 && len(req.GeoSite) == 0 {
+		return collectBuiltInRuleSetUpdateTargets(config)
+	}
+	return collectBuiltInRuleSetUpdateTargetsByValues(req.GeoIP, req.GeoSite)
+}
+
+func buildBuiltInRuleSetLocalStatuses(targets []builtInRuleSetUpdateTarget) []RuleSetLocalStatus {
+	statuses := make([]RuleSetLocalStatus, 0, len(targets))
+	for _, target := range targets {
+		status := RuleSetLocalStatus{
+			Kind:  target.Kind,
+			Value: target.Value,
+			Tag:   target.Tag,
+		}
+		if _, fileInfo, ok := statBuiltInRuleSetPath(target.Kind, target.Value); ok {
+			status.Exists = true
+			status.UpdatedAtMS = fileInfo.ModTime().UnixMilli()
+		}
+		statuses = append(statuses, status)
+	}
+	return statuses
+}
+
+func collectBuiltInRuleSetStatusesByRequest(
+	config RuleConfigV2,
+	req QueryBuiltInRuleSetsStatusRequest,
+) []RuleSetLocalStatus {
+	targets := collectBuiltInRuleSetUpdateTargetsByValues(req.GeoIP, req.GeoSite)
+	if len(req.GeoIP) == 0 && len(req.GeoSite) == 0 {
+		targets = collectBuiltInRuleSetUpdateTargets(config)
+	}
+	return buildBuiltInRuleSetLocalStatuses(targets)
+}
+
+func (s *RuntimeStore) QueryBuiltInRuleSetsStatus(
+	_ context.Context,
+	req QueryBuiltInRuleSetsStatusRequest,
+) (StateSnapshot, []RuleSetLocalStatus, error) {
+	s.mu.RLock()
+	snapshot := cloneSnapshot(s.state)
+	s.mu.RUnlock()
+	statuses := collectBuiltInRuleSetStatusesByRequest(snapshot.RuleConfigV2, req)
+	return snapshot, statuses, nil
+}
+
+func downloadRuleSetFile(ctx context.Context, urlValue string, filePath string, proxyURL string) error {
+	if strings.TrimSpace(urlValue) == "" {
+		return errors.New("rule-set url is empty")
+	}
+	if strings.TrimSpace(filePath) == "" {
+		return errors.New("rule-set path is empty")
+	}
+	requestCtx := ctx
+	if requestCtx == nil {
+		requestCtx = context.Background()
+	}
+	requestCtx, cancel := context.WithTimeout(requestCtx, 45*time.Second)
+	defer cancel()
+
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if strings.TrimSpace(proxyURL) != "" {
+		parsedProxyURL, err := neturl.Parse(proxyURL)
+		if err != nil {
+			return fmt.Errorf("invalid proxy url %q: %w", proxyURL, err)
+		}
+		transport.Proxy = http.ProxyURL(parsedProxyURL)
+	} else {
+		transport.Proxy = nil
+	}
+	client := &http.Client{
+		Transport: transport,
+	}
+	request, err := http.NewRequestWithContext(requestCtx, http.MethodGet, urlValue, nil)
+	if err != nil {
+		return fmt.Errorf("create request failed: %w", err)
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return fmt.Errorf("request failed: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(response.Body, 2048))
+		return fmt.Errorf("status=%d body=%s", response.StatusCode, strings.TrimSpace(string(body)))
+	}
+	if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
+		return fmt.Errorf("create rule-set dir failed: %w", err)
+	}
+	tmpPath := filePath + ".tmp"
+	file, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("create temp file failed: %w", err)
+	}
+	written, copyErr := io.Copy(file, io.LimitReader(response.Body, 64*1024*1024))
+	closeErr := file.Close()
+	if copyErr != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("write file failed: %w", copyErr)
+	}
+	if closeErr != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("close file failed: %w", closeErr)
+	}
+	if written <= 0 {
+		_ = os.Remove(tmpPath)
+		return errors.New("downloaded file is empty")
+	}
+	if err := os.Rename(tmpPath, filePath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("save file failed: %w", err)
+	}
+	return nil
+}
+
+func normalizeRuleSetDownloadMode(raw RuleSetDownloadMode) RuleSetDownloadMode {
+	switch strings.ToLower(strings.TrimSpace(string(raw))) {
+	case string(RuleSetDownloadModeDirect):
+		return RuleSetDownloadModeDirect
+	case string(RuleSetDownloadModeProxy):
+		return RuleSetDownloadModeProxy
+	default:
+		return RuleSetDownloadModeAuto
+	}
+}
+
+func downloadBuiltInRuleSetWithFallback(ctx context.Context, target builtInRuleSetUpdateTarget, proxyURL string) error {
+	if strings.TrimSpace(proxyURL) != "" {
+		proxyErr := downloadRuleSetFile(ctx, target.URL, target.Path, proxyURL)
+		if proxyErr == nil {
+			return nil
+		}
+		directErr := downloadRuleSetFile(ctx, target.URL, target.Path, "")
+		if directErr == nil {
+			return nil
+		}
+		return fmt.Errorf(
+			"%s 更新失败（代理: %v；直连: %v）",
+			target.Tag,
+			proxyErr,
+			directErr,
+		)
+	}
+	if err := downloadRuleSetFile(ctx, target.URL, target.Path, ""); err != nil {
+		return fmt.Errorf("%s 更新失败（直连: %v）", target.Tag, err)
+	}
+	return nil
+}
+
+func downloadBuiltInRuleSetByMode(
+	ctx context.Context,
+	target builtInRuleSetUpdateTarget,
+	mode RuleSetDownloadMode,
+	proxyURL string,
+	proxyViaTun bool,
+) error {
+	switch normalizeRuleSetDownloadMode(mode) {
+	case RuleSetDownloadModeDirect:
+		if err := downloadRuleSetFile(ctx, target.URL, target.Path, ""); err != nil {
+			return fmt.Errorf("%s 更新失败（直连: %v）", target.Tag, err)
+		}
+		return nil
+	case RuleSetDownloadModeProxy:
+		if strings.TrimSpace(proxyURL) != "" {
+			if err := downloadRuleSetFile(ctx, target.URL, target.Path, proxyURL); err != nil {
+				return fmt.Errorf("%s 更新失败（代理: %v）", target.Tag, err)
+			}
+			return nil
+		}
+		if proxyViaTun {
+			if err := downloadRuleSetFile(ctx, target.URL, target.Path, ""); err != nil {
+				return fmt.Errorf("%s 更新失败（代理[TUN]: %v）", target.Tag, err)
+			}
+			return nil
+		}
+		return fmt.Errorf("%s 更新失败（代理不可用：当前未连接）", target.Tag)
+	default:
+		return downloadBuiltInRuleSetWithFallback(ctx, target, proxyURL)
+	}
+}
+
+func (s *RuntimeStore) updateBuiltInRuleSetsNow(
+	ctx context.Context,
+	req UpdateBuiltInRuleSetsRequest,
+) (StateSnapshot, RuleSetUpdateSummary, error) {
+	var snapshot StateSnapshot
+	summary := RuleSetUpdateSummary{}
+	err := s.withForegroundTask(
+		runtimeTaskOptions{
+			TaskType:     BackgroundTaskTypeBuiltinRuleSet,
+			ScopeKey:     "builtin_ruleset_update:active",
+			Title:        "更新内置规则集",
+			ProgressText: "检查待更新规则集",
+			SuccessText:  "内置规则集更新完成",
+		},
+		func(handle runtimeTaskHandle) error {
+			s.mu.Lock()
+			s.ensureValidLocked()
+			snapshot = cloneSnapshot(s.state)
+			s.mu.Unlock()
+
+			mode := normalizeRuleSetDownloadMode(req.DownloadMode)
+			targets := collectBuiltInRuleSetUpdateTargetsByRequest(snapshot.RuleConfigV2, req)
+			if len(targets) == 0 {
+				summary = RuleSetUpdateSummary{
+					Requested: 0,
+					Success:   0,
+					Failed:    0,
+				}
+				message := "当前活动规则未引用可更新的 GeoIP/GeoSite 规则集"
+				if len(req.GeoIP) > 0 || len(req.GeoSite) > 0 {
+					message = "所选规则集中无可更新的 GeoIP/GeoSite 条目"
+				}
+				s.mu.Lock()
+				defer s.mu.Unlock()
+				s.appendCoreLogLocked(
+					LogLevelWarn,
+					fmt.Sprintf("update built-in rule-sets skipped: mode=%s reason=%s", mode, message),
+				)
+				_ = s.saveLocked()
+				snapshot = cloneSnapshot(s.state)
+				return errors.New(message)
+			}
+
+			proxyURL := ""
+			proxyViaTun := false
+			if snapshot.ConnectionStage == ConnectionConnected {
+				switch snapshot.ProxyMode {
+				case ProxyModeSystem:
+					proxyURL = fmt.Sprintf(
+						"http://%s:%d",
+						defaultLocalMixedListenAddress,
+						runtimeListenPort(snapshot),
+					)
+				case ProxyModeTun:
+					proxyViaTun = true
+				}
+			}
+
+			updatedTags := make([]string, 0, len(targets))
+			downloadFailed := make([]string, 0)
+			for index, target := range targets {
+				handle.UpdateProgress(
+					fmt.Sprintf("下载规则集 %d/%d：%s", index+1, len(targets), strings.TrimSpace(target.Tag)),
+				)
+				if err := downloadBuiltInRuleSetByMode(ctx, target, mode, proxyURL, proxyViaTun); err != nil {
+					downloadFailed = append(downloadFailed, err.Error())
+					continue
+				}
+				updatedTags = append(updatedTags, target.Tag)
+			}
+
+			failedItems := make([]string, 0, len(downloadFailed))
+			failedItems = append(failedItems, downloadFailed...)
+			summary = RuleSetUpdateSummary{
+				Requested:   len(targets),
+				Success:     len(updatedTags),
+				Failed:      len(downloadFailed),
+				UpdatedTags: append([]string{}, updatedTags...),
+				FailedItems: append([]string{}, failedItems...),
+			}
+
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			s.appendCoreLogLocked(
+				LogLevelInfo,
+				fmt.Sprintf(
+					"update built-in rule-sets finished: mode=%s requested=%d success=%d failed=%d dir=%s",
+					mode,
+					summary.Requested,
+					summary.Success,
+					summary.Failed,
+					resolveRuleSetStorageDir(),
+				),
+			)
+			if len(failedItems) > 0 {
+				s.appendCoreLogLocked(LogLevelWarn, "update built-in rule-sets details: "+strings.Join(failedItems, " | "))
+			}
+			_ = s.saveLocked()
+			snapshot = cloneSnapshot(s.state)
+			if len(downloadFailed) > 0 {
+				return errors.New(strings.Join(downloadFailed, "; "))
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		return snapshot, summary, err
+	}
+	return snapshot, summary, nil
+}
+
+func (s *RuntimeStore) CheckStartPreconditions(
+	_ context.Context,
+) (StateSnapshot, StartPrecheckResult, error) {
+	s.mu.Lock()
+	s.ensureValidLocked()
+	snapshot := cloneSnapshot(s.state)
+	s.mu.Unlock()
+	targetMode := snapshot.ProxyMode
+	if targetMode == ProxyModeOff {
+		targetMode = normalizeConfiguredProxyMode(snapshot.ConfiguredProxyMode)
+	}
+	result := buildStartPrecheckResult(snapshot, targetMode, s.runtime)
+	return snapshot, result, nil
+}
+
+func buildStartPrecheckResult(
+	snapshot StateSnapshot,
+	targetMode ProxyMode,
+	runtime *proxyRuntime,
+) StartPrecheckResult {
+	result := StartPrecheckResult{
+		CanStart: true,
+	}
+	appendWarning := func(code StartPrecheckIssueCode, message string) {
+		result.Warnings = append(result.Warnings, StartPrecheckIssue{
+			Code:    code,
+			Message: message,
+		})
+	}
+	appendBlocker := func(code StartPrecheckIssueCode, message string) {
+		result.Blockers = append(result.Blockers, StartPrecheckIssue{
+			Code:    code,
+			Message: message,
+		})
+		result.CanStart = false
+	}
+
+	activeRuleGroup, hasActiveRuleGroup := resolveActiveRuleGroupForPrecheck(snapshot.RuleConfigV2)
+	if !hasActiveRuleGroup {
+		appendBlocker(StartPrecheckIssueRuleGroupNotActive, "当前未激活规则分组")
+	} else if isDefaultRuleGroup(activeRuleGroup) {
+		appendWarning(StartPrecheckIssueRuleGroupDefaultDemo, "当前活动规则为默认示例分组,请检查是否正确")
+	}
+
+	activeNode, hasActiveNode := resolveActiveNodeForPrecheck(snapshot)
+	if !hasActiveNode {
+		appendBlocker(StartPrecheckIssueNodeNotConfigured, "当前未配置节点")
+	}
+
+	if !snapshot.RuntimeAdmin {
+		appendBlocker(StartPrecheckIssueAdminRequired, "请以管理员方式启动")
+	}
+
+	if targetMode != ProxyModeOff {
+		if endpoint, available := canListenOnEndpoint(runtimeListenAddress(snapshot), runtimeListenPort(snapshot)); !available {
+			appendBlocker(StartPrecheckIssueListenPortUnavailable, fmt.Sprintf("本地监听端口不可用: %s", endpoint))
+		}
+	}
+
+	if hasActiveRuleGroup {
+		missingRuleSets := collectMissingBuiltInRuleSets(activeRuleGroup)
+		if len(missingRuleSets) > 0 {
+			appendBlocker(
+				StartPrecheckIssueRuleSetMissing,
+				fmt.Sprintf("规则集文件缺失: %s", formatRuleSetList(missingRuleSets)),
+			)
+		}
+	}
+
+	// 延迟检查仅提示，不阻断启动。
+	if hasActiveNode && activeNode.LatencyMS < 0 {
+		appendWarning(StartPrecheckIssueActiveNodeUnreachable, "当前活动节点不可用")
+	}
+
+	return result
+}
+
+func resolveActiveRuleGroupForPrecheck(config RuleConfigV2) (RuleGroup, bool) {
+	activeGroupID := strings.TrimSpace(config.ActiveGroupID)
+	if activeGroupID == "" || len(config.Groups) == 0 {
+		return RuleGroup{}, false
+	}
+	for _, group := range config.Groups {
+		if group.ID == activeGroupID {
+			return group, true
+		}
+	}
+	return RuleGroup{}, false
+}
+
+func isDefaultRuleGroup(group RuleGroup) bool {
+	groupID := strings.ToLower(strings.TrimSpace(group.ID))
+	if groupID == "default" {
+		return true
+	}
+	groupName := strings.ToLower(strings.TrimSpace(group.Name))
+	return groupName == "默认分组" || groupName == "default" || groupName == "default group"
+}
+
+func resolveActiveNodeForPrecheck(snapshot StateSnapshot) (Node, bool) {
+	activeGroupID := strings.TrimSpace(snapshot.ActiveGroupID)
+	selectedNodeID := strings.TrimSpace(snapshot.SelectedNodeID)
+	if activeGroupID == "" || selectedNodeID == "" {
+		return Node{}, false
+	}
+	for _, group := range snapshot.Groups {
+		if group.ID != activeGroupID {
+			continue
+		}
+		for _, node := range group.Nodes {
+			if node.ID == selectedNodeID {
+				return node, true
+			}
+		}
+		return Node{}, false
+	}
+	return Node{}, false
+}
+
+func canListenOnEndpoint(address string, port int) (string, bool) {
+	endpoint := fmt.Sprintf("%s:%d", strings.TrimSpace(address), port)
+	listener, err := net.Listen("tcp", endpoint)
+	if err != nil {
+		return endpoint, false
+	}
+	_ = listener.Close()
+	return endpoint, true
+}
+
+func collectMissingBuiltInRuleSets(activeGroup RuleGroup) []string {
+	if len(activeGroup.Rules) == 0 {
+		return nil
+	}
+	missing := make([]string, 0)
+	seen := map[string]struct{}{}
+	appendMissing := func(kind string, rawValue string) {
+		value := normalizeGeoRuleSetValue(rawValue)
+		if value == "" {
+			return
+		}
+		if kind == "geoip" && value == "private" {
+			return
+		}
+		key := fmt.Sprintf("%s-%s", kind, value)
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		if _, _, ok := statBuiltInRuleSetPath(kind, value); ok {
+			return
+		}
+		missing = append(missing, key)
+	}
+	for _, rule := range activeGroup.Rules {
+		if !rule.Enabled {
+			continue
+		}
+		for _, value := range rule.Match.GeoIP {
+			appendMissing("geoip", value)
+		}
+		for _, value := range rule.Match.GeoSite {
+			appendMissing("geosite", value)
+		}
+	}
+	sort.Strings(missing)
+	return missing
+}
+
+func formatRuleSetList(items []string) string {
+	if len(items) <= 3 {
+		return strings.Join(items, ", ")
+	}
+	return fmt.Sprintf("%s 等%d项", strings.Join(items[:3], ", "), len(items)-3)
+}
+
+func collectReferencedRulePoolCandidateNodeIDs(snapshot StateSnapshot) []string {
+	if !hasReferencedNodePoolRule(snapshot) {
+		return nil
+	}
+	activeNodes := resolveActiveGroupNodes(snapshot)
+	if len(activeNodes) == 0 {
+		return nil
+	}
+	referencedPolicies := collectReferencedPolicyIDs(snapshot.RuleConfigV2)
+	candidateSet := map[string]struct{}{}
+	candidateIDs := make([]string, 0, len(activeNodes))
+	for _, group := range snapshot.RuleConfigV2.PolicyGroups {
+		if _, ok := referencedPolicies[group.ID]; !ok {
+			continue
+		}
+		if group.Type != RulePolicyGroupTypeNodePool || group.NodePool == nil {
+			continue
+		}
+		for _, nodeID := range resolveNodePoolRefsToNodeIDs(group.NodePool.Nodes, activeNodes) {
+			if _, exists := candidateSet[nodeID]; exists {
+				continue
+			}
+			candidateSet[nodeID] = struct{}{}
+			candidateIDs = append(candidateIDs, nodeID)
+		}
+	}
+	return candidateIDs
+}
+
+func findGroupByID(groups []NodeGroup, groupID string) *NodeGroup {
+	targetID := strings.TrimSpace(groupID)
+	if targetID == "" {
+		return nil
+	}
+	for index := range groups {
+		if strings.TrimSpace(groups[index].ID) == targetID {
+			return &groups[index]
+		}
+	}
+	return nil
+}
+
+func (s *RuntimeStore) enqueueReferencedNodePoolRefresh(reason string) {
+	s.mu.RLock()
+	snapshot := cloneSnapshot(s.state)
+	s.mu.RUnlock()
+	if !hasReferencedNodePoolRule(snapshot) {
+		return
+	}
+	activeGroupID := strings.TrimSpace(snapshot.ActiveGroupID)
+	if activeGroupID == "" {
+		return
+	}
+	groupName := activeGroupID
+	if group := findGroupByID(snapshot.Groups, activeGroupID); group != nil {
+		groupName = strings.TrimSpace(group.Name)
+		if groupName == "" {
+			groupName = activeGroupID
+		}
+	}
+	scopeKey := "node_pool_refresh:active_group"
+	title := "刷新节点池优选结果"
+	if groupName != "" {
+		title = fmt.Sprintf("刷新节点池优选结果：%s", groupName)
+	}
+	s.taskQueue.EnqueueLatest(
+		runtimeTaskOptions{
+			TaskType:     BackgroundTaskTypeNodePoolRefresh,
+			ScopeKey:     scopeKey,
+			Title:        title,
+			ProgressText: fmt.Sprintf("等待刷新活动分组节点池（%s）", strings.TrimSpace(reason)),
+			SuccessText:  "节点池优选结果已更新",
+		},
+		func(handle runtimeTaskHandle) error {
+			return s.runReferencedNodePoolRefreshTask(context.Background(), handle, reason, activeGroupID, snapshot.StateRevision)
+		},
+	)
+}
+
+func (s *RuntimeStore) runReferencedNodePoolRefreshTask(
+	ctx context.Context,
+	handle runtimeTaskHandle,
+	reason string,
+	expectedActiveGroupID string,
+	expectedRevision int64,
+) error {
+	handle.UpdateProgress("检查节点池候选节点")
+	s.mu.RLock()
+	snapshot := cloneSnapshot(s.state)
+	s.mu.RUnlock()
+	if strings.TrimSpace(snapshot.ActiveGroupID) != strings.TrimSpace(expectedActiveGroupID) {
+		handle.UpdateProgress("活动分组已变化，跳过过期任务")
+		return nil
+	}
+	if !hasReferencedNodePoolRule(snapshot) {
+		handle.UpdateProgress("当前规则未引用节点池")
+		return nil
+	}
+
+	candidateNodeIDs := collectReferencedRulePoolCandidateNodeIDs(snapshot)
+	probeSettings := normalizeProbeSettings(snapshot.ProbeSettings)
+	intervalMS := int64(probeSettings.ProbeIntervalMin) * 60 * 1000
+	nowMS := time.Now().UnixMilli()
+	nodeByID := make(map[string]Node, len(resolveActiveGroupNodes(snapshot)))
+	for _, node := range resolveActiveGroupNodes(snapshot) {
+		nodeByID[node.ID] = node
+	}
+	needsProbe := false
+	for _, nodeID := range candidateNodeIDs {
+		node, ok := nodeByID[nodeID]
+		if !ok || !canReuseRulePoolProbeScore(node, nowMS, intervalMS) {
+			needsProbe = true
+			break
+		}
+	}
+	if needsProbe && len(candidateNodeIDs) > 0 {
+		handle.UpdateProgress("评分当前规则引用节点池候选节点")
+		timeoutMS := probeSettings.TimeoutSec * 1000
+		if timeoutMS <= 0 {
+			timeoutMS = 5000
+		}
+		if _, _, err := s.probeNodesNow(ctx, ProbeNodesRequest{
+			GroupID:    expectedActiveGroupID,
+			NodeIDs:    candidateNodeIDs,
+			ProbeTypes: []ProbeType{ProbeTypeRealConnect},
+			TimeoutMS:  timeoutMS,
+		}, handle); err != nil {
+			return fmt.Errorf("probe referenced node pools failed: %w", err)
+		}
+	} else {
+		handle.UpdateProgress("复用未过期评分缓存")
+	}
+
+	handle.UpdateProgress("重算节点池优选结果")
+	s.mu.Lock()
+	if strings.TrimSpace(s.state.ActiveGroupID) != strings.TrimSpace(expectedActiveGroupID) {
+		s.mu.Unlock()
+		handle.UpdateProgress("活动分组已变化，跳过热更")
+		return nil
+	}
+	previous := cloneSnapshot(s.state)
+	updatedCount := refreshReferencedRulePoolAvailableNodeIDs(&s.state)
+	current := cloneSnapshot(s.state)
+	runtimeConnected := s.state.ConnectionStage == ConnectionConnected && s.state.ProxyMode != ProxyModeOff
+	if updatedCount > 0 {
+		s.appendCoreLogLocked(
+			LogLevelInfo,
+			fmt.Sprintf(
+				"refresh referenced node pools queued success: reason=%s active_group=%s state_revision=%d updated=%d",
+				strings.TrimSpace(reason),
+				expectedActiveGroupID,
+				expectedRevision,
+				updatedCount,
+			),
+		)
+		_ = s.saveLocked()
+	}
+	s.mu.Unlock()
+
+	if updatedCount == 0 {
+		handle.UpdateProgress("节点池优选结果无需更新")
+		return nil
+	}
+	if !runtimeConnected {
+		handle.UpdateProgress("已更新节点池结果，代理当前未运行")
+		return nil
+	}
+
+	handle.UpdateProgress("热更运行中的节点池选择器")
+	hotErr := s.applyRulePoolSelectionsHot(current)
+	if hotErr == nil {
+		s.LogCore(
+			LogLevelInfo,
+			fmt.Sprintf(
+				"apply referenced node pools hot success: reason=%s active_group=%s updated=%d",
+				strings.TrimSpace(reason),
+				expectedActiveGroupID,
+				updatedCount,
+			),
+		)
+		return nil
+	}
+	if reloadErr := s.applyRuntimeWithRollback(current, previous); reloadErr != nil {
+		return fmt.Errorf("hot apply failed: %v; fallback reload failed: %w", hotErr, reloadErr)
+	}
+	s.LogCore(
+		LogLevelWarn,
+		fmt.Sprintf(
+			"apply referenced node pools hot failed, fallback reload success: reason=%s active_group=%s error=%v",
+			strings.TrimSpace(reason),
+			expectedActiveGroupID,
+			hotErr,
+		),
+	)
+	return nil
+}
+
+func (s *RuntimeStore) refreshRulePoolAvailableNodeIDsBeforeStart(ctx context.Context) error {
+	s.mu.RLock()
+	snapshot := cloneSnapshot(s.state)
+	s.mu.RUnlock()
+	if !hasReferencedNodePoolRule(snapshot) {
+		return nil
+	}
+	return s.runReferencedNodePoolRefreshTask(
+		ctx,
+		runtimeTaskHandle{},
+		"before_start",
+		snapshot.ActiveGroupID,
+		snapshot.StateRevision,
+	)
+}
+
+func (s *RuntimeStore) startNow(ctx context.Context) (StateSnapshot, error) {
+	s.mu.Lock()
+	s.ensureValidLocked()
+	previous := cloneSnapshot(s.state)
+	targetMode := s.state.ProxyMode
+	if s.state.ConnectionStage == ConnectionConnected && s.state.ProxyMode != ProxyModeOff {
+		s.state.LastRuntimeApply = newRuntimeApplyStatus(
+			RuntimeApplyOperationStartConnection,
+			RuntimeApplyStrategyNoop,
+			"already_connected",
+			true,
+			false,
+			nil,
+		)
+		_ = s.saveLocked()
 		snapshot := cloneSnapshot(s.state)
 		s.mu.Unlock()
 		s.LogCore(LogLevelInfo, "start connection skipped: already connected")
 		return snapshot, nil
 	}
-	if s.state.ProxyMode == ProxyModeOff {
-		s.state.ConnectionStage = ConnectionIdle
-		_ = s.saveLocked()
-		snapshot := cloneSnapshot(s.state)
-		s.mu.Unlock()
-		s.LogCore(LogLevelWarn, "start connection blocked: proxy mode is off")
-		return snapshot, errors.New("proxy mode is off")
+	targetMode = s.state.ProxyMode
+	if targetMode == ProxyModeOff {
+		targetMode = normalizeConfiguredProxyMode(s.state.ConfiguredProxyMode)
+		applyProxyModeToState(&s.state, targetMode)
 	}
-	if len(s.state.Groups) == 0 {
+	if targetMode != ProxyModeOff && len(s.state.Groups) == 0 {
+		runtimeErr := errors.New("no node group available")
 		s.state.ConnectionStage = ConnectionError
+		s.state.LastRuntimeApply = newRuntimeApplyStatus(
+			RuntimeApplyOperationStartConnection,
+			RuntimeApplyStrategyNoop,
+			"no_node_group",
+			false,
+			false,
+			runtimeErr,
+		)
 		_ = s.saveLocked()
 		snapshot := cloneSnapshot(s.state)
 		s.mu.Unlock()
 		s.LogCore(LogLevelWarn, "start connection blocked: no node group available")
-		return snapshot, errors.New("no node group available")
+		return snapshot, runtimeErr
 	}
 	s.state.ConnectionStage = ConnectionConnecting
-	s.appendCoreLogLocked(LogLevelInfo, "start connection requested")
+	if err := s.ensureTaskProxyPortLocked(s.state.LocalProxyPort); err == nil {
+		s.runtime.ConfigureInternalProxyPort(s.taskProxyPort)
+	}
+	s.appendCoreLogLocked(
+		LogLevelInfo,
+		fmt.Sprintf(
+			"start connection requested: targetProxyMode=%s configuredProxyMode=%s",
+			targetMode,
+			s.state.ConfiguredProxyMode,
+		),
+	)
 	_ = s.saveLocked()
 	snapshot := cloneSnapshot(s.state)
 	s.mu.Unlock()
 
-	err := s.runtime.Start(snapshot)
-	if err == nil {
-		if proxyErr := syncSystemProxy(snapshot); proxyErr != nil {
-			_ = s.runtime.Stop()
-			err = proxyErr
+	appliedSnapshot := snapshot
+	err := s.runtimeCoordinatorOrDefault().ApplyFastRestart(
+		snapshot,
+		previous,
+		"start_connection",
+		snapshot.ProxyMode != ProxyModeOff && snapshot.Mux.Enabled,
+	)
+	muxProtocolFallback := false
+	if err != nil && shouldFallbackMuxProtocolToH2(snapshot, err) {
+		fallbackSnapshot := cloneSnapshot(snapshot)
+		fallbackSnapshot.Mux.Protocol = ProxyMuxProtocolH2Mux
+		fallbackErr := s.runtimeCoordinatorOrDefault().ApplyFastRestart(
+			fallbackSnapshot,
+			previous,
+			"start_connection_mux_fallback",
+			fallbackSnapshot.ProxyMode != ProxyModeOff && fallbackSnapshot.Mux.Enabled,
+		)
+		if fallbackErr == nil {
+			appliedSnapshot = fallbackSnapshot
+			muxProtocolFallback = true
+			err = nil
+		} else {
+			err = fmt.Errorf("%v; mux fallback to h2mux failed: %w", err, fallbackErr)
 		}
 	}
-
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if err != nil {
+		var applyErr *runtimeApplyError
+		if errors.As(err, &applyErr) && applyErr.rollbackApplied {
+			s.state = cloneSnapshot(previous)
+			s.state.ConnectionStage = ConnectionConnected
+			s.state.LastRuntimeApply = newRuntimeApplyStatus(
+				RuntimeApplyOperationStartConnection,
+				RuntimeApplyStrategyFastRestart,
+				"start_connection",
+				false,
+				true,
+				err,
+			)
+			s.appendCoreLogLocked(
+				LogLevelWarn,
+				fmt.Sprintf("start connection failed and rolled back: %v", err),
+			)
+			_ = s.saveLocked()
+			return cloneSnapshot(s.state), err
+		}
 		s.state.ConnectionStage = ConnectionError
+		s.state.LastRuntimeApply = newRuntimeApplyStatus(
+			RuntimeApplyOperationStartConnection,
+			RuntimeApplyStrategyFastRestart,
+			"start_connection",
+			false,
+			false,
+			err,
+		)
 		s.appendCoreLogLocked(LogLevelError, fmt.Sprintf("start connection failed: %v", err))
 		_ = s.saveLocked()
 		return cloneSnapshot(s.state), err
 	}
 	s.state.ConnectionStage = ConnectionConnected
-	s.lastRuleReloadSig = buildRuleReloadSignature(s.state.RuleConfigV2)
-	s.appendCoreLogLocked(LogLevelInfo, "connection started")
+	if s.state.ProxyMode == ProxyModeOff {
+		s.state.ProxyStartedAtMS = 0
+	} else {
+		s.state.ProxyStartedAtMS = time.Now().UnixMilli()
+	}
+	if muxProtocolFallback {
+		s.state.Mux = appliedSnapshot.Mux
+		s.appendCoreLogLocked(
+			LogLevelWarn,
+			"mux post-check failed with current protocol, fallback to h2mux",
+		)
+	}
+	changeSummary := "start_connection"
+	if muxProtocolFallback {
+		changeSummary = "start_connection,mux_fallback_h2mux"
+	}
+	s.state.LastRuntimeApply = newRuntimeApplyStatus(
+		RuntimeApplyOperationStartConnection,
+		RuntimeApplyStrategyFastRestart,
+		changeSummary,
+		true,
+		false,
+		nil,
+	)
+	s.appendCoreLogLocked(
+		LogLevelInfo,
+		fmt.Sprintf("connection started: proxy mode=%s", s.state.ProxyMode),
+	)
+	_ = s.saveLocked()
+	result := cloneSnapshot(s.state)
+	shouldEnqueue := s.state.ProxyMode != ProxyModeOff && hasReferencedNodePoolRule(s.state)
+	s.mu.Unlock()
+	if shouldEnqueue {
+		s.enqueueReferencedNodePoolRefresh("start_connection")
+	}
+	return result, nil
+}
+
+func (s *RuntimeStore) stopNow(_ context.Context) (StateSnapshot, error) {
+	s.mu.Lock()
+	s.ensureValidLocked()
+	previous := cloneSnapshot(s.state)
+	applyProxyModeToState(&s.state, ProxyModeOff)
+	s.state.ConnectionStage = ConnectionDisconnecting
+	if err := s.ensureTaskProxyPortLocked(s.state.LocalProxyPort); err == nil {
+		s.runtime.ConfigureInternalProxyPort(s.taskProxyPort)
+	}
+	s.appendCoreLogLocked(
+		LogLevelInfo,
+		fmt.Sprintf(
+			"disable proxy requested: keep minimal runtime (configuredProxyMode=%s)",
+			s.state.ConfiguredProxyMode,
+		),
+	)
+	_ = s.saveLocked()
+	snapshot := cloneSnapshot(s.state)
+	s.mu.Unlock()
+	type stopResult struct {
+		snapshot StateSnapshot
+		err      error
+	}
+	resultCh := make(chan stopResult, 1)
+	go func(stopSnapshot StateSnapshot, rollbackSnapshot StateSnapshot) {
+		resultSnapshot, resultErr := s.completeStopTransition(stopSnapshot, rollbackSnapshot)
+		resultCh <- stopResult{
+			snapshot: resultSnapshot,
+			err:      resultErr,
+		}
+	}(snapshot, previous)
+
+	const stopForegroundWait = 250 * time.Millisecond
+	timer := time.NewTimer(stopForegroundWait)
+	defer timer.Stop()
+	select {
+	case result := <-resultCh:
+		return result.snapshot, result.err
+	case <-timer.C:
+		s.LogCore(LogLevelWarn, "stop connection is still running in background; return disconnecting snapshot early")
+		return snapshot, nil
+	}
+}
+
+func (s *RuntimeStore) completeStopTransition(
+	snapshot StateSnapshot,
+	previous StateSnapshot,
+) (StateSnapshot, error) {
+	err := s.runtimeCoordinatorOrDefault().ApplyFastRestart(
+		snapshot,
+		previous,
+		"stop_connection",
+		false,
+	)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ensureValidLocked()
+	if s.state.StateRevision != snapshot.StateRevision ||
+		s.state.ConnectionStage != ConnectionDisconnecting ||
+		s.state.ProxyMode != ProxyModeOff {
+		return cloneSnapshot(s.state), nil
+	}
+	if err != nil {
+		var applyErr *runtimeApplyError
+		if errors.As(err, &applyErr) && applyErr.rollbackApplied {
+			s.state = cloneSnapshot(previous)
+			s.state.ConnectionStage = ConnectionConnected
+			s.state.LastRuntimeApply = newRuntimeApplyStatus(
+				RuntimeApplyOperationStopConnection,
+				RuntimeApplyStrategyFastRestart,
+				"stop_connection",
+				false,
+				true,
+				err,
+			)
+			s.appendCoreLogLocked(
+				LogLevelWarn,
+				fmt.Sprintf("disable proxy failed and rolled back: %v", err),
+			)
+			_ = s.saveLocked()
+			return cloneSnapshot(s.state), err
+		}
+		s.state.ConnectionStage = ConnectionError
+		s.state.LastRuntimeApply = newRuntimeApplyStatus(
+			RuntimeApplyOperationStopConnection,
+			RuntimeApplyStrategyFastRestart,
+			"stop_connection",
+			false,
+			false,
+			err,
+		)
+		s.appendCoreLogLocked(LogLevelError, fmt.Sprintf("disable proxy failed: %v", err))
+		_ = s.saveLocked()
+		return cloneSnapshot(s.state), err
+	}
+	s.state.ConnectionStage = ConnectionConnected
+	s.state.ProxyStartedAtMS = 0
+	s.state.LastRuntimeApply = newRuntimeApplyStatus(
+		RuntimeApplyOperationStopConnection,
+		RuntimeApplyStrategyFastRestart,
+		"stop_connection",
+		true,
+		false,
+		nil,
+	)
+	s.appendCoreLogLocked(LogLevelInfo, "proxy disabled; runtime still running in minimal mode")
 	_ = s.saveLocked()
 	return cloneSnapshot(s.state), nil
 }
 
-func (s *RuntimeStore) Stop(_ context.Context) (StateSnapshot, error) {
+func (s *RuntimeStore) restartNow(ctx context.Context) (StateSnapshot, error) {
+	s.mu.RLock()
+	clearDNSCacheOnRestart := s.state.ClearDNSCacheOnRestart
+	s.mu.RUnlock()
+	if clearDNSCacheOnRestart {
+		if _, clearErr := s.ClearDNSCache(ctx); clearErr != nil {
+			wrappedErr := fmt.Errorf("clear dns cache before restart failed: %w", clearErr)
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			s.ensureValidLocked()
+			s.state.LastRuntimeApply = newRuntimeApplyStatus(
+				RuntimeApplyOperationRestartConnection,
+				RuntimeApplyStrategyNoop,
+				"restart_connection,clear_dns_cache_before_restart",
+				false,
+				false,
+				wrappedErr,
+			)
+			s.appendCoreLogLocked(LogLevelError, wrappedErr.Error())
+			_ = s.saveLocked()
+			return cloneSnapshot(s.state), wrappedErr
+		}
+	}
+
 	s.mu.Lock()
-	s.state.ConnectionStage = ConnectionDisconnecting
-	s.appendCoreLogLocked(LogLevelInfo, "stop connection requested")
+	s.ensureValidLocked()
+	previous := cloneSnapshot(s.state)
+	currentMode := s.state.ProxyMode
+	s.state.ConnectionStage = ConnectionConnecting
+	if err := s.ensureTaskProxyPortLocked(s.state.LocalProxyPort); err == nil {
+		s.runtime.ConfigureInternalProxyPort(s.taskProxyPort)
+	}
+	if currentMode == ProxyModeOff {
+		s.appendCoreLogLocked(LogLevelInfo, "restart service requested: minimal runtime mode")
+	} else {
+		s.appendCoreLogLocked(LogLevelInfo, fmt.Sprintf("restart service requested: proxy mode=%s", currentMode))
+	}
 	_ = s.saveLocked()
+	snapshot := cloneSnapshot(s.state)
 	s.mu.Unlock()
 
-	err := s.runtime.Stop()
-	if proxyErr := clearSystemHTTPProxy(); err == nil {
-		err = proxyErr
+	restartSnapshot := snapshot
+	rollbackSnapshot := previous
+	if currentMode == ProxyModeOff {
+		restartSnapshot = buildMinimalProbeRuntimeSnapshot(snapshot)
+		rollbackSnapshot = buildMinimalProbeRuntimeSnapshot(previous)
 	}
-
+	appliedSnapshot := restartSnapshot
+	err := s.runtimeCoordinatorOrDefault().ApplyFastRestart(
+		restartSnapshot,
+		rollbackSnapshot,
+		"restart_connection",
+		restartSnapshot.ProxyMode != ProxyModeOff && restartSnapshot.Mux.Enabled,
+	)
+	muxProtocolFallback := false
+	if err != nil && shouldFallbackMuxProtocolToH2(restartSnapshot, err) {
+		fallbackSnapshot := cloneSnapshot(restartSnapshot)
+		fallbackSnapshot.Mux.Protocol = ProxyMuxProtocolH2Mux
+		fallbackErr := s.runtimeCoordinatorOrDefault().ApplyFastRestart(
+			fallbackSnapshot,
+			rollbackSnapshot,
+			"restart_connection_mux_fallback",
+			fallbackSnapshot.ProxyMode != ProxyModeOff && fallbackSnapshot.Mux.Enabled,
+		)
+		if fallbackErr == nil {
+			appliedSnapshot = fallbackSnapshot
+			muxProtocolFallback = true
+			err = nil
+		} else {
+			err = fmt.Errorf("%v; mux fallback to h2mux failed: %w", err, fallbackErr)
+		}
+	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if err != nil {
+		var applyErr *runtimeApplyError
+		if errors.As(err, &applyErr) && applyErr.rollbackApplied {
+			s.state = cloneSnapshot(previous)
+			s.state.ConnectionStage = ConnectionConnected
+			s.state.LastRuntimeApply = newRuntimeApplyStatus(
+				RuntimeApplyOperationRestartConnection,
+				RuntimeApplyStrategyFastRestart,
+				"restart_connection",
+				false,
+				true,
+				err,
+			)
+			s.appendCoreLogLocked(
+				LogLevelWarn,
+				fmt.Sprintf("restart service failed and rolled back: %v", err),
+			)
+			_ = s.saveLocked()
+			result := cloneSnapshot(s.state)
+			s.mu.Unlock()
+			return result, err
+		}
 		s.state.ConnectionStage = ConnectionError
-		s.appendCoreLogLocked(LogLevelError, fmt.Sprintf("stop connection failed: %v", err))
+		s.state.LastRuntimeApply = newRuntimeApplyStatus(
+			RuntimeApplyOperationRestartConnection,
+			RuntimeApplyStrategyFastRestart,
+			"restart_connection",
+			false,
+			false,
+			err,
+		)
+		s.appendCoreLogLocked(LogLevelError, fmt.Sprintf("restart service failed: %v", err))
 		_ = s.saveLocked()
-		return cloneSnapshot(s.state), err
+		result := cloneSnapshot(s.state)
+		s.mu.Unlock()
+		return result, err
 	}
-	s.state.ConnectionStage = ConnectionIdle
-	s.appendCoreLogLocked(LogLevelInfo, "connection stopped")
+	s.state.ConnectionStage = ConnectionConnected
+	if currentMode == ProxyModeOff {
+		s.state.ProxyStartedAtMS = 0
+	} else {
+		s.state.ProxyStartedAtMS = time.Now().UnixMilli()
+	}
+	if muxProtocolFallback {
+		s.state.Mux = appliedSnapshot.Mux
+		s.appendCoreLogLocked(
+			LogLevelWarn,
+			"mux post-check failed with current protocol, fallback to h2mux",
+		)
+	}
+	changeSummary := "restart_connection"
+	if muxProtocolFallback {
+		changeSummary = "restart_connection,mux_fallback_h2mux"
+	}
+	s.state.LastRuntimeApply = newRuntimeApplyStatus(
+		RuntimeApplyOperationRestartConnection,
+		RuntimeApplyStrategyFastRestart,
+		changeSummary,
+		true,
+		false,
+		nil,
+	)
+	if currentMode == ProxyModeOff {
+		s.appendCoreLogLocked(LogLevelInfo, "restart service success: minimal runtime mode")
+	} else {
+		s.appendCoreLogLocked(LogLevelInfo, fmt.Sprintf("restart service success: proxy mode=%s", currentMode))
+	}
 	_ = s.saveLocked()
-	return cloneSnapshot(s.state), nil
+	result := cloneSnapshot(s.state)
+	shouldEnqueue := s.state.ProxyMode != ProxyModeOff && hasReferencedNodePoolRule(s.state)
+	s.mu.Unlock()
+	if shouldEnqueue {
+		s.enqueueReferencedNodePoolRefresh("restart_connection")
+	}
+	return result, nil
 }
 
 func (s *RuntimeStore) AppendUILog(_ context.Context, req AppendUILogRequest) error {
@@ -1544,8 +5045,17 @@ func (s *RuntimeStore) AppendUILog(_ context.Context, req AppendUILogRequest) er
 		return errors.New("message is required")
 	}
 	level := normalizeLogLevel(req.Level)
-	if !isValidLogLevel(level) || level == LogLevelNone {
+	if !isValidLogLevel(level) {
 		level = LogLevelInfo
+	}
+	if level == LogLevelNone {
+		return nil
+	}
+	s.mu.RLock()
+	threshold := normalizeLogLevel(s.state.UILogLevel)
+	s.mu.RUnlock()
+	if !shouldRecordLog(level, threshold) {
+		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1718,32 +5228,18 @@ func (s *RuntimeStore) indexRuleProfileByIDLocked(profileID string) int {
 	return -1
 }
 
+func (s *RuntimeStore) refreshRuntimeEnvironmentLocked() {
+	environment := detectRuntimeEnvironment()
+	s.state.SystemType = environment.SystemType
+	s.state.RuntimeAdmin = environment.RuntimeAdmin
+}
+
 func (s *RuntimeStore) ensureValidLocked() {
 	s.stripLegacySeedDataLocked()
 	if s.state.SchemaVersion <= 0 {
 		s.state.SchemaVersion = 1
 	}
 	if s.state.SchemaVersion < 2 {
-		if strings.TrimSpace(s.state.DNSRemoteServer) == "" {
-			s.state.DNSRemoteServer = defaultDNSRemoteServer
-		}
-		if strings.TrimSpace(s.state.DNSDirectServer) == "" {
-			s.state.DNSDirectServer = defaultDNSDirectServer
-		}
-		if !isValidDNSStrategy(normalizeDNSStrategy(s.state.DNSStrategy)) {
-			s.state.DNSStrategy = defaultDNSStrategy
-		}
-		if strings.TrimSpace(s.state.DNSFakeIPV4Range) == "" {
-			s.state.DNSFakeIPV4Range = defaultDNSFakeIPV4Range
-		}
-		if strings.TrimSpace(s.state.DNSFakeIPV6Range) == "" {
-			s.state.DNSFakeIPV6Range = defaultDNSFakeIPV6Range
-		}
-		// Legacy state before v2 has no DNS settings: initialize safe defaults.
-		s.state.DNSIndependentCache = true
-		s.state.DNSCacheFileEnabled = true
-		s.state.DNSCacheStoreRDRC = true
-		s.state.DNSFakeIPEnabled = true
 		s.state.SchemaVersion = 2
 	}
 	if s.state.SchemaVersion < 3 {
@@ -1756,10 +5252,6 @@ func (s *RuntimeStore) ensureValidLocked() {
 		s.state.SchemaVersion = 4
 	}
 	if s.state.SchemaVersion < 5 {
-		s.state.DNSBootstrapServer = strings.TrimSpace(s.state.DNSDirectServer)
-		if s.state.DNSBootstrapServer == "" {
-			s.state.DNSBootstrapServer = defaultDNSBootstrapServer
-		}
 		s.state.SchemaVersion = 5
 	}
 	if s.state.SchemaVersion < 6 {
@@ -1791,6 +5283,76 @@ func (s *RuntimeStore) ensureValidLocked() {
 	if s.state.SchemaVersion < 9 {
 		s.state.RecordLogsToFile = true
 		s.state.SchemaVersion = 9
+	}
+	if s.state.SchemaVersion < 10 {
+		s.state.SchemaVersion = 10
+	}
+	if s.state.SchemaVersion < 11 {
+		now := time.Now().UnixMilli()
+		defaultConfig := defaultRuleConfigV2()
+		if len(s.state.RuleProfiles) == 0 {
+			s.state.RuleProfiles = []RuleProfile{
+				{
+					ID:            defaultRuleProfileID,
+					Name:          defaultRuleProfileName,
+					SourceKind:    RuleProfileSourceManual,
+					LastUpdatedMS: now,
+					Config:        defaultConfig,
+				},
+			}
+			s.state.ActiveRuleProfileID = defaultRuleProfileID
+		} else {
+			for index := range s.state.RuleProfiles {
+				s.state.RuleProfiles[index].Config = cloneRuleConfigV2(defaultConfig)
+				s.state.RuleProfiles[index].LastUpdatedMS = now
+				s.state.RuleProfiles[index].SourceKind = RuleProfileSourceManual
+				s.state.RuleProfiles[index].SourceRefID = ""
+			}
+			if strings.TrimSpace(s.state.ActiveRuleProfileID) == "" {
+				s.state.ActiveRuleProfileID = s.state.RuleProfiles[0].ID
+			}
+		}
+		s.state.RuleConfigV2 = cloneRuleConfigV2(defaultConfig)
+		s.state.SchemaVersion = 11
+	}
+	if s.state.SchemaVersion < 12 {
+		// Hard-cut migration: reset legacy DNS fields into new structured DNS config.
+		s.state.DNS = defaultDNSConfig()
+		s.state.SchemaVersion = 12
+	}
+	if s.state.SchemaVersion < 13 {
+		// Transport guard + mux defaults.
+		s.state.BlockQUIC = true
+		s.state.BlockUDP = false
+		s.state.Mux = defaultProxyMuxConfig()
+		s.state.SchemaVersion = 13
+	}
+	if s.state.SchemaVersion < 14 {
+		// Split persistent startup mode from runtime mode.
+		configuredMode := normalizeProxyMode(s.state.ProxyMode)
+		if !isValidConfiguredProxyMode(configuredMode) {
+			configuredMode = inferProxyMode(s.state.TunEnabled, s.state.SystemProxyEnabled)
+		}
+		s.state.ConfiguredProxyMode = normalizeConfiguredProxyMode(configuredMode)
+		s.state.SchemaVersion = 14
+	}
+	if s.state.SchemaVersion < 15 {
+		s.state.ProbeSettings = defaultProbeSettings()
+		s.state.SchemaVersion = 15
+	}
+	if s.state.SchemaVersion < 16 {
+		s.state.SchemaVersion = 16
+	}
+	if s.state.SchemaVersion < 17 {
+		s.state.SchemaVersion = 17
+	}
+	if s.state.SchemaVersion < 18 {
+		s.state.TrafficMonitorIntervalSec = normalizeTrafficMonitorIntervalSec(s.state.TrafficMonitorIntervalSec)
+		s.state.SchemaVersion = 18
+	}
+	if s.state.SchemaVersion < currentSnapshotSchemaVersion {
+		s.state.ClearDNSCacheOnRestart = false
+		s.state.SchemaVersion = currentSnapshotSchemaVersion
 	}
 	if s.state.StateRevision <= 0 {
 		s.state.StateRevision = 1
@@ -1827,37 +5389,32 @@ func (s *RuntimeStore) ensureValidLocked() {
 	if s.state.LocalProxyPort <= 0 || s.state.LocalProxyPort > 65535 {
 		s.state.LocalProxyPort = defaultLocalMixedListenPort
 	}
+	s.state.TunMTU = normalizeProxyTunMTU(s.state.TunMTU)
+	s.state.TunStack = normalizeProxyTunStack(s.state.TunStack)
+	if !isValidProxyTunStack(s.state.TunStack) {
+		s.state.TunStack = ProxyTunStackSystem
+	}
 	if s.state.SniffTimeoutMS < 100 || s.state.SniffTimeoutMS > 10000 {
 		s.state.SniffTimeoutMS = defaultSniffTimeoutMS
 	}
-	if strings.TrimSpace(s.state.DNSRemoteServer) == "" {
-		s.state.DNSRemoteServer = defaultDNSRemoteServer
-	}
-	if strings.TrimSpace(s.state.DNSDirectServer) == "" {
-		s.state.DNSDirectServer = defaultDNSDirectServer
-	}
-	if strings.TrimSpace(s.state.DNSBootstrapServer) == "" {
-		s.state.DNSBootstrapServer = strings.TrimSpace(s.state.DNSDirectServer)
-		if s.state.DNSBootstrapServer == "" {
-			s.state.DNSBootstrapServer = defaultDNSBootstrapServer
-		}
-	}
-	strategy := normalizeDNSStrategy(s.state.DNSStrategy)
-	if !isValidDNSStrategy(strategy) {
-		strategy = defaultDNSStrategy
-	}
-	s.state.DNSStrategy = strategy
-	if strings.TrimSpace(s.state.DNSFakeIPV4Range) == "" {
-		s.state.DNSFakeIPV4Range = defaultDNSFakeIPV4Range
-	}
-	if strings.TrimSpace(s.state.DNSFakeIPV6Range) == "" {
-		s.state.DNSFakeIPV6Range = defaultDNSFakeIPV6Range
+	s.state.Mux = normalizeProxyMuxConfig(s.state.Mux)
+	s.state.ProbeSettings = normalizeProbeSettings(s.state.ProbeSettings)
+	s.state.TrafficMonitorIntervalSec = normalizeTrafficMonitorIntervalSec(s.state.TrafficMonitorIntervalSec)
+	if normalizedDNS, dnsErr := normalizeDNSConfig(s.state.DNS); dnsErr == nil {
+		s.state.DNS = normalizedDNS
+	} else {
+		s.state.DNS = defaultDNSConfig()
 	}
 	mode := normalizeProxyMode(s.state.ProxyMode)
 	if !isValidProxyMode(mode) {
 		mode = inferProxyMode(s.state.TunEnabled, s.state.SystemProxyEnabled)
 	}
 	applyProxyModeToState(&s.state, mode)
+	configuredMode := normalizeProxyMode(s.state.ConfiguredProxyMode)
+	if !isValidConfiguredProxyMode(configuredMode) {
+		configuredMode = s.state.ProxyMode
+	}
+	s.state.ConfiguredProxyMode = normalizeConfiguredProxyMode(configuredMode)
 	if !isValidLogLevel(normalizeLogLevel(s.state.ProxyLogLevel)) {
 		s.state.ProxyLogLevel = LogLevelInfo
 	}
@@ -1870,6 +5427,13 @@ func (s *RuntimeStore) ensureValidLocked() {
 	s.state.ProxyLogLevel = normalizeLogLevel(s.state.ProxyLogLevel)
 	s.state.CoreLogLevel = normalizeLogLevel(s.state.CoreLogLevel)
 	s.state.UILogLevel = normalizeLogLevel(s.state.UILogLevel)
+	if !s.state.ProxyRecordToFile && !s.state.CoreRecordToFile && !s.state.UIRecordToFile && s.state.RecordLogsToFile {
+		// Migrate from legacy global switch persisted by older versions.
+		s.state.ProxyRecordToFile = true
+		s.state.CoreRecordToFile = true
+		s.state.UIRecordToFile = true
+	}
+	syncRecordLogsToFileCompatibility(&s.state)
 	if s.state.ProxyLogs == nil {
 		s.state.ProxyLogs = []RuntimeLogEntry{}
 	}
@@ -1879,10 +5443,29 @@ func (s *RuntimeStore) ensureValidLocked() {
 	if s.state.UILogs == nil {
 		s.state.UILogs = []RuntimeLogEntry{}
 	}
-	s.state.ProxyLogs = trimRuntimeLogsByPolicy(s.state.ProxyLogs, s.state.RecordLogsToFile)
-	s.state.CoreLogs = trimRuntimeLogsByPolicy(s.state.CoreLogs, s.state.RecordLogsToFile)
-	s.state.UILogs = trimRuntimeLogsByPolicy(s.state.UILogs, s.state.RecordLogsToFile)
+	s.state.ProxyLogs = trimRuntimeLogsByPolicy(s.state.ProxyLogs, s.state.ProxyRecordToFile)
+	s.state.CoreLogs = trimRuntimeLogsByPolicy(s.state.CoreLogs, s.state.CoreRecordToFile)
+	s.state.UILogs = trimRuntimeLogsByPolicy(s.state.UILogs, s.state.UIRecordToFile)
+	coreVersionValue := strings.TrimSpace(s.state.CoreVersion)
+	if strings.EqualFold(coreVersionValue, "daemon") || !isCoreVersionSemVer(coreVersionValue) {
+		s.state.CoreVersion = s.resolveCoreVersionFallbackLocked()
+	}
+	proxyVersionValue := strings.TrimSpace(s.state.ProxyVersion)
+	if proxyVersionValue == "" || strings.EqualFold(proxyVersionValue, "unknown") {
+		s.state.ProxyVersion = currentProxyCoreVersion()
+	}
+	if s.state.DaemonStartedAtMS <= 0 {
+		s.state.DaemonStartedAtMS = time.Now().UnixMilli()
+	}
+	if s.state.ProxyStartedAtMS < 0 {
+		s.state.ProxyStartedAtMS = 0
+	}
+	if s.state.LastClientHeartbeatMS < 0 {
+		s.state.LastClientHeartbeatMS = 0
+	}
 	normalizeRuleProfilesLocked(&s.state)
+	s.refreshRuntimeEnvironmentLocked()
+	s.refreshSessionObservabilityLocked(time.Now().UnixMilli())
 
 	if len(s.state.Groups) == 0 {
 		s.state.ActiveGroupID = ""
@@ -2022,6 +5605,482 @@ func normalizeProxyMode(mode ProxyMode) ProxyMode {
 	return ProxyMode(strings.ToLower(strings.TrimSpace(string(mode))))
 }
 
+func normalizeProxyTunMTU(raw int) int {
+	if raw < minTunMTU || raw > maxTunMTU {
+		return defaultTunMTU
+	}
+	return raw
+}
+
+func normalizeProxyTunStack(raw ProxyTunStack) ProxyTunStack {
+	switch strings.ToLower(strings.TrimSpace(string(raw))) {
+	case string(ProxyTunStackSystem):
+		return ProxyTunStackSystem
+	case string(ProxyTunStackGVisor):
+		return ProxyTunStackGVisor
+	case string(ProxyTunStackMixed):
+		return ProxyTunStackMixed
+	default:
+		return ""
+	}
+}
+
+func isValidProxyTunStack(stack ProxyTunStack) bool {
+	switch normalizeProxyTunStack(stack) {
+	case ProxyTunStackMixed, ProxyTunStackSystem, ProxyTunStackGVisor:
+		return true
+	default:
+		return false
+	}
+}
+
+func defaultProxyMuxConfig() ProxyMuxConfig {
+	return ProxyMuxConfig{
+		Enabled:        false,
+		Protocol:       ProxyMuxProtocolSMux,
+		MaxConnections: 0,
+		MinStreams:     0,
+		MaxStreams:     4,
+		Padding:        false,
+		Brutal: ProxyMuxBrutal{
+			Enabled:  false,
+			UpMbps:   100,
+			DownMbps: 100,
+		},
+	}
+}
+
+func normalizeProxyMuxProtocol(raw ProxyMuxProtocol) ProxyMuxProtocol {
+	switch strings.ToLower(strings.TrimSpace(string(raw))) {
+	case string(ProxyMuxProtocolSMux):
+		return ProxyMuxProtocolSMux
+	case string(ProxyMuxProtocolYAMux):
+		return ProxyMuxProtocolYAMux
+	case string(ProxyMuxProtocolH2Mux):
+		return ProxyMuxProtocolH2Mux
+	default:
+		return ""
+	}
+}
+
+func normalizeProxyMuxConfig(raw ProxyMuxConfig) ProxyMuxConfig {
+	_ = raw
+	config := defaultProxyMuxConfig()
+	// Mux is explicitly disabled by product policy. Keep shape for compatibility.
+	config.Enabled = false
+	config.Padding = false
+	config.Brutal.Enabled = false
+	return config
+}
+
+func defaultDNSRules() []DNSRule {
+	return []DNSRule{
+		{
+			ID:           "builtin-lan-direct",
+			Enabled:      true,
+			DomainSuffix: []string{"lan", "local"},
+			Action:       DNSRuleActionTypeRoute,
+			Server:       DNSRuleServerDirect,
+		},
+	}
+}
+
+func defaultDNSConfig() DNSConfig {
+	return DNSConfig{
+		Version: 2,
+		Remote: DNSResolverEndpoint{
+			Type:    DNSResolverTypeUDP,
+			Address: "8.8.8.8",
+			Port:    53,
+			Detour:  DNSDetourModeProxy,
+		},
+		Direct: DNSResolverEndpoint{
+			Type:    DNSResolverTypeUDP,
+			Address: defaultDNSDirectServer,
+			Port:    53,
+			Detour:  DNSDetourModeDirect,
+		},
+		Bootstrap: DNSResolverEndpoint{
+			Type:    DNSResolverTypeUDP,
+			Address: defaultDNSBootstrapServer,
+			Port:    53,
+			Detour:  DNSDetourModeDirect,
+		},
+		Policy: DNSResolverPolicy{
+			Strategy: defaultDNSStrategy,
+			Final:    DNSRuleServerRemote,
+		},
+		Cache: DNSCachePolicy{
+			IndependentCache: false,
+			Capacity:         defaultDNSCacheCapacity,
+			FileEnabled:      false,
+			StoreRDRC:        false,
+		},
+		FakeIP: DNSFakeIPPolicy{
+			Enabled:   false,
+			IPv4Range: defaultDNSFakeIPV4Range,
+			IPv6Range: defaultDNSFakeIPV6Range,
+		},
+		Hosts: DNSHostsPolicy{
+			UseSystemHosts: false,
+			UseCustomHosts: false,
+			CustomHosts:    "",
+		},
+		Rules: defaultDNSRules(),
+	}
+}
+
+func isZeroDNSResolverEndpoint(endpoint DNSResolverEndpoint) bool {
+	return endpoint == (DNSResolverEndpoint{})
+}
+
+func isZeroDNSConfig(config DNSConfig) bool {
+	if config.Version != 0 {
+		return false
+	}
+	if !isZeroDNSResolverEndpoint(config.Remote) || !isZeroDNSResolverEndpoint(config.Direct) || !isZeroDNSResolverEndpoint(config.Bootstrap) {
+		return false
+	}
+	if config.Policy != (DNSResolverPolicy{}) {
+		return false
+	}
+	if config.Cache != (DNSCachePolicy{}) {
+		return false
+	}
+	if config.FakeIP != (DNSFakeIPPolicy{}) {
+		return false
+	}
+	if config.Hosts != (DNSHostsPolicy{}) {
+		return false
+	}
+	return len(config.Rules) == 0
+}
+
+func normalizeDNSResolverType(raw DNSResolverType) DNSResolverType {
+	switch strings.ToLower(strings.TrimSpace(string(raw))) {
+	case string(DNSResolverTypeLocal):
+		return DNSResolverTypeLocal
+	case string(DNSResolverTypeHosts):
+		return DNSResolverTypeHosts
+	case string(DNSResolverTypeResolved):
+		return DNSResolverTypeResolved
+	case string(DNSResolverTypeUDP):
+		return DNSResolverTypeUDP
+	case string(DNSResolverTypeTCP):
+		return DNSResolverTypeTCP
+	case string(DNSResolverTypeTLS):
+		return DNSResolverTypeTLS
+	case string(DNSResolverTypeQUIC):
+		return DNSResolverTypeQUIC
+	case string(DNSResolverTypeHTTPS):
+		return DNSResolverTypeHTTPS
+	case string(DNSResolverTypeH3):
+		return DNSResolverTypeH3
+	case string(DNSResolverTypeDHCP):
+		return DNSResolverTypeDHCP
+	default:
+		return ""
+	}
+}
+
+func normalizeDNSDetourMode(raw DNSDetourMode) DNSDetourMode {
+	switch strings.ToLower(strings.TrimSpace(string(raw))) {
+	case string(DNSDetourModeDirect):
+		return DNSDetourModeDirect
+	case string(DNSDetourModeProxy):
+		return DNSDetourModeProxy
+	default:
+		return ""
+	}
+}
+
+func normalizeDNSRuleServer(raw DNSRuleServer) DNSRuleServer {
+	switch strings.ToLower(strings.TrimSpace(string(raw))) {
+	case string(DNSRuleServerRemote):
+		return DNSRuleServerRemote
+	case string(DNSRuleServerDirect):
+		return DNSRuleServerDirect
+	case string(DNSRuleServerBootstrap):
+		return DNSRuleServerBootstrap
+	case string(DNSRuleServerFakeIP):
+		return DNSRuleServerFakeIP
+	default:
+		return ""
+	}
+}
+
+func normalizeDNSRuleActionType(raw DNSRuleActionType) DNSRuleActionType {
+	switch strings.ToLower(strings.TrimSpace(string(raw))) {
+	case "", string(DNSRuleActionTypeRoute):
+		return DNSRuleActionTypeRoute
+	case string(DNSRuleActionTypeReject):
+		return DNSRuleActionTypeReject
+	default:
+		return ""
+	}
+}
+
+func defaultDNSPortByType(serverType DNSResolverType) int {
+	switch serverType {
+	case DNSResolverTypeTLS, DNSResolverTypeQUIC:
+		return 853
+	case DNSResolverTypeHTTPS, DNSResolverTypeH3:
+		return 443
+	default:
+		return 53
+	}
+}
+
+func normalizeDNSResolverEndpoint(
+	input DNSResolverEndpoint,
+	fallback DNSResolverEndpoint,
+	role string,
+) (DNSResolverEndpoint, error) {
+	normalized := fallback
+	if nextType := normalizeDNSResolverType(input.Type); nextType != "" {
+		normalized.Type = nextType
+	}
+	if address := strings.TrimSpace(input.Address); address != "" {
+		normalized.Address = address
+	}
+	if input.Port > 0 && input.Port <= 65535 {
+		normalized.Port = input.Port
+	}
+	if path := strings.TrimSpace(input.Path); path != "" {
+		normalized.Path = path
+	}
+	if iface := strings.TrimSpace(input.Interface); iface != "" {
+		normalized.Interface = iface
+	}
+	if detour := normalizeDNSDetourMode(input.Detour); detour != "" {
+		normalized.Detour = detour
+	}
+	if normalized.Detour == "" {
+		if role == "remote" {
+			normalized.Detour = DNSDetourModeProxy
+		} else {
+			normalized.Detour = DNSDetourModeDirect
+		}
+	}
+
+	switch normalized.Type {
+	case DNSResolverTypeLocal, DNSResolverTypeHosts, DNSResolverTypeResolved:
+		normalized.Address = ""
+		normalized.Port = 0
+		normalized.Path = ""
+		normalized.Interface = ""
+		return normalized, nil
+	case DNSResolverTypeDHCP:
+		if strings.TrimSpace(normalized.Interface) == "" {
+			normalized.Interface = strings.TrimSpace(normalized.Address)
+		}
+		if strings.TrimSpace(normalized.Interface) == "" {
+			normalized.Interface = "auto"
+		}
+		normalized.Address = ""
+		normalized.Port = 0
+		normalized.Path = ""
+		return normalized, nil
+	}
+
+	if strings.TrimSpace(normalized.Address) == "" {
+		return DNSResolverEndpoint{}, fmt.Errorf("dns.%s.address is required", role)
+	}
+	if normalized.Port <= 0 {
+		normalized.Port = defaultDNSPortByType(normalized.Type)
+	}
+	if normalized.Port <= 0 || normalized.Port > 65535 {
+		return DNSResolverEndpoint{}, fmt.Errorf("dns.%s.port must be between 1 and 65535", role)
+	}
+	if normalized.Type == DNSResolverTypeHTTPS || normalized.Type == DNSResolverTypeH3 {
+		if strings.TrimSpace(normalized.Path) == "" {
+			normalized.Path = "/dns-query"
+		}
+		if !strings.HasPrefix(normalized.Path, "/") {
+			normalized.Path = "/" + normalized.Path
+		}
+	} else {
+		normalized.Path = ""
+	}
+	normalized.Interface = ""
+	return normalized, nil
+}
+
+func normalizeDNSRules(rules []DNSRule) []DNSRule {
+	if len(rules) == 0 {
+		return defaultDNSRules()
+	}
+	result := make([]DNSRule, 0, len(rules))
+	seenRuleIDs := map[string]struct{}{}
+	for index, rawRule := range rules {
+		ruleID := strings.TrimSpace(rawRule.ID)
+		if ruleID == "" {
+			ruleID = fmt.Sprintf("dns-rule-%d", index+1)
+		}
+		lowerRuleID := strings.ToLower(ruleID)
+		if _, exists := seenRuleIDs[lowerRuleID]; exists {
+			ruleID = fmt.Sprintf("%s-%d", ruleID, index+1)
+			lowerRuleID = strings.ToLower(ruleID)
+		}
+		seenRuleIDs[lowerRuleID] = struct{}{}
+		action := normalizeDNSRuleActionType(rawRule.Action)
+		if action == "" {
+			continue
+		}
+		server := normalizeDNSRuleServer(rawRule.Server)
+		if server == "" {
+			server = DNSRuleServerRemote
+		}
+		rule := DNSRule{
+			ID:            ruleID,
+			Enabled:       rawRule.Enabled,
+			Domain:        uniqueNonEmptyStrings(rawRule.Domain),
+			DomainSuffix:  uniqueNonEmptyStrings(rawRule.DomainSuffix),
+			DomainKeyword: uniqueNonEmptyStrings(rawRule.DomainKeyword),
+			DomainRegex:   uniqueNonEmptyStrings(rawRule.DomainRegex),
+			QueryType:     uniqueNonEmptyStrings(rawRule.QueryType),
+			Outbound:      uniqueNonEmptyStrings(rawRule.Outbound),
+			Action:        action,
+			Server:        server,
+			DisableCache:  rawRule.DisableCache,
+			ClientSubnet:  strings.TrimSpace(rawRule.ClientSubnet),
+		}
+		if len(rule.Domain) == 0 &&
+			len(rule.DomainSuffix) == 0 &&
+			len(rule.DomainKeyword) == 0 &&
+			len(rule.DomainRegex) == 0 &&
+			len(rule.QueryType) == 0 &&
+			len(rule.Outbound) == 0 {
+			continue
+		}
+		result = append(result, rule)
+	}
+	if len(result) == 0 {
+		return defaultDNSRules()
+	}
+	return result
+}
+
+func normalizeDNSConfig(raw DNSConfig) (DNSConfig, error) {
+	defaultConfig := defaultDNSConfig()
+	if isZeroDNSConfig(raw) {
+		return defaultConfig, nil
+	}
+
+	config := defaultConfig
+	rawVersion := raw.Version
+	if raw.Version > 0 {
+		config.Version = raw.Version
+	}
+	if config.Version < defaultConfig.Version {
+		config.Version = defaultConfig.Version
+	}
+	remote, err := normalizeDNSResolverEndpoint(raw.Remote, config.Remote, "remote")
+	if err != nil {
+		return DNSConfig{}, err
+	}
+	direct, err := normalizeDNSResolverEndpoint(raw.Direct, config.Direct, "direct")
+	if err != nil {
+		return DNSConfig{}, err
+	}
+	bootstrap, err := normalizeDNSResolverEndpoint(raw.Bootstrap, config.Bootstrap, "bootstrap")
+	if err != nil {
+		return DNSConfig{}, err
+	}
+	config.Remote = remote
+	config.Direct = direct
+	config.Bootstrap = bootstrap
+
+	strategy := normalizeDNSStrategy(raw.Policy.Strategy)
+	if !isValidDNSStrategy(strategy) {
+		strategy = config.Policy.Strategy
+	}
+	finalServer := normalizeDNSRuleServer(raw.Policy.Final)
+	if finalServer == "" {
+		finalServer = config.Policy.Final
+	}
+	config.Policy = DNSResolverPolicy{
+		Strategy:     strategy,
+		Final:        finalServer,
+		ClientSubnet: strings.TrimSpace(raw.Policy.ClientSubnet),
+	}
+
+	if rawVersion >= 2 {
+		customHosts := normalizeDNSHostsText(raw.Hosts.CustomHosts)
+		if raw.Hosts.UseCustomHosts && customHosts != "" {
+			if _, parseErr := parseDNSHostsEntries(customHosts); parseErr != nil {
+				return DNSConfig{}, fmt.Errorf("dns.hosts.customHosts invalid: %w", parseErr)
+			}
+		}
+		config.Hosts = DNSHostsPolicy{
+			UseSystemHosts: raw.Hosts.UseSystemHosts,
+			UseCustomHosts: raw.Hosts.UseCustomHosts,
+			CustomHosts:    customHosts,
+		}
+	}
+
+	cacheCapacity := raw.Cache.Capacity
+	if cacheCapacity <= 0 {
+		cacheCapacity = config.Cache.Capacity
+	}
+	if cacheCapacity < 1024 {
+		cacheCapacity = 1024
+	}
+	config.Cache = DNSCachePolicy{
+		IndependentCache: raw.Cache.IndependentCache,
+		Capacity:         cacheCapacity,
+		FileEnabled:      raw.Cache.FileEnabled,
+		StoreRDRC:        raw.Cache.FileEnabled && raw.Cache.StoreRDRC,
+	}
+
+	config.FakeIP = DNSFakeIPPolicy{
+		Enabled:   raw.FakeIP.Enabled,
+		IPv4Range: strings.TrimSpace(raw.FakeIP.IPv4Range),
+		IPv6Range: strings.TrimSpace(raw.FakeIP.IPv6Range),
+	}
+	if config.FakeIP.Enabled {
+		if config.FakeIP.IPv4Range == "" {
+			config.FakeIP.IPv4Range = defaultDNSFakeIPV4Range
+		}
+		if config.FakeIP.IPv6Range == "" {
+			config.FakeIP.IPv6Range = defaultDNSFakeIPV6Range
+		}
+	}
+	config.Rules = normalizeDNSRules(raw.Rules)
+	return config, nil
+}
+
+func isDNSConfigEqual(left DNSConfig, right DNSConfig) bool {
+	leftNormalized, leftErr := normalizeDNSConfig(left)
+	rightNormalized, rightErr := normalizeDNSConfig(right)
+	if leftErr != nil || rightErr != nil {
+		return false
+	}
+	leftRaw, err := json.Marshal(leftNormalized)
+	if err != nil {
+		return false
+	}
+	rightRaw, err := json.Marshal(rightNormalized)
+	if err != nil {
+		return false
+	}
+	return string(leftRaw) == string(rightRaw)
+}
+
+func isProxyMuxConfigEqual(left ProxyMuxConfig, right ProxyMuxConfig) bool {
+	leftNormalized := normalizeProxyMuxConfig(left)
+	rightNormalized := normalizeProxyMuxConfig(right)
+	leftRaw, err := json.Marshal(leftNormalized)
+	if err != nil {
+		return false
+	}
+	rightRaw, err := json.Marshal(rightNormalized)
+	if err != nil {
+		return false
+	}
+	return string(leftRaw) == string(rightRaw)
+}
+
 func normalizeDNSStrategy(strategy DNSStrategy) DNSStrategy {
 	return DNSStrategy(strings.ToLower(strings.TrimSpace(string(strategy))))
 }
@@ -2046,6 +6105,37 @@ func isValidRuleNodeSelectStrategy(strategy RuleNodeSelectStrategy) bool {
 	default:
 		return false
 	}
+}
+
+func normalizeRuleNodePoolFallbackMode(mode RuleNodePoolFallbackMode) RuleNodePoolFallbackMode {
+	return RuleNodePoolFallbackMode(strings.ToLower(strings.TrimSpace(string(mode))))
+}
+
+func isValidRuleNodePoolFallbackMode(mode RuleNodePoolFallbackMode) bool {
+	switch mode {
+	case RuleNodePoolFallbackReject, RuleNodePoolFallbackActiveNode:
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeRuleNodePoolAvailableNodeIDs(values []string) []string {
+	seen := map[string]struct{}{}
+	result := make([]string, 0, len(values))
+	for _, rawValue := range values {
+		value := strings.TrimSpace(rawValue)
+		if value == "" {
+			continue
+		}
+		key := strings.ToLower(value)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, value)
+	}
+	return result
 }
 
 func uniqueNonEmptyStrings(values []string) []string {
@@ -2130,67 +6220,39 @@ func isValidRuleActionType(actionType RuleActionType) bool {
 	}
 }
 
-func normalizeRuleApplyMode(mode RuleApplyMode) RuleApplyMode {
-	return RuleApplyMode(strings.ToLower(strings.TrimSpace(string(mode))))
-}
-
-func isValidRuleApplyMode(mode RuleApplyMode) bool {
-	switch normalizeRuleApplyMode(mode) {
-	case RuleApplyModeProxy, RuleApplyModeDirect:
-		return true
+func normalizeRuleMissMode(mode RuleMissMode) RuleMissMode {
+	switch strings.ToLower(strings.TrimSpace(string(mode))) {
+	case string(RuleMissModeProxy):
+		return RuleMissModeProxy
 	default:
-		return false
+		return RuleMissModeDirect
 	}
 }
 
-func defaultsForRuleApplyMode(mode RuleApplyMode) RuleDefaults {
-	switch normalizeRuleApplyMode(mode) {
-	case RuleApplyModeDirect:
-		return RuleDefaults{
-			OnMatch: "direct",
-			OnMiss:  "proxy",
+func resolveRuleGroupOnMissMode(group RuleGroup, fallback RuleMissMode) RuleMissMode {
+	groupMode := strings.TrimSpace(string(group.OnMissMode))
+	if groupMode == "" {
+		return normalizeRuleMissMode(fallback)
+	}
+	return normalizeRuleMissMode(group.OnMissMode)
+}
+
+func resolveActiveRuleGroupOnMissMode(config RuleConfigV2) RuleMissMode {
+	fallback := normalizeRuleMissMode(config.OnMissMode)
+	if len(config.Groups) == 0 {
+		return fallback
+	}
+	activeGroup := config.Groups[0]
+	activeGroupID := strings.TrimSpace(config.ActiveGroupID)
+	if activeGroupID != "" {
+		for _, group := range config.Groups {
+			if group.ID == activeGroupID {
+				activeGroup = group
+				break
+			}
 		}
-	default:
-		return RuleDefaults{
-			OnMatch: "proxy",
-			OnMiss:  "direct",
-		}
 	}
-}
-
-func inferRuleApplyModeFromDefaults(defaults RuleDefaults) RuleApplyMode {
-	onMatch := strings.ToLower(strings.TrimSpace(defaults.OnMatch))
-	onMiss := strings.ToLower(strings.TrimSpace(defaults.OnMiss))
-	if onMatch == "direct" && onMiss == "proxy" {
-		return RuleApplyModeDirect
-	}
-	return RuleApplyModeProxy
-}
-
-func normalizeRuleActionMode(mode RuleActionMode) RuleActionMode {
-	return RuleActionMode(strings.ToLower(strings.TrimSpace(string(mode))))
-}
-
-func isValidRuleActionMode(mode RuleActionMode) bool {
-	switch normalizeRuleActionMode(mode) {
-	case RuleActionModeInherit, RuleActionModeProxy, RuleActionModeDirect, RuleActionModeReject, RuleActionModePolicy:
-		return true
-	default:
-		return false
-	}
-}
-
-func normalizeRuleBaseRuleKind(kind RuleBaseRuleKind) RuleBaseRuleKind {
-	return RuleBaseRuleKind(strings.ToLower(strings.TrimSpace(string(kind))))
-}
-
-func isValidRuleBaseRuleKind(kind RuleBaseRuleKind) bool {
-	switch normalizeRuleBaseRuleKind(kind) {
-	case RuleBaseRuleKindProcess, RuleBaseRuleKindDomain, RuleBaseRuleKindIP, RuleBaseRuleKindMixed, RuleBaseRuleKindCustom:
-		return true
-	default:
-		return false
-	}
+	return resolveRuleGroupOnMissMode(activeGroup, fallback)
 }
 
 func normalizeRuleProviderKind(kind RuleProviderKind) RuleProviderKind {
@@ -2247,121 +6309,96 @@ func normalizeRuleConfigV2(raw RuleConfigV2) (RuleConfigV2, error) {
 		policyByID[group.ID] = group
 	}
 
-	requestedApplyMode := normalizeRuleApplyMode(raw.ApplyMode)
-	if isValidRuleApplyMode(requestedApplyMode) {
-		config.ApplyMode = requestedApplyMode
-		config.Defaults = defaultsForRuleApplyMode(requestedApplyMode)
-	} else {
-		defaults := RuleDefaults{
-			OnMatch: strings.TrimSpace(raw.Defaults.OnMatch),
-			OnMiss:  strings.TrimSpace(raw.Defaults.OnMiss),
-		}
-		if _, ok := policyByID[defaults.OnMatch]; !ok {
-			defaults.OnMatch = "direct"
-		}
-		if _, ok := policyByID[defaults.OnMiss]; !ok {
-			defaults.OnMiss = "proxy"
-		}
-		config.Defaults = defaults
-		config.ApplyMode = inferRuleApplyModeFromDefaults(defaults)
-	}
-
 	providers, err := normalizeRuleProviders(raw.Providers)
 	if err != nil {
 		return RuleConfigV2{}, err
 	}
 	config.Providers = providers
 
-	legacyRules, err := normalizeRuleItems(raw.Rules, config.Defaults, policyByID)
-	if err != nil {
-		return RuleConfigV2{}, err
-	}
-
-	baseRules, err := normalizeBaseRuleItems(raw.BaseRules, policyByID)
-	if err != nil {
-		return RuleConfigV2{}, err
-	}
-	baseRulesByID := map[string]BaseRuleItem{}
-	for _, item := range baseRules {
-		baseRulesByID[item.ID] = item
-	}
-
-	normalizedGroups, normalizedActiveGroupID, err := normalizeComposedRuleGroups(
-		raw.ComposedRuleGroups,
-		raw.ComposedRules,
-		raw.ActiveComposedRuleGroupID,
-		baseRulesByID,
-		config.ApplyMode,
-	)
-	if err != nil {
-		return RuleConfigV2{}, err
-	}
-
-	usesComposedModel := len(raw.BaseRules) > 0 ||
-		len(raw.ComposedRules) > 0 ||
-		len(raw.ComposedRuleGroups) > 0 ||
-		strings.TrimSpace(raw.ActiveComposedRuleGroupID) != "" ||
-		isValidRuleApplyMode(normalizeRuleApplyMode(raw.ApplyMode))
-
-	if !usesComposedModel && len(baseRules) == 0 && len(raw.ComposedRules) == 0 && len(legacyRules) > 0 {
-		var migratedComposedRules []ComposedRuleItem
-		baseRules, migratedComposedRules = migrateLegacyRulesToBaseAndComposedRules(legacyRules, config.Defaults)
-		baseRulesByID = map[string]BaseRuleItem{}
-		for _, item := range baseRules {
-			baseRulesByID[item.ID] = item
+	legacyOnMissMode := normalizeRuleMissMode(raw.OnMissMode)
+	if strings.TrimSpace(string(raw.OnMissMode)) == "" {
+		if strings.EqualFold(strings.TrimSpace(raw.Defaults.OnMiss), "proxy") {
+			legacyOnMissMode = RuleMissModeProxy
 		}
-		normalizedGroups = []ComposedRuleGroup{
+	}
+	config.OnMissMode = legacyOnMissMode
+	config.Defaults = RuleDefaults{
+		OnMatch: "proxy",
+		OnMiss:  map[RuleMissMode]string{RuleMissModeProxy: "proxy", RuleMissModeDirect: "direct"}[legacyOnMissMode],
+	}
+
+	sourceGroups := raw.Groups
+	if len(sourceGroups) == 0 && len(raw.Rules) > 0 {
+		sourceGroups = []RuleGroup{
 			{
-				ID:    "default",
-				Name:  "默认分组",
-				Mode:  config.ApplyMode,
-				Items: migratedComposedRules,
+				ID:     "default",
+				Name:   "默认分组",
+				Locked: false,
+				Rules:  raw.Rules,
 			},
 		}
-		normalizedActiveGroupID = "default"
+	}
+	if len(sourceGroups) == 0 {
+		sourceGroups = defaultRuleConfigV2().Groups
 	}
 
-	effectiveRules := legacyRules
-	if usesComposedModel {
-		effectiveRules = []RuleItemV2{}
-	}
-	activeComposedRules := []ComposedRuleItem{}
-	activeGroupMode := config.ApplyMode
-	for _, group := range normalizedGroups {
-		if group.ID == normalizedActiveGroupID {
-			activeComposedRules = append([]ComposedRuleItem{}, group.Items...)
-			groupMode := normalizeRuleApplyMode(group.Mode)
-			if isValidRuleApplyMode(groupMode) {
-				activeGroupMode = groupMode
+	normalizedGroups := make([]RuleGroup, 0, len(sourceGroups))
+	groupIDSet := map[string]struct{}{}
+	for index, rawGroup := range sourceGroups {
+		groupID := strings.TrimSpace(rawGroup.ID)
+		if groupID == "" {
+			groupID = fmt.Sprintf("group-%d", index+1)
+		}
+		baseGroupID := groupID
+		dedupe := 1
+		for {
+			if _, exists := groupIDSet[strings.ToLower(groupID)]; !exists {
+				break
 			}
+			dedupe += 1
+			groupID = fmt.Sprintf("%s-%d", baseGroupID, dedupe)
+		}
+		groupIDSet[strings.ToLower(groupID)] = struct{}{}
+		groupName := strings.TrimSpace(rawGroup.Name)
+		if groupName == "" {
+			groupName = groupID
+		}
+		groupRules, normalizeErr := normalizeRuleItems(rawGroup.Rules, config.Defaults, policyByID)
+		if normalizeErr != nil {
+			return RuleConfigV2{}, fmt.Errorf("group %s: %w", groupID, normalizeErr)
+		}
+		normalizedGroups = append(normalizedGroups, RuleGroup{
+			ID:         groupID,
+			Name:       groupName,
+			OnMissMode: resolveRuleGroupOnMissMode(rawGroup, legacyOnMissMode),
+			Locked:     rawGroup.Locked,
+			Rules:      groupRules,
+		})
+	}
+	if len(normalizedGroups) == 0 {
+		normalizedGroups = defaultRuleConfigV2().Groups
+	}
+
+	activeGroupID := strings.TrimSpace(raw.ActiveGroupID)
+	activeGroup := normalizedGroups[0]
+	for _, group := range normalizedGroups {
+		if group.ID == activeGroupID {
+			activeGroup = group
 			break
 		}
 	}
-	config.ApplyMode = activeGroupMode
-	config.Defaults = defaultsForRuleApplyMode(activeGroupMode)
-
-	if len(activeComposedRules) > 0 {
-		resolvedRules, resolveErr := buildEffectiveRulesFromComposed(
-			activeComposedRules,
-			baseRulesByID,
-			config.ApplyMode,
-			config.Defaults,
-			policyByID,
-		)
-		if resolveErr != nil {
-			return RuleConfigV2{}, resolveErr
-		}
-		effectiveRules, err = normalizeRuleItems(resolvedRules, config.Defaults, policyByID)
-		if err != nil {
-			return RuleConfigV2{}, err
-		}
+	config.Groups = normalizedGroups
+	config.ActiveGroupID = activeGroup.ID
+	config.OnMissMode = resolveRuleGroupOnMissMode(activeGroup, legacyOnMissMode)
+	onMissPolicy := map[RuleMissMode]string{
+		RuleMissModeProxy:  "proxy",
+		RuleMissModeDirect: "direct",
+	}[config.OnMissMode]
+	config.Defaults = RuleDefaults{
+		OnMatch: "proxy",
+		OnMiss:  onMissPolicy,
 	}
-
-	config.BaseRules = baseRules
-	config.ComposedRuleGroups = normalizedGroups
-	config.ActiveComposedRuleGroupID = normalizedActiveGroupID
-	config.ComposedRules = activeComposedRules
-	config.Rules = effectiveRules
+	config.Rules = append([]RuleItemV2{}, activeGroup.Rules...)
 	return config, nil
 }
 
@@ -2400,11 +6437,17 @@ func normalizeRulePolicyGroups(groups []RulePolicyGroup) ([]RulePolicyGroup, err
 			group.NodePool = nil
 		case RulePolicyGroupTypeNodePool:
 			nodePool := RuleNodePool{
+				Enabled:            rawNodePoolEnabled(raw.NodePool),
 				Nodes:              normalizeRuleNodeRefs(rawNodePoolNodes(raw.NodePool)),
 				NodeSelectStrategy: normalizeRuleNodeSelectStrategy(rawNodePoolStrategy(raw.NodePool)),
+				FallbackMode:       normalizeRuleNodePoolFallbackMode(rawNodePoolFallbackMode(raw.NodePool)),
+				AvailableNodeIDs:   normalizeRuleNodePoolAvailableNodeIDs(rawNodePoolAvailableNodeIDs(raw.NodePool)),
 			}
 			if !isValidRuleNodeSelectStrategy(nodePool.NodeSelectStrategy) {
 				nodePool.NodeSelectStrategy = RuleNodeSelectFastest
+			}
+			if !isValidRuleNodePoolFallbackMode(nodePool.FallbackMode) {
+				nodePool.FallbackMode = RuleNodePoolFallbackReject
 			}
 			group.NodePool = &nodePool
 		}
@@ -2437,11 +6480,36 @@ func rawNodePoolNodes(pool *RuleNodePool) []RuleNodeRef {
 	return pool.Nodes
 }
 
+func rawNodePoolEnabled(pool *RuleNodePool) bool {
+	if pool == nil {
+		return true
+	}
+	// Backward-compatible default: old snapshots/clients don't carry fallback mode.
+	if !pool.Enabled && strings.TrimSpace(string(pool.FallbackMode)) == "" {
+		return true
+	}
+	return pool.Enabled
+}
+
 func rawNodePoolStrategy(pool *RuleNodePool) RuleNodeSelectStrategy {
 	if pool == nil {
 		return RuleNodeSelectFastest
 	}
 	return pool.NodeSelectStrategy
+}
+
+func rawNodePoolFallbackMode(pool *RuleNodePool) RuleNodePoolFallbackMode {
+	if pool == nil {
+		return RuleNodePoolFallbackReject
+	}
+	return pool.FallbackMode
+}
+
+func rawNodePoolAvailableNodeIDs(pool *RuleNodePool) []string {
+	if pool == nil {
+		return nil
+	}
+	return pool.AvailableNodeIDs
 }
 
 func normalizeRuleProviders(raw RuleProviders) (RuleProviders, error) {
@@ -2492,423 +6560,6 @@ func normalizeRuleProviders(raw RuleProviders) (RuleProviders, error) {
 		providers.RuleSets = append(providers.RuleSets, provider)
 	}
 	return providers, nil
-}
-
-func normalizeBaseRuleItems(
-	raw []BaseRuleItem,
-	policyByID map[string]RulePolicyGroup,
-) ([]BaseRuleItem, error) {
-	if len(raw) == 0 {
-		return []BaseRuleItem{}, nil
-	}
-	normalized := make([]BaseRuleItem, 0, len(raw))
-	seen := map[string]struct{}{}
-	for index, item := range raw {
-		baseRule := BaseRuleItem{
-			ID:   strings.TrimSpace(item.ID),
-			Name: strings.TrimSpace(item.Name),
-			Kind: normalizeRuleBaseRuleKind(item.Kind),
-			Match: RuleMatch{
-				Domain: RuleDomainMatch{
-					Exact:   uniqueNonEmptyStrings(item.Match.Domain.Exact),
-					Suffix:  uniqueNonEmptyStrings(item.Match.Domain.Suffix),
-					Keyword: uniqueNonEmptyStrings(item.Match.Domain.Keyword),
-					Regex:   uniqueNonEmptyStrings(item.Match.Domain.Regex),
-				},
-				IPCIDR:      normalizeIPCIDRPatterns(item.Match.IPCIDR),
-				GeoIP:       uniqueNonEmptyStrings(item.Match.GeoIP),
-				GeoSite:     uniqueNonEmptyStrings(item.Match.GeoSite),
-				RuleSetRefs: uniqueNonEmptyStrings(item.Match.RuleSetRefs),
-				Process: RuleProcessMatch{
-					NameContains: uniqueNonEmptyStrings(item.Match.Process.NameContains),
-					PathContains: uniqueNonEmptyStrings(item.Match.Process.PathContains),
-					PathRegex:    uniqueNonEmptyStrings(item.Match.Process.PathRegex),
-				},
-			},
-			ActionMode:     normalizeRuleActionMode(item.ActionMode),
-			TargetPolicy:   strings.TrimSpace(item.TargetPolicy),
-			TargetPolicies: uniqueNonEmptyStrings(item.TargetPolicies),
-		}
-		if baseRule.ID == "" {
-			baseRule.ID = fmt.Sprintf("base-rule-%d", index+1)
-		}
-		if baseRule.Name == "" {
-			baseRule.Name = baseRule.ID
-		}
-		if !isValidRuleBaseRuleKind(baseRule.Kind) {
-			baseRule.Kind = inferBaseRuleKind(baseRule.Match)
-		}
-		if baseRule.ActionMode == "" {
-			baseRule.ActionMode = RuleActionModeInherit
-		}
-		if !isValidRuleActionMode(baseRule.ActionMode) {
-			baseRule.ActionMode = RuleActionModeInherit
-		}
-		if baseRule.ActionMode == RuleActionModePolicy {
-			if baseRule.TargetPolicy == "" && len(baseRule.TargetPolicies) > 0 {
-				baseRule.TargetPolicy = strings.TrimSpace(baseRule.TargetPolicies[0])
-			}
-			if baseRule.TargetPolicy == "" {
-				return nil, fmt.Errorf("base rule %s missing targetPolicy", baseRule.ID)
-			}
-			if _, ok := policyByID[baseRule.TargetPolicy]; !ok {
-				return nil, fmt.Errorf("base rule %s references unknown policy: %s", baseRule.ID, baseRule.TargetPolicy)
-			}
-			for _, policyID := range baseRule.TargetPolicies {
-				if _, ok := policyByID[policyID]; !ok {
-					return nil, fmt.Errorf("base rule %s references unknown policy in targetPolicies: %s", baseRule.ID, policyID)
-				}
-			}
-		}
-		if !hasAnyRuleMatcher(baseRule.Match) {
-			return nil, fmt.Errorf("base rule %s has no match conditions", baseRule.ID)
-		}
-		key := strings.ToLower(baseRule.ID)
-		if _, ok := seen[key]; ok {
-			return nil, fmt.Errorf("duplicate base rule id: %s", baseRule.ID)
-		}
-		seen[key] = struct{}{}
-		normalized = append(normalized, baseRule)
-	}
-	return normalized, nil
-}
-
-func normalizeComposedRuleItems(
-	raw []ComposedRuleItem,
-	baseRulesByID map[string]BaseRuleItem,
-) ([]ComposedRuleItem, error) {
-	if len(raw) == 0 {
-		return []ComposedRuleItem{}, nil
-	}
-	normalized := make([]ComposedRuleItem, 0, len(raw))
-	seen := map[string]struct{}{}
-	for index, item := range raw {
-		composed := ComposedRuleItem{
-			ID:           strings.TrimSpace(item.ID),
-			Name:         strings.TrimSpace(item.Name),
-			BaseRuleID:   strings.TrimSpace(item.BaseRuleID),
-			Enabled:      item.Enabled,
-			ActionMode:   normalizeRuleActionMode(item.ActionMode),
-			TargetPolicy: strings.TrimSpace(item.TargetPolicy),
-		}
-		if composed.ID == "" {
-			composed.ID = fmt.Sprintf("composed-rule-%d", index+1)
-		}
-		if composed.Name == "" {
-			composed.Name = composed.ID
-		}
-		if composed.BaseRuleID == "" {
-			return nil, fmt.Errorf("composed rule %s missing baseRuleId", composed.ID)
-		}
-		if _, ok := baseRulesByID[composed.BaseRuleID]; !ok {
-			return nil, fmt.Errorf("composed rule %s references missing base rule: %s", composed.ID, composed.BaseRuleID)
-		}
-		if composed.ActionMode == "" && composed.TargetPolicy != "" {
-			composed.ActionMode = RuleActionModePolicy
-		}
-		if composed.ActionMode != "" && !isValidRuleActionMode(composed.ActionMode) {
-			return nil, fmt.Errorf("composed rule %s has invalid actionMode: %s", composed.ID, item.ActionMode)
-		}
-		if composed.ActionMode == RuleActionModePolicy && composed.TargetPolicy == "" {
-			return nil, fmt.Errorf("composed rule %s missing targetPolicy", composed.ID)
-		}
-		key := strings.ToLower(composed.ID)
-		if _, ok := seen[key]; ok {
-			return nil, fmt.Errorf("duplicate composed rule id: %s", composed.ID)
-		}
-		seen[key] = struct{}{}
-		normalized = append(normalized, composed)
-	}
-	return normalized, nil
-}
-
-func normalizeComposedRuleGroups(
-	rawGroups []ComposedRuleGroup,
-	rawFallbackItems []ComposedRuleItem,
-	rawActiveGroupID string,
-	baseRulesByID map[string]BaseRuleItem,
-	fallbackMode RuleApplyMode,
-) ([]ComposedRuleGroup, string, error) {
-	sourceGroups := append([]ComposedRuleGroup{}, rawGroups...)
-	if len(sourceGroups) == 0 && len(rawFallbackItems) > 0 {
-		sourceGroups = []ComposedRuleGroup{
-			{
-				ID:    "default",
-				Name:  "默认分组",
-				Mode:  fallbackMode,
-				Items: append([]ComposedRuleItem{}, rawFallbackItems...),
-			},
-		}
-	}
-	if len(sourceGroups) == 0 {
-		sourceGroups = []ComposedRuleGroup{
-			{
-				ID:    "default",
-				Name:  "默认分组",
-				Mode:  fallbackMode,
-				Items: []ComposedRuleItem{},
-			},
-		}
-	}
-
-	normalized := make([]ComposedRuleGroup, 0, len(sourceGroups))
-	seen := map[string]struct{}{}
-	for index, raw := range sourceGroups {
-		group := ComposedRuleGroup{
-			ID:   strings.TrimSpace(raw.ID),
-			Name: strings.TrimSpace(raw.Name),
-			Mode: normalizeRuleApplyMode(raw.Mode),
-		}
-		if group.ID == "" {
-			group.ID = fmt.Sprintf("composed-group-%d", index+1)
-		}
-		if group.Name == "" {
-			group.Name = group.ID
-		}
-		if !isValidRuleApplyMode(group.Mode) {
-			group.Mode = fallbackMode
-		}
-		key := strings.ToLower(group.ID)
-		if _, ok := seen[key]; ok {
-			return nil, "", fmt.Errorf("duplicate composed rule group id: %s", group.ID)
-		}
-		seen[key] = struct{}{}
-
-		items, err := normalizeComposedRuleItems(raw.Items, baseRulesByID)
-		if err != nil {
-			return nil, "", fmt.Errorf("composed group %s invalid items: %w", group.ID, err)
-		}
-		group.Items = items
-		normalized = append(normalized, group)
-	}
-
-	activeGroupID := strings.TrimSpace(rawActiveGroupID)
-	if activeGroupID == "" {
-		activeGroupID = normalized[0].ID
-	}
-	if _, ok := seen[strings.ToLower(activeGroupID)]; !ok {
-		activeGroupID = normalized[0].ID
-	}
-	return normalized, activeGroupID, nil
-}
-
-func buildEffectiveRulesFromComposed(
-	composedRules []ComposedRuleItem,
-	baseRulesByID map[string]BaseRuleItem,
-	applyMode RuleApplyMode,
-	defaults RuleDefaults,
-	policyByID map[string]RulePolicyGroup,
-) ([]RuleItemV2, error) {
-	effective := make([]RuleItemV2, 0, len(composedRules))
-	for _, composed := range composedRules {
-		baseRule, ok := baseRulesByID[composed.BaseRuleID]
-		if !ok {
-			return nil, fmt.Errorf("composed rule %s references missing base rule: %s", composed.ID, composed.BaseRuleID)
-		}
-		actionMode := normalizeRuleActionMode(baseRule.ActionMode)
-		if actionMode == "" || !isValidRuleActionMode(actionMode) {
-			actionMode = RuleActionModeInherit
-		}
-		targetPolicy := strings.TrimSpace(baseRule.TargetPolicy)
-		if targetPolicy == "" && len(baseRule.TargetPolicies) > 0 {
-			targetPolicy = strings.TrimSpace(baseRule.TargetPolicies[0])
-		}
-		overrideMode := normalizeRuleActionMode(composed.ActionMode)
-		if overrideMode != "" {
-			if !isValidRuleActionMode(overrideMode) {
-				return nil, fmt.Errorf("composed rule %s has invalid actionMode: %s", composed.ID, composed.ActionMode)
-			}
-			actionMode = overrideMode
-			targetPolicy = strings.TrimSpace(composed.TargetPolicy)
-			if targetPolicy == "" {
-				targetPolicy = strings.TrimSpace(baseRule.TargetPolicy)
-			}
-		}
-		action, err := resolveRuleActionForComposed(actionMode, targetPolicy, applyMode, defaults, policyByID)
-		if err != nil {
-			return nil, fmt.Errorf("composed rule %s action resolve failed: %w", composed.ID, err)
-		}
-		name := strings.TrimSpace(composed.Name)
-		if name == "" {
-			name = baseRule.Name
-		}
-		if name == "" {
-			name = composed.ID
-		}
-		effective = append(effective, RuleItemV2{
-			ID:      composed.ID,
-			Name:    name,
-			Enabled: composed.Enabled,
-			Match:   cloneRuleMatch(baseRule.Match),
-			Action:  action,
-		})
-	}
-	return effective, nil
-}
-
-func resolveRuleActionForComposed(
-	actionMode RuleActionMode,
-	targetPolicy string,
-	applyMode RuleApplyMode,
-	defaults RuleDefaults,
-	policyByID map[string]RulePolicyGroup,
-) (RuleAction, error) {
-	mode := normalizeRuleActionMode(actionMode)
-	if mode == "" {
-		mode = RuleActionModeInherit
-	}
-	switch mode {
-	case RuleActionModeReject:
-		return RuleAction{
-			Type:         RuleActionTypeReject,
-			TargetPolicy: "reject",
-		}, nil
-	case RuleActionModeDirect:
-		targetPolicy = "direct"
-	case RuleActionModeProxy:
-		targetPolicy = "proxy"
-	case RuleActionModePolicy:
-		targetPolicy = strings.TrimSpace(targetPolicy)
-		if targetPolicy == "" {
-			return RuleAction{}, errors.New("targetPolicy is required for policy action")
-		}
-	default:
-		targetPolicy = strings.TrimSpace(defaults.OnMatch)
-		if targetPolicy == "" {
-			targetPolicy = defaultsForRuleApplyMode(applyMode).OnMatch
-		}
-	}
-	if _, ok := policyByID[targetPolicy]; !ok {
-		return RuleAction{}, fmt.Errorf("unknown policy: %s", targetPolicy)
-	}
-	return RuleAction{
-		Type:         RuleActionTypeRoute,
-		TargetPolicy: targetPolicy,
-	}, nil
-}
-
-func migrateLegacyRulesToBaseAndComposedRules(
-	legacyRules []RuleItemV2,
-	defaults RuleDefaults,
-) ([]BaseRuleItem, []ComposedRuleItem) {
-	baseRules := make([]BaseRuleItem, 0, len(legacyRules))
-	composedRules := make([]ComposedRuleItem, 0, len(legacyRules))
-	seenBase := map[string]struct{}{}
-	seenComposed := map[string]struct{}{}
-	for index, item := range legacyRules {
-		baseID := strings.TrimSpace(item.ID)
-		if baseID == "" {
-			baseID = fmt.Sprintf("base-rule-%d", index+1)
-		} else {
-			baseID = "base-" + baseID
-		}
-		for {
-			key := strings.ToLower(baseID)
-			if _, ok := seenBase[key]; !ok {
-				seenBase[key] = struct{}{}
-				break
-			}
-			baseID = fmt.Sprintf("%s-%d", baseID, index+1)
-		}
-		actionMode, targetPolicy := inferActionModeFromRuleAction(item.Action, defaults)
-		baseRules = append(baseRules, BaseRuleItem{
-			ID:           baseID,
-			Name:         strings.TrimSpace(item.Name),
-			Kind:         inferBaseRuleKind(item.Match),
-			Match:        cloneRuleMatch(item.Match),
-			ActionMode:   actionMode,
-			TargetPolicy: targetPolicy,
-		})
-
-		composedID := strings.TrimSpace(item.ID)
-		if composedID == "" {
-			composedID = fmt.Sprintf("composed-rule-%d", index+1)
-		}
-		for {
-			key := strings.ToLower(composedID)
-			if _, ok := seenComposed[key]; !ok {
-				seenComposed[key] = struct{}{}
-				break
-			}
-			composedID = fmt.Sprintf("%s-%d", composedID, index+1)
-		}
-		composedRules = append(composedRules, ComposedRuleItem{
-			ID:         composedID,
-			Name:       strings.TrimSpace(item.Name),
-			BaseRuleID: baseID,
-			Enabled:    item.Enabled,
-		})
-	}
-	return baseRules, composedRules
-}
-
-func inferActionModeFromRuleAction(action RuleAction, defaults RuleDefaults) (RuleActionMode, string) {
-	switch normalizeRuleActionType(action.Type) {
-	case RuleActionTypeReject:
-		return RuleActionModeReject, ""
-	case RuleActionTypeRoute:
-		targetPolicy := strings.TrimSpace(action.TargetPolicy)
-		if targetPolicy == "" || strings.EqualFold(targetPolicy, strings.TrimSpace(defaults.OnMatch)) {
-			return RuleActionModeInherit, ""
-		}
-		switch strings.ToLower(targetPolicy) {
-		case "direct":
-			return RuleActionModeDirect, ""
-		case "proxy":
-			return RuleActionModeProxy, ""
-		case "reject", "block":
-			return RuleActionModeReject, ""
-		default:
-			return RuleActionModePolicy, targetPolicy
-		}
-	default:
-		return RuleActionModeInherit, ""
-	}
-}
-
-func inferBaseRuleKind(match RuleMatch) RuleBaseRuleKind {
-	hasProcess := len(match.Process.NameContains) > 0 ||
-		len(match.Process.PathContains) > 0 ||
-		len(match.Process.PathRegex) > 0
-	hasDomain := len(match.Domain.Exact) > 0 ||
-		len(match.Domain.Suffix) > 0 ||
-		len(match.Domain.Keyword) > 0 ||
-		len(match.Domain.Regex) > 0 ||
-		len(match.GeoSite) > 0
-	hasIP := len(match.IPCIDR) > 0 ||
-		len(match.GeoIP) > 0
-	switch {
-	case hasProcess && !hasDomain && !hasIP:
-		return RuleBaseRuleKindProcess
-	case hasDomain && !hasProcess && !hasIP:
-		return RuleBaseRuleKindDomain
-	case hasIP && !hasProcess && !hasDomain:
-		return RuleBaseRuleKindIP
-	case hasProcess || hasDomain || hasIP:
-		return RuleBaseRuleKindMixed
-	default:
-		return RuleBaseRuleKindCustom
-	}
-}
-
-func cloneRuleMatch(match RuleMatch) RuleMatch {
-	return RuleMatch{
-		Domain: RuleDomainMatch{
-			Exact:   append([]string{}, match.Domain.Exact...),
-			Suffix:  append([]string{}, match.Domain.Suffix...),
-			Keyword: append([]string{}, match.Domain.Keyword...),
-			Regex:   append([]string{}, match.Domain.Regex...),
-		},
-		IPCIDR:      append([]string{}, match.IPCIDR...),
-		GeoIP:       append([]string{}, match.GeoIP...),
-		GeoSite:     append([]string{}, match.GeoSite...),
-		RuleSetRefs: append([]string{}, match.RuleSetRefs...),
-		Process: RuleProcessMatch{
-			NameContains: append([]string{}, match.Process.NameContains...),
-			PathContains: append([]string{}, match.Process.PathContains...),
-			PathRegex:    append([]string{}, match.Process.PathRegex...),
-		},
-	}
 }
 
 func normalizeRuleItems(
@@ -2996,7 +6647,7 @@ func hasAnyRuleMatcher(match RuleMatch) bool {
 		len(match.Process.PathRegex) > 0
 }
 
-func hasEnabledFastestRule(snapshot StateSnapshot) bool {
+func hasReferencedNodePoolRule(snapshot StateSnapshot) bool {
 	config := snapshot.RuleConfigV2
 	if len(config.PolicyGroups) == 0 {
 		return false
@@ -3006,11 +6657,12 @@ func hasEnabledFastestRule(snapshot StateSnapshot) bool {
 		policyByID[group.ID] = group
 	}
 	referenced := map[string]struct{}{}
-	if policyID := strings.TrimSpace(config.Defaults.OnMatch); policyID != "" {
-		referenced[policyID] = struct{}{}
+	onMissPolicy := "direct"
+	if resolveActiveRuleGroupOnMissMode(config) == RuleMissModeProxy {
+		onMissPolicy = "proxy"
 	}
-	if policyID := strings.TrimSpace(config.Defaults.OnMiss); policyID != "" {
-		referenced[policyID] = struct{}{}
+	if onMissPolicy != "" {
+		referenced[onMissPolicy] = struct{}{}
 	}
 	for _, rule := range config.Rules {
 		if !rule.Enabled {
@@ -3021,7 +6673,7 @@ func hasEnabledFastestRule(snapshot StateSnapshot) bool {
 		}
 		policyID := strings.TrimSpace(rule.Action.TargetPolicy)
 		if policyID == "" {
-			policyID = strings.TrimSpace(config.Defaults.OnMatch)
+			policyID = "proxy"
 		}
 		if policyID != "" {
 			referenced[policyID] = struct{}{}
@@ -3032,34 +6684,9 @@ func hasEnabledFastestRule(snapshot StateSnapshot) bool {
 		if !ok || group.Type != RulePolicyGroupTypeNodePool || group.NodePool == nil {
 			continue
 		}
-		if len(group.NodePool.Nodes) == 0 {
-			continue
-		}
-		if normalizeRuleNodeSelectStrategy(group.NodePool.NodeSelectStrategy) == RuleNodeSelectFastest {
-			return true
-		}
+		return true
 	}
 	return false
-}
-
-func buildRuleReloadSignature(config RuleConfigV2) string {
-	payload := struct {
-		ActiveGroupID string       `json:"activeGroupId"`
-		Defaults      RuleDefaults `json:"defaults"`
-		Rules         []RuleItemV2 `json:"rules"`
-	}{
-		ActiveGroupID: strings.TrimSpace(config.ActiveComposedRuleGroupID),
-		Defaults: RuleDefaults{
-			OnMatch: strings.TrimSpace(config.Defaults.OnMatch),
-			OnMiss:  strings.TrimSpace(config.Defaults.OnMiss),
-		},
-		Rules: append([]RuleItemV2(nil), config.Rules...),
-	}
-	raw, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Sprintf("%s|%d|%s|%s", payload.ActiveGroupID, len(payload.Rules), payload.Defaults.OnMatch, payload.Defaults.OnMiss)
-	}
-	return string(raw)
 }
 
 func cloneRuleConfigV2(config RuleConfigV2) RuleConfigV2 {
@@ -3163,6 +6790,24 @@ func isValidProxyMode(mode ProxyMode) bool {
 	}
 }
 
+func isValidConfiguredProxyMode(mode ProxyMode) bool {
+	switch mode {
+	case ProxyModeSystem, ProxyModeTun:
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeConfiguredProxyMode(mode ProxyMode) ProxyMode {
+	switch normalizeProxyMode(mode) {
+	case ProxyModeTun:
+		return ProxyModeTun
+	default:
+		return ProxyModeSystem
+	}
+}
+
 func inferProxyMode(tunEnabled bool, systemProxyEnabled bool) ProxyMode {
 	if tunEnabled {
 		return ProxyModeTun
@@ -3188,14 +6833,166 @@ func applyProxyModeToState(state *StateSnapshot, mode ProxyMode) {
 	}
 }
 
-func shouldReloadRuntimeForSettings(previous StateSnapshot, current StateSnapshot) bool {
-	if current.ProxyMode == ProxyModeOff {
+func toSnapshotRuntimeApplyStrategy(strategy runtimeApplyStrategy) RuntimeApplyStrategy {
+	switch strategy {
+	case runtimeApplyStrategyHotPatch:
+		return RuntimeApplyStrategyHotPatch
+	case runtimeApplyStrategyFastRestart:
+		return RuntimeApplyStrategyFastRestart
+	case runtimeApplyStrategyNoop:
+		return RuntimeApplyStrategyNoop
+	default:
+		trimmed := strings.TrimSpace(string(strategy))
+		if trimmed == "" {
+			return RuntimeApplyStrategyNoop
+		}
+		return RuntimeApplyStrategy(trimmed)
+	}
+}
+
+func newRuntimeApplyStatus(
+	operation RuntimeApplyOperation,
+	strategy RuntimeApplyStrategy,
+	changeSetSummary string,
+	success bool,
+	rollbackApplied bool,
+	err error,
+	restartRequired ...bool,
+) *RuntimeApplyStatus {
+	resolvedSummary := strings.TrimSpace(changeSetSummary)
+	if resolvedSummary == "" {
+		resolvedSummary = "none"
+	}
+	resolvedStrategy := strategy
+	if strings.TrimSpace(string(resolvedStrategy)) == "" {
+		resolvedStrategy = RuntimeApplyStrategyNoop
+	}
+	resolvedRestartRequired := false
+	if len(restartRequired) > 0 {
+		resolvedRestartRequired = restartRequired[0]
+	}
+	result := RuntimeApplyResultSavedOnly
+	switch {
+	case !success:
+		result = RuntimeApplyResultApplyFailed
+	case resolvedRestartRequired:
+		result = RuntimeApplyResultRestartRequired
+	case resolvedStrategy == RuntimeApplyStrategyHotPatch ||
+		resolvedStrategy == RuntimeApplyStrategyFastRestart:
+		result = RuntimeApplyResultHotApplied
+	}
+	status := &RuntimeApplyStatus{
+		Operation:        operation,
+		Strategy:         resolvedStrategy,
+		Result:           result,
+		ChangeSetSummary: resolvedSummary,
+		Success:          success,
+		RollbackApplied:  rollbackApplied,
+		RestartRequired:  resolvedRestartRequired,
+		TimestampMS:      time.Now().UnixMilli(),
+	}
+	if err != nil {
+		status.Error = err.Error()
+	}
+	return status
+}
+
+func (s *RuntimeStore) setLastRuntimeApplyLocked(status *RuntimeApplyStatus) {
+	s.state.LastRuntimeApply = status
+}
+
+func (s *RuntimeStore) publishRuntimeApplyPushLocked(status *RuntimeApplyStatus) {
+	if status == nil {
+		return
+	}
+	s.publishPushEventLocked(newRuntimeApplyPushEvent(s.state.StateRevision, *status))
+}
+
+func updateProxyStartedAtAfterSettingsApply(
+	current *StateSnapshot,
+	previous StateSnapshot,
+	strategy runtimeApplyStrategy,
+) {
+	if current == nil {
+		return
+	}
+	if normalizeProxyMode(current.ProxyMode) == ProxyModeOff {
+		current.ProxyStartedAtMS = 0
+		return
+	}
+	if strategy == runtimeApplyStrategyFastRestart {
+		current.ProxyStartedAtMS = time.Now().UnixMilli()
+		return
+	}
+	if normalizeProxyMode(previous.ProxyMode) == ProxyModeOff || current.ProxyStartedAtMS <= 0 {
+		current.ProxyStartedAtMS = time.Now().UnixMilli()
+	}
+}
+
+func (s *RuntimeStore) applyRuntimeWithRollback(nextSnapshot StateSnapshot, rollbackSnapshot StateSnapshot) error {
+	return s.runtimeCoordinatorOrDefault().ApplyFastRestart(
+		nextSnapshot,
+		rollbackSnapshot,
+		"apply_runtime",
+		false,
+	)
+}
+
+func shouldFallbackMuxProtocolToH2(snapshot StateSnapshot, err error) bool {
+	if err == nil {
 		return false
 	}
+	if snapshot.ProxyMode == ProxyModeOff || !snapshot.Mux.Enabled {
+		return false
+	}
+	protocol := normalizeProxyMuxProtocol(snapshot.Mux.Protocol)
+	if protocol == "" || protocol == ProxyMuxProtocolH2Mux {
+		return false
+	}
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	if message == "" {
+		return false
+	}
+	return strings.Contains(message, "mux post-check failed")
+}
+
+func (s *RuntimeStore) runtimeApplier() *runtimeApplyManager {
+	if s.applyManager == nil {
+		s.applyManager = newRuntimeApplyManager(s.runtime)
+	}
+	return s.applyManager
+}
+
+func (s *RuntimeStore) onRuntimeCoordinatorLockWait(wait time.Duration, reason string) {
+	if wait < runtimeCoordinatorWaitWarnThreshold {
+		return
+	}
+	s.LogCore(
+		LogLevelWarn,
+		fmt.Sprintf(
+			"runtime coordinator lock wait: wait_ms=%d reason=%s",
+			wait.Milliseconds(),
+			strings.TrimSpace(reason),
+		),
+	)
+}
+
+func (s *RuntimeStore) runtimeCoordinatorOrDefault() *RuntimeCoordinator {
+	if s.runtimeCoordinator == nil {
+		s.runtimeCoordinator = newRuntimeCoordinator(
+			s.runtime,
+			s.runtimeApplier(),
+			s.onRuntimeCoordinatorLockWait,
+		)
+	}
+	return s.runtimeCoordinator
+}
+
+func shouldReloadRuntimeForSettings(previous StateSnapshot, current StateSnapshot) bool {
 	if previous.ProxyMode != current.ProxyMode {
 		return true
 	}
-	if current.ProxyMode == ProxyModeSystem {
+	if current.ProxyMode != ProxyModeOff {
 		if previous.LocalProxyPort != current.LocalProxyPort {
 			return true
 		}
@@ -3203,8 +7000,13 @@ func shouldReloadRuntimeForSettings(previous StateSnapshot, current StateSnapsho
 			return true
 		}
 	}
-	if previous.ProxyLogLevel != current.ProxyLogLevel {
-		return true
+	if current.ProxyMode == ProxyModeTun {
+		if previous.TunMTU != current.TunMTU {
+			return true
+		}
+		if normalizeProxyTunStack(previous.TunStack) != normalizeProxyTunStack(current.TunStack) {
+			return true
+		}
 	}
 	if previous.SniffEnabled != current.SniffEnabled {
 		return true
@@ -3215,34 +7017,16 @@ func shouldReloadRuntimeForSettings(previous StateSnapshot, current StateSnapsho
 	if previous.SniffTimeoutMS != current.SniffTimeoutMS {
 		return true
 	}
-	if previous.DNSRemoteServer != current.DNSRemoteServer {
+	if previous.BlockQUIC != current.BlockQUIC {
 		return true
 	}
-	if previous.DNSDirectServer != current.DNSDirectServer {
+	if previous.BlockUDP != current.BlockUDP {
 		return true
 	}
-	if previous.DNSBootstrapServer != current.DNSBootstrapServer {
+	if !isProxyMuxConfigEqual(previous.Mux, current.Mux) {
 		return true
 	}
-	if previous.DNSStrategy != current.DNSStrategy {
-		return true
-	}
-	if previous.DNSIndependentCache != current.DNSIndependentCache {
-		return true
-	}
-	if previous.DNSCacheFileEnabled != current.DNSCacheFileEnabled {
-		return true
-	}
-	if previous.DNSCacheStoreRDRC != current.DNSCacheStoreRDRC {
-		return true
-	}
-	if previous.DNSFakeIPEnabled != current.DNSFakeIPEnabled {
-		return true
-	}
-	if previous.DNSFakeIPV4Range != current.DNSFakeIPV4Range {
-		return true
-	}
-	if previous.DNSFakeIPV6Range != current.DNSFakeIPV6Range {
+	if !isDNSConfigEqual(previous.DNS, current.DNS) {
 		return true
 	}
 	return false
@@ -3264,28 +7048,43 @@ type rulePoolSelection struct {
 }
 
 func (s *RuntimeStore) applyRulePoolSelectionsHot(snapshot StateSnapshot) error {
+	return s.runtimeCoordinatorOrDefault().WithRuntime(
+		"hot_switch_rule_pool",
+		func(runtime *proxyRuntime) error {
+			return applyRulePoolSelectionsHotWithRuntime(runtime, snapshot)
+		},
+	)
+}
+
+func applyRulePoolSelectionsHotWithRuntime(runtime *proxyRuntime, snapshot StateSnapshot) error {
 	if snapshot.ProxyMode == ProxyModeOff {
 		return nil
 	}
+	switched := false
 	if strings.TrimSpace(snapshot.SelectedNodeID) != "" {
-		if err := s.runtime.SwitchSelectedNode(snapshot.SelectedNodeID); err != nil {
+		if err := runtime.SwitchSelectedNode(snapshot.SelectedNodeID); err != nil {
 			return fmt.Errorf("switch selected node failed: %w", err)
 		}
+		switched = true
 	}
 	selections := computeRulePoolSelections(snapshot)
 	for _, selection := range selections {
-		if err := s.runtime.SwitchSelectorOutbound(selection.selectorTag, selection.outboundTag); err != nil {
+		if err := runtime.SwitchSelectorOutbound(selection.selectorTag, selection.outboundTag); err != nil {
 			return fmt.Errorf("switch rule pool %s failed: %w", selection.selectorTag, err)
 		}
+		switched = true
+	}
+	if !switched {
+		return nil
+	}
+	if err := runtime.CloseAllConnections(); err != nil {
+		return fmt.Errorf("close old connections failed: %w", err)
 	}
 	return nil
 }
 
 func computeRulePoolSelections(snapshot StateSnapshot) []rulePoolSelection {
 	activeNodes := resolveActiveGroupNodes(snapshot)
-	if len(activeNodes) == 0 {
-		return nil
-	}
 	config := snapshot.RuleConfigV2
 	if len(config.PolicyGroups) == 0 {
 		return nil
@@ -3308,19 +7107,14 @@ func computeRulePoolSelections(snapshot StateSnapshot) []rulePoolSelection {
 		if group.Type != RulePolicyGroupTypeNodePool || group.NodePool == nil {
 			continue
 		}
-		nodeIDs := resolveNodePoolRefsToNodeIDs(group.NodePool.Nodes, activeNodes)
-		if len(nodeIDs) == 0 {
-			continue
-		}
-		selectedNodeID := nodeIDs[0]
-		if normalizeRuleNodeSelectStrategy(group.NodePool.NodeSelectStrategy) == RuleNodeSelectFastest {
-			if fastestNodeID, ok := pickBestRulePoolNodeID(nodeIDs, nodeByID); ok {
-				selectedNodeID = fastestNodeID
-			}
+		decision := resolveRulePoolDecision(group.NodePool, activeNodes, nodeByID)
+		selectedOutboundTag := decision.fallbackOutboundTag
+		if strings.TrimSpace(decision.selectedNodeID) != "" {
+			selectedOutboundTag = runtimeNodeTag(decision.selectedNodeID)
 		}
 		selections = append(selections, rulePoolSelection{
 			selectorTag: buildPolicyGroupSelectorTag(group.ID, index),
-			outboundTag: runtimeNodeTag(selectedNodeID),
+			outboundTag: selectedOutboundTag,
 		})
 	}
 	return selections
@@ -3328,11 +7122,12 @@ func computeRulePoolSelections(snapshot StateSnapshot) []rulePoolSelection {
 
 func collectReferencedPolicyIDs(config RuleConfigV2) map[string]struct{} {
 	referenced := map[string]struct{}{}
-	if policyID := strings.TrimSpace(config.Defaults.OnMatch); policyID != "" {
-		referenced[policyID] = struct{}{}
+	onMissPolicy := "direct"
+	if resolveActiveRuleGroupOnMissMode(config) == RuleMissModeProxy {
+		onMissPolicy = "proxy"
 	}
-	if policyID := strings.TrimSpace(config.Defaults.OnMiss); policyID != "" {
-		referenced[policyID] = struct{}{}
+	if onMissPolicy != "" {
+		referenced[onMissPolicy] = struct{}{}
 	}
 	for _, rule := range config.Rules {
 		if !rule.Enabled || normalizeRuleActionType(rule.Action.Type) != RuleActionTypeRoute {
@@ -3340,7 +7135,7 @@ func collectReferencedPolicyIDs(config RuleConfigV2) map[string]struct{} {
 		}
 		policyID := strings.TrimSpace(rule.Action.TargetPolicy)
 		if policyID == "" {
-			policyID = strings.TrimSpace(config.Defaults.OnMatch)
+			policyID = "proxy"
 		}
 		if policyID != "" {
 			referenced[policyID] = struct{}{}
@@ -3459,6 +7254,241 @@ func resolveNodePoolRefsToNodeIDs(refs []RuleNodeRef, activeNodes []Node) []stri
 	return result
 }
 
+type rulePoolDecision struct {
+	candidateNodeIDs    []string
+	selectedNodeID      string
+	fallbackOutboundTag string
+}
+
+func resolveRulePoolFallbackOutboundTag(pool *RuleNodePool) string {
+	if pool == nil {
+		return "block"
+	}
+	if normalizeRuleNodePoolFallbackMode(pool.FallbackMode) == RuleNodePoolFallbackActiveNode {
+		return proxySelectorTag
+	}
+	return "block"
+}
+
+func resolveRulePoolCandidateNodeIDs(pool *RuleNodePool, activeNodes []Node) []string {
+	if pool == nil {
+		return nil
+	}
+	resolvedByRefs := resolveNodePoolRefsToNodeIDs(pool.Nodes, activeNodes)
+	availableNodeIDs := normalizeRuleNodePoolAvailableNodeIDs(pool.AvailableNodeIDs)
+	if len(availableNodeIDs) == 0 {
+		return resolvedByRefs
+	}
+	if len(resolvedByRefs) == 0 {
+		return nil
+	}
+	allowed := map[string]struct{}{}
+	for _, nodeID := range resolvedByRefs {
+		allowed[strings.ToLower(strings.TrimSpace(nodeID))] = struct{}{}
+	}
+	filtered := make([]string, 0, len(availableNodeIDs))
+	seen := map[string]struct{}{}
+	for _, rawNodeID := range availableNodeIDs {
+		nodeID := strings.TrimSpace(rawNodeID)
+		if nodeID == "" {
+			continue
+		}
+		normalizedNodeID := strings.ToLower(nodeID)
+		if _, ok := allowed[normalizedNodeID]; !ok {
+			continue
+		}
+		if _, ok := seen[normalizedNodeID]; ok {
+			continue
+		}
+		seen[normalizedNodeID] = struct{}{}
+		filtered = append(filtered, nodeID)
+	}
+	return filtered
+}
+
+func isRulePoolNodeAvailableByProbe(node Node) bool {
+	return node.LatencyMS > 0 && node.ProbeRealConnectMS > 0 && node.ProbeScore > 0
+}
+
+func isRulePoolProbeTimestampFresh(timestampMS int64, nowMS int64, intervalMS int64) bool {
+	if timestampMS <= 0 {
+		return false
+	}
+	if nowMS <= timestampMS {
+		return true
+	}
+	return nowMS-timestampMS < intervalMS
+}
+
+func canReuseRulePoolProbeScore(node Node, nowMS int64, intervalMS int64) bool {
+	if !isRulePoolNodeAvailableByProbe(node) {
+		return false
+	}
+	return isRulePoolProbeTimestampFresh(node.LatencyProbedAtMS, nowMS, intervalMS) &&
+		isRulePoolProbeTimestampFresh(node.RealConnectProbedAtMS, nowMS, intervalMS)
+}
+
+func buildRulePoolTopAvailableNodeIDs(pool *RuleNodePool, activeNodes []Node) []string {
+	if pool == nil {
+		return nil
+	}
+	candidateIDs := resolveNodePoolRefsToNodeIDs(pool.Nodes, activeNodes)
+	if len(candidateIDs) == 0 {
+		return nil
+	}
+	nodeByID := make(map[string]Node, len(activeNodes))
+	for _, node := range activeNodes {
+		nodeByID[node.ID] = node
+	}
+	candidates := make([]Node, 0, len(candidateIDs))
+	for _, nodeID := range candidateIDs {
+		node, ok := nodeByID[nodeID]
+		if !ok || !isRulePoolNodeAvailableByProbe(node) {
+			continue
+		}
+		candidates = append(candidates, node)
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		scoreDiff := candidates[i].ProbeScore - candidates[j].ProbeScore
+		if math.Abs(scoreDiff) > 0.0001 {
+			return scoreDiff > 0
+		}
+		realConnectDiff := candidates[i].ProbeRealConnectMS - candidates[j].ProbeRealConnectMS
+		if realConnectDiff != 0 {
+			return realConnectDiff < 0
+		}
+		return candidates[i].LatencyMS < candidates[j].LatencyMS
+	})
+	result := make([]string, 0, 5)
+	for _, node := range candidates {
+		result = append(result, node.ID)
+		if len(result) >= 5 {
+			break
+		}
+	}
+	return normalizeRuleNodePoolAvailableNodeIDs(result)
+}
+
+func refreshReferencedRulePoolAvailableNodeIDs(snapshot *StateSnapshot) int {
+	if snapshot == nil {
+		return 0
+	}
+	referencedPolicies := collectReferencedPolicyIDs(snapshot.RuleConfigV2)
+	activeNodes := resolveActiveGroupNodes(*snapshot)
+	updatedCount := 0
+	for index := range snapshot.RuleConfigV2.PolicyGroups {
+		group := &snapshot.RuleConfigV2.PolicyGroups[index]
+		if _, ok := referencedPolicies[group.ID]; !ok {
+			continue
+		}
+		if group.Type != RulePolicyGroupTypeNodePool || group.NodePool == nil {
+			continue
+		}
+		nextAvailable := buildRulePoolTopAvailableNodeIDs(group.NodePool, activeNodes)
+		currentAvailable := normalizeRuleNodePoolAvailableNodeIDs(group.NodePool.AvailableNodeIDs)
+		if len(currentAvailable) == len(nextAvailable) {
+			same := true
+			for itemIndex := range currentAvailable {
+				if currentAvailable[itemIndex] != nextAvailable[itemIndex] {
+					same = false
+					break
+				}
+			}
+			if same {
+				continue
+			}
+		}
+		group.NodePool.AvailableNodeIDs = nextAvailable
+		updatedCount++
+	}
+	return updatedCount
+}
+
+func stripRuleConfigNodePoolAvailableNodeIDs(config *RuleConfigV2) {
+	if config == nil {
+		return
+	}
+	for index := range config.PolicyGroups {
+		group := &config.PolicyGroups[index]
+		if group.Type != RulePolicyGroupTypeNodePool || group.NodePool == nil {
+			continue
+		}
+		group.NodePool.AvailableNodeIDs = nil
+	}
+}
+
+func stripSnapshotNodePoolAvailableNodeIDs(snapshot *StateSnapshot) {
+	if snapshot == nil {
+		return
+	}
+	stripRuleConfigNodePoolAvailableNodeIDs(&snapshot.RuleConfigV2)
+	for index := range snapshot.RuleProfiles {
+		stripRuleConfigNodePoolAvailableNodeIDs(&snapshot.RuleProfiles[index].Config)
+	}
+}
+
+func pickFirstRulePoolNodeIDByProbe(nodeIDs []string, nodeByID map[string]Node) (string, bool) {
+	for _, nodeID := range nodeIDs {
+		node, ok := nodeByID[nodeID]
+		if !ok {
+			continue
+		}
+		if !isRulePoolNodeAvailableByProbe(node) {
+			continue
+		}
+		return nodeID, true
+	}
+	return "", false
+}
+
+func pickFirstRulePoolNodeIDByLatency(nodeIDs []string, nodeByID map[string]Node) (string, bool) {
+	for _, nodeID := range nodeIDs {
+		node, ok := nodeByID[nodeID]
+		if !ok || node.LatencyMS <= 0 {
+			continue
+		}
+		return nodeID, true
+	}
+	return "", false
+}
+
+func resolveRulePoolDecision(pool *RuleNodePool, activeNodes []Node, nodeByID map[string]Node) rulePoolDecision {
+	decision := rulePoolDecision{
+		candidateNodeIDs:    nil,
+		selectedNodeID:      "",
+		fallbackOutboundTag: resolveRulePoolFallbackOutboundTag(pool),
+	}
+	if pool == nil {
+		return decision
+	}
+	if !pool.Enabled {
+		return decision
+	}
+	candidateNodeIDs := resolveRulePoolCandidateNodeIDs(pool, activeNodes)
+	decision.candidateNodeIDs = candidateNodeIDs
+	if len(candidateNodeIDs) == 0 {
+		return decision
+	}
+	hasAvailableNodeHints := len(normalizeRuleNodePoolAvailableNodeIDs(pool.AvailableNodeIDs)) > 0
+	if hasAvailableNodeHints {
+		if selectedNodeID, ok := pickFirstRulePoolNodeIDByProbe(candidateNodeIDs, nodeByID); ok {
+			decision.selectedNodeID = selectedNodeID
+		}
+		return decision
+	}
+	switch normalizeRuleNodeSelectStrategy(pool.NodeSelectStrategy) {
+	case RuleNodeSelectFirst:
+		if selectedNodeID, ok := pickFirstRulePoolNodeIDByLatency(candidateNodeIDs, nodeByID); ok {
+			decision.selectedNodeID = selectedNodeID
+		}
+	default:
+		if selectedNodeID, ok := pickBestRulePoolNodeID(candidateNodeIDs, nodeByID); ok {
+			decision.selectedNodeID = selectedNodeID
+		}
+	}
+	return decision
+}
+
 func pickBestRulePoolNodeID(nodeIDs []string, nodeByID map[string]Node) (string, bool) {
 	bestNodeID := ""
 	bestLatency := 0
@@ -3488,34 +7518,72 @@ func syncSystemProxy(snapshot StateSnapshot) error {
 func (s *RuntimeStore) runRuleAutoProbeLoop() {
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
-	lastRun := time.Now().Unix()
+	lastRun := int64(0)
 	for {
 		select {
 		case <-ticker.C:
 			snapshot, shouldProbe := s.snapshotForRuleAutoProbe()
 			if !shouldProbe {
+				lastRun = 0
 				continue
 			}
-			intervalSec := snapshot.RuleConfigV2.ProbeIntervalSec
+			intervalMin := snapshot.ProbeSettings.ProbeIntervalMin
+			if !isAllowedProbeIntervalMin(intervalMin) {
+				intervalMin = defaultProbeIntervalMin
+			}
+			intervalSec := intervalMin * 60
 			if intervalSec < minRuleProbeIntervalSec {
 				intervalSec = minRuleProbeIntervalSec
 			}
 			nowSec := time.Now().Unix()
-			if nowSec-lastRun < int64(intervalSec) {
+			if lastRun > 0 && nowSec-lastRun < int64(intervalSec) {
 				continue
 			}
 			lastRun = nowSec
-			if _, err := s.ProbeNodes(context.Background(), ProbeNodesRequest{
-				GroupID:   snapshot.ActiveGroupID,
-				URL:       "https://www.gstatic.com/generate_204",
-				TimeoutMS: 5000,
-			}); err != nil {
-				s.LogCore(LogLevelWarn, fmt.Sprintf("rule auto probe skipped: %v", err))
-			}
+			s.enqueueActiveGroupAutoProbe(snapshot)
 		case <-s.autoProbeStop:
 			return
 		}
 	}
+}
+
+func (s *RuntimeStore) enqueueActiveGroupAutoProbe(snapshot StateSnapshot) {
+	activeGroupID := strings.TrimSpace(snapshot.ActiveGroupID)
+	if activeGroupID == "" {
+		return
+	}
+	groupName := activeGroupID
+	if group := findGroupByID(snapshot.Groups, activeGroupID); group != nil {
+		groupName = strings.TrimSpace(group.Name)
+		if groupName == "" {
+			groupName = activeGroupID
+		}
+	}
+	title := "自动评分活动分组"
+	if groupName != "" {
+		title = fmt.Sprintf("自动评分活动分组：%s", groupName)
+	}
+	s.taskQueue.EnqueueLatest(
+		runtimeTaskOptions{
+			TaskType:     BackgroundTaskTypeAutoProbe,
+			ScopeKey:     "scheduled:auto_probe:active_group",
+			Title:        title,
+			ProgressText: "等待定时自动评分",
+			SuccessText:  "活动分组自动评分完成",
+		},
+		func(handle runtimeTaskHandle) error {
+			handle.UpdateProgress("执行活动分组自动评分")
+			_, _, err := s.probeNodesNow(context.Background(), ProbeNodesRequest{
+				GroupID:   activeGroupID,
+				TimeoutMS: 5000,
+				ProbeType: ProbeTypeRealConnect,
+			}, handle)
+			if err != nil {
+				s.LogCore(LogLevelWarn, fmt.Sprintf("rule auto score skipped: %v", err))
+			}
+			return err
+		},
+	)
 }
 
 func (s *RuntimeStore) snapshotForRuleAutoProbe() (StateSnapshot, bool) {
@@ -3524,7 +7592,7 @@ func (s *RuntimeStore) snapshotForRuleAutoProbe() (StateSnapshot, bool) {
 	if s.state.ConnectionStage != ConnectionConnected {
 		return StateSnapshot{}, false
 	}
-	if s.state.ProxyMode == ProxyModeOff {
+	if !s.state.ProbeSettings.AutoProbeOnActiveGroup {
 		return StateSnapshot{}, false
 	}
 	if strings.TrimSpace(s.state.ActiveGroupID) == "" {
@@ -3541,19 +7609,282 @@ func (s *RuntimeStore) snapshotForRuleAutoProbe() (StateSnapshot, bool) {
 	if !hasActiveGroupNodes {
 		return StateSnapshot{}, false
 	}
-	if !hasEnabledFastestRule(s.state) {
-		return StateSnapshot{}, false
-	}
 	return cloneSnapshot(s.state), true
 }
 
+func (s *RuntimeStore) runConnectionsStatsLoop() {
+	for {
+		intervalSec := s.currentTrafficMonitorIntervalSec()
+		waitDuration := time.Second
+		if intervalSec > 0 {
+			waitDuration = time.Duration(intervalSec) * time.Second
+		}
+		timer := time.NewTimer(waitDuration)
+		select {
+		case <-timer.C:
+			if intervalSec <= 0 {
+				s.mu.Lock()
+				s.resetTrafficSamplingBaselineLocked()
+				s.mu.Unlock()
+				continue
+			}
+			nowMS := time.Now().UnixMilli()
+			if !s.shouldSampleConnectionsStats(nowMS) {
+				continue
+			}
+			trafficStats, err := s.runtime.QueryConnectionsStats()
+			if err != nil {
+				continue
+			}
+			s.mu.Lock()
+			s.refreshSessionObservabilityLocked(nowMS)
+			if s.state.ConnectionStage != ConnectionConnected ||
+				normalizeTrafficMonitorIntervalSec(s.state.TrafficMonitorIntervalSec) <= 0 {
+				s.mu.Unlock()
+				continue
+			}
+			s.enrichTrafficTickLocked(&trafficStats, nowMS, intervalSec)
+			s.persistTrafficStatsIfNeededLocked(nowMS, false)
+			s.publishPushEventLocked(newTrafficTickPushEvent(s.state.StateRevision, trafficStats))
+			s.mu.Unlock()
+		case <-s.connectionStatsStop:
+			timer.Stop()
+			return
+		}
+	}
+}
+
+func (s *RuntimeStore) currentTrafficMonitorIntervalSec() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return normalizeTrafficMonitorIntervalSec(s.state.TrafficMonitorIntervalSec)
+}
+
+func (s *RuntimeStore) resetTrafficSamplingBaselineLocked() {
+	s.lastTrafficSampleAtMS = 0
+	s.lastTrafficUploadBytes = 0
+	s.lastTrafficDownloadBytes = 0
+	s.lastTrafficNodeCounters = map[string]trafficNodeCounter{}
+}
+
+func nonNegativeTrafficDelta(current int64, previous int64) int64 {
+	if current <= previous {
+		return 0
+	}
+	return current - previous
+}
+
+func trafficRateFromDelta(deltaBytes int64, elapsedSec float64) int64 {
+	if deltaBytes <= 0 || elapsedSec <= 0 {
+		return 0
+	}
+	value := int64(float64(deltaBytes) / elapsedSec)
+	if value < 0 {
+		return 0
+	}
+	return value
+}
+
+func trafficBytesToMB(value int64) float64 {
+	if value <= 0 {
+		return 0
+	}
+	return float64(value) / float64(1024*1024)
+}
+
+func trafficMBToBytes(value float64) int64 {
+	if math.IsNaN(value) || math.IsInf(value, 0) || value <= 0 {
+		return 0
+	}
+	return int64(math.Round(value * 1024 * 1024))
+}
+
+func (s *RuntimeStore) findNodeByIDLocked(nodeID string) *Node {
+	trimmedID := strings.TrimSpace(nodeID)
+	if trimmedID == "" {
+		return nil
+	}
+	for groupIndex := range s.state.Groups {
+		for nodeIndex := range s.state.Groups[groupIndex].Nodes {
+			if s.state.Groups[groupIndex].Nodes[nodeIndex].ID == trimmedID {
+				return &s.state.Groups[groupIndex].Nodes[nodeIndex]
+			}
+		}
+	}
+	return nil
+}
+
+func (s *RuntimeStore) resolveNodeTrafficTotalsBytesLocked(nodeID string) (int64, int64, bool) {
+	node := s.findNodeByIDLocked(nodeID)
+	if node == nil {
+		return 0, 0, false
+	}
+	return trafficMBToBytes(node.TotalUploadMB), trafficMBToBytes(node.TotalDownloadMB), true
+}
+
+func (s *RuntimeStore) accumulateNodeTrafficTotalsLocked(nodeID string, uploadDeltaBytes int64, downloadDeltaBytes int64) bool {
+	if uploadDeltaBytes <= 0 && downloadDeltaBytes <= 0 {
+		return false
+	}
+	node := s.findNodeByIDLocked(nodeID)
+	if node == nil {
+		return false
+	}
+	if uploadDeltaBytes > 0 {
+		node.TotalUploadMB += trafficBytesToMB(uploadDeltaBytes)
+	}
+	if downloadDeltaBytes > 0 {
+		node.TotalDownloadMB += trafficBytesToMB(downloadDeltaBytes)
+	}
+	return true
+}
+
+func (s *RuntimeStore) enrichTrafficTickLocked(
+	traffic *TrafficTickPayload,
+	nowMS int64,
+	sampleIntervalSec int,
+) {
+	if traffic == nil {
+		return
+	}
+	if sampleIntervalSec <= 0 {
+		sampleIntervalSec = normalizeTrafficMonitorIntervalSec(s.state.TrafficMonitorIntervalSec)
+	}
+	if sampleIntervalSec <= 0 {
+		sampleIntervalSec = 1
+	}
+	traffic.SampleIntervalSec = sampleIntervalSec
+	elapsedSec := float64(sampleIntervalSec)
+	if s.lastTrafficSampleAtMS > 0 {
+		elapsedMs := nowMS - s.lastTrafficSampleAtMS
+		if elapsedMs > 0 {
+			elapsedSec = float64(elapsedMs) / 1000.0
+		}
+	}
+	if elapsedSec <= 0 {
+		elapsedSec = float64(sampleIntervalSec)
+	}
+	if elapsedSec <= 0 {
+		elapsedSec = 1
+	}
+
+	nextNodeCounters := make(map[string]trafficNodeCounter, len(traffic.Nodes))
+	if s.lastTrafficSampleAtMS <= 0 {
+		for index := range traffic.Nodes {
+			node := &traffic.Nodes[index]
+			nextNodeCounters[node.NodeID] = trafficNodeCounter{
+				UploadBytes:   node.UploadBytes,
+				DownloadBytes: node.DownloadBytes,
+			}
+			if totalUploadBytes, totalDownloadBytes, ok := s.resolveNodeTrafficTotalsBytesLocked(node.NodeID); ok {
+				node.TotalUploadBytes = totalUploadBytes
+				node.TotalDownloadBytes = totalDownloadBytes
+			}
+		}
+		s.lastTrafficSampleAtMS = nowMS
+		s.lastTrafficUploadBytes = traffic.UploadBytes
+		s.lastTrafficDownloadBytes = traffic.DownloadBytes
+		s.lastTrafficNodeCounters = nextNodeCounters
+		return
+	}
+
+	traffic.UploadDeltaBytes = nonNegativeTrafficDelta(traffic.UploadBytes, s.lastTrafficUploadBytes)
+	traffic.DownloadDeltaBytes = nonNegativeTrafficDelta(traffic.DownloadBytes, s.lastTrafficDownloadBytes)
+	traffic.UploadRateBps = trafficRateFromDelta(traffic.UploadDeltaBytes, elapsedSec)
+	traffic.DownloadRateBps = trafficRateFromDelta(traffic.DownloadDeltaBytes, elapsedSec)
+
+	var nodeUploadRateTotal int64
+	var nodeDownloadRateTotal int64
+	nodeTotalsChanged := false
+	for index := range traffic.Nodes {
+		node := &traffic.Nodes[index]
+		previousCounter := s.lastTrafficNodeCounters[node.NodeID]
+		node.UploadDeltaBytes = nonNegativeTrafficDelta(node.UploadBytes, previousCounter.UploadBytes)
+		node.DownloadDeltaBytes = nonNegativeTrafficDelta(node.DownloadBytes, previousCounter.DownloadBytes)
+		node.UploadRateBps = trafficRateFromDelta(node.UploadDeltaBytes, elapsedSec)
+		node.DownloadRateBps = trafficRateFromDelta(node.DownloadDeltaBytes, elapsedSec)
+		nodeUploadRateTotal += node.UploadRateBps
+		nodeDownloadRateTotal += node.DownloadRateBps
+		if s.accumulateNodeTrafficTotalsLocked(node.NodeID, node.UploadDeltaBytes, node.DownloadDeltaBytes) {
+			nodeTotalsChanged = true
+		}
+		if totalUploadBytes, totalDownloadBytes, ok := s.resolveNodeTrafficTotalsBytesLocked(node.NodeID); ok {
+			node.TotalUploadBytes = totalUploadBytes
+			node.TotalDownloadBytes = totalDownloadBytes
+		}
+		nextNodeCounters[node.NodeID] = trafficNodeCounter{
+			UploadBytes:   node.UploadBytes,
+			DownloadBytes: node.DownloadBytes,
+		}
+	}
+	traffic.NodeUploadRateBps = nodeUploadRateTotal
+	traffic.NodeDownloadRateBps = nodeDownloadRateTotal
+	if nodeTotalsChanged {
+		s.trafficStatsDirty = true
+	}
+	s.lastTrafficSampleAtMS = nowMS
+	s.lastTrafficUploadBytes = traffic.UploadBytes
+	s.lastTrafficDownloadBytes = traffic.DownloadBytes
+	s.lastTrafficNodeCounters = nextNodeCounters
+}
+
+func (s *RuntimeStore) persistTrafficStatsIfNeededLocked(nowMS int64, force bool) {
+	if !s.trafficStatsDirty {
+		return
+	}
+	if s.stateFile == "" {
+		s.trafficStatsDirty = false
+		s.lastTrafficPersistMS = nowMS
+		return
+	}
+	if !force && s.lastTrafficPersistMS > 0 {
+		minIntervalMS := int64(trafficStatsPersistIntervalSec * 1000)
+		if nowMS-s.lastTrafficPersistMS < minIntervalMS {
+			return
+		}
+	}
+	persisted := cloneSnapshot(s.state)
+	stripRuntimeLogs(&persisted)
+	stripBackgroundTasks(&persisted)
+	stripOperationStatuses(&persisted)
+	s.enqueuePersistSnapshotLocked(persisted)
+	s.trafficStatsDirty = false
+	s.lastTrafficPersistMS = nowMS
+}
+
+func (s *RuntimeStore) shouldSampleConnectionsStats(nowMS int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.refreshSessionObservabilityLocked(nowMS)
+	if s.state.ConnectionStage != ConnectionConnected ||
+		normalizeTrafficMonitorIntervalSec(s.state.TrafficMonitorIntervalSec) <= 0 {
+		s.resetTrafficSamplingBaselineLocked()
+		return false
+	}
+	return true
+}
+
 func (s *RuntimeStore) LogCore(level LogLevel, message string) {
+	level = normalizeLogLevel(level)
+	s.mu.RLock()
+	threshold := normalizeLogLevel(s.state.CoreLogLevel)
+	s.mu.RUnlock()
+	if !shouldRecordLog(level, threshold) {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.appendCoreLogLocked(level, message)
 }
 
 func (s *RuntimeStore) onProxyRuntimeLog(level LogLevel, message string) {
+	level = normalizeLogLevel(level)
+	s.mu.RLock()
+	threshold := normalizeLogLevel(s.state.ProxyLogLevel)
+	s.mu.RUnlock()
+	if !shouldRecordLog(level, threshold) {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.appendProxyLogLocked(level, message)
@@ -3565,7 +7896,7 @@ func (s *RuntimeStore) appendProxyLogLocked(level LogLevel, message string) {
 		s.state.ProxyLogLevel,
 		level,
 		message,
-		s.state.RecordLogsToFile,
+		s.state.ProxyRecordToFile,
 	)
 	s.state.ProxyLogs = nextLogs
 	if entry != nil {
@@ -3582,7 +7913,7 @@ func (s *RuntimeStore) appendCoreLogLocked(level LogLevel, message string) {
 		s.state.CoreLogLevel,
 		level,
 		message,
-		s.state.RecordLogsToFile,
+		s.state.CoreRecordToFile,
 	)
 	s.state.CoreLogs = nextLogs
 	if entry != nil {
@@ -3599,7 +7930,7 @@ func (s *RuntimeStore) appendUILogLocked(level LogLevel, message string) {
 		s.state.UILogLevel,
 		level,
 		message,
-		s.state.RecordLogsToFile,
+		s.state.UIRecordToFile,
 	)
 	s.state.UILogs = nextLogs
 	if entry != nil {
@@ -3646,10 +7977,20 @@ func isValidLogLevel(level LogLevel) bool {
 }
 
 func shouldRecordLog(level LogLevel, threshold LogLevel) bool {
-	if !isValidLogLevel(level) || !isValidLogLevel(threshold) || threshold == LogLevelNone {
+	if !isValidLogLevel(level) || !isValidLogLevel(threshold) || threshold == LogLevelNone || level == LogLevelNone {
 		return false
 	}
 	return logLevelWeight(level) <= logLevelWeight(threshold)
+}
+
+func isFileInUseError(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "used by another process") ||
+		strings.Contains(lower, "resource busy") ||
+		strings.Contains(lower, "sharing violation")
 }
 
 func logLevelWeight(level LogLevel) int {
@@ -3687,6 +8028,26 @@ func normalizeRuntimeLogKind(raw string) (runtimeLogKind, bool) {
 		return runtimeLogKindUI, true
 	default:
 		return "", false
+	}
+}
+
+func syncRecordLogsToFileCompatibility(snapshot *StateSnapshot) {
+	if snapshot == nil {
+		return
+	}
+	snapshot.RecordLogsToFile = snapshot.ProxyRecordToFile || snapshot.CoreRecordToFile || snapshot.UIRecordToFile
+}
+
+func isRuntimeLogRecordToFileEnabled(snapshot StateSnapshot, kind runtimeLogKind) bool {
+	switch kind {
+	case runtimeLogKindProxy:
+		return snapshot.ProxyRecordToFile
+	case runtimeLogKindCore:
+		return snapshot.CoreRecordToFile
+	case runtimeLogKindUI:
+		return snapshot.UIRecordToFile
+	default:
+		return false
 	}
 }
 
@@ -3730,7 +8091,7 @@ func formatRuntimeLogLine(entry RuntimeLogEntry) string {
 }
 
 func (s *RuntimeStore) writeRuntimeLogEntryToFileLocked(kind runtimeLogKind, entry RuntimeLogEntry) {
-	if !s.state.RecordLogsToFile {
+	if !isRuntimeLogRecordToFileEnabled(s.state, kind) {
 		return
 	}
 	filePath := s.runtimeLogFilePathForKind(kind, false)
@@ -3785,6 +8146,56 @@ func newLogPushEvent(kind DaemonPushEventKind, revision int64, entry RuntimeLogE
 	}
 }
 
+func newTrafficTickPushEvent(revision int64, traffic TrafficTickPayload) DaemonPushEvent {
+	trafficCopy := traffic
+	return DaemonPushEvent{
+		Kind:        DaemonPushEventTrafficTick,
+		TimestampMS: time.Now().UnixMilli(),
+		Revision:    revision,
+		Payload: DaemonPushPayload{
+			Traffic: &trafficCopy,
+		},
+	}
+}
+
+func newRuntimeApplyPushEvent(revision int64, status RuntimeApplyStatus) DaemonPushEvent {
+	statusCopy := status
+	return DaemonPushEvent{
+		Kind:        DaemonPushEventRuntimeApply,
+		TimestampMS: time.Now().UnixMilli(),
+		Revision:    revision,
+		Payload: DaemonPushPayload{
+			RuntimeApply: &statusCopy,
+		},
+	}
+}
+
+func newTaskQueuePushEvent(revision int64, tasks []BackgroundTask) DaemonPushEvent {
+	taskCopy := cloneBackgroundTasks(tasks)
+	return DaemonPushEvent{
+		Kind:        DaemonPushEventTaskQueue,
+		TimestampMS: time.Now().UnixMilli(),
+		Revision:    revision,
+		Payload: DaemonPushPayload{
+			TaskQueue: &TaskQueuePayload{
+				Tasks: taskCopy,
+			},
+		},
+	}
+}
+
+func newOperationStatusPushEvent(revision int64, operation OperationStatus) DaemonPushEvent {
+	operationCopy := operation
+	return DaemonPushEvent{
+		Kind:        DaemonPushEventOperationStatus,
+		TimestampMS: time.Now().UnixMilli(),
+		Revision:    revision,
+		Payload: DaemonPushPayload{
+			Operation: &operationCopy,
+		},
+	}
+}
+
 func newSnapshotChangedEvent(snapshot StateSnapshot) DaemonPushEvent {
 	snapshotCopy := snapshot
 	return DaemonPushEvent{
@@ -3797,7 +8208,91 @@ func newSnapshotChangedEvent(snapshot StateSnapshot) DaemonPushEvent {
 	}
 }
 
+func (s *RuntimeStore) currentOperationSnapshot() []OperationStatus {
+	if s == nil || s.operationRegistry == nil {
+		return []OperationStatus{}
+	}
+	return s.operationRegistry.Snapshot()
+}
+
+func (s *RuntimeStore) publishOperationStatus(status OperationStatus) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.publishPushEventLocked(newOperationStatusPushEvent(s.state.StateRevision, status))
+}
+
+func normalizeClientSessionTTLSec(ttlSec int) int {
+	if ttlSec < minClientSessionTTLSec {
+		return defaultClientSessionTTLSec
+	}
+	if ttlSec > maxClientSessionTTLSec {
+		return maxClientSessionTTLSec
+	}
+	return ttlSec
+}
+
+func (s *RuntimeStore) pruneExpiredClientSessionsLocked(nowMS int64) {
+	if len(s.clientSessions) == 0 {
+		return
+	}
+	for sessionID, expireAtMS := range s.clientSessions {
+		if expireAtMS <= nowMS {
+			delete(s.clientSessions, sessionID)
+		}
+	}
+}
+
+func (s *RuntimeStore) refreshSessionObservabilityLocked(nowMS int64) {
+	s.pruneExpiredClientSessionsLocked(nowMS)
+	s.state.ActiveClientSessions = len(s.clientSessions)
+	s.state.ActivePushSubscribers = len(s.pushSubscribers)
+	if s.state.LastClientHeartbeatMS < 0 {
+		s.state.LastClientHeartbeatMS = 0
+	}
+}
+
+func (s *RuntimeStore) TouchClientSession(sessionID string, ttlSec int) int {
+	id := strings.TrimSpace(sessionID)
+	if id == "" {
+		return 0
+	}
+	ttlSec = normalizeClientSessionTTLSec(ttlSec)
+	nowMS := time.Now().UnixMilli()
+	expireAtMS := nowMS + int64(ttlSec*1000)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.clientSessions == nil {
+		s.clientSessions = map[string]int64{}
+	}
+	s.clientSessions[id] = expireAtMS
+	s.state.LastClientHeartbeatMS = nowMS
+	s.refreshSessionObservabilityLocked(nowMS)
+	return s.state.ActiveClientSessions
+}
+
+func (s *RuntimeStore) DisconnectClientSession(sessionID string) int {
+	id := strings.TrimSpace(sessionID)
+	nowMS := time.Now().UnixMilli()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if id != "" && len(s.clientSessions) > 0 {
+		delete(s.clientSessions, id)
+	}
+	if len(s.pushSubscribers) == 0 && len(s.clientSessions) == 0 {
+		s.state.LastClientHeartbeatMS = 0
+	}
+	s.refreshSessionObservabilityLocked(nowMS)
+	return s.state.ActiveClientSessions
+}
+
 func (s *RuntimeStore) publishPushEventLocked(event DaemonPushEvent) {
+	s.refreshSessionObservabilityLocked(time.Now().UnixMilli())
+	if len(s.pushSubscribers) <= 0 {
+		return
+	}
 	for _, subscriber := range s.pushSubscribers {
 		select {
 		case subscriber <- event:
@@ -3815,64 +8310,236 @@ func (s *RuntimeStore) publishPushEventLocked(event DaemonPushEvent) {
 	}
 }
 
-func (s *RuntimeStore) load() error {
-	data, err := os.ReadFile(s.stateFile)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
+func persistSnapshotToFile(stateFile string, snapshot StateSnapshot) error {
+	if strings.TrimSpace(stateFile) == "" {
+		return nil
+	}
+	stripSnapshotNodePoolAvailableNodeIDs(&snapshot)
+	if err := os.MkdirAll(filepath.Dir(stateFile), 0o755); err != nil {
 		return err
+	}
+	data, err := json.MarshalIndent(snapshot, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := stateFile + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, stateFile)
+}
+
+func (s *RuntimeStore) enqueuePersistSnapshotLocked(snapshot StateSnapshot) {
+	if s.persistQueue == nil {
+		_ = persistSnapshotToFile(s.stateFile, snapshot)
+		return
+	}
+	select {
+	case s.persistQueue <- snapshot:
+	default:
+		select {
+		case <-s.persistQueue:
+		default:
+		}
+		select {
+		case s.persistQueue <- snapshot:
+		default:
+		}
+	}
+}
+
+func (s *RuntimeStore) runPersistLoop() {
+	if s.persistQueue == nil {
+		return
+	}
+	for snapshot := range s.persistQueue {
+		latest := snapshot
+		for {
+			select {
+			case latest = <-s.persistQueue:
+			default:
+				goto persistNow
+			}
+		}
+	persistNow:
+		_ = persistSnapshotToFile(s.stateFile, latest)
+	}
+}
+
+func (s *RuntimeStore) load() (stateBootstrapSource, error) {
+	return s.loadWithExecutablePath("")
+}
+
+func (s *RuntimeStore) loadWithExecutablePath(executablePath string) (stateBootstrapSource, error) {
+	if strings.TrimSpace(s.stateFile) == "" {
+		return stateBootstrapSourceKernelDefault, nil
+	}
+	loaded, err := loadSnapshotFromFile(s.stateFile, s.state)
+	if err == nil {
+		s.applyLoadedSnapshot(loaded)
+		return stateBootstrapSourceAppState, nil
+	}
+	if !os.IsNotExist(err) {
+		return stateBootstrapSourceKernelDefault, err
+	}
+	for _, candidate := range resolveBundledDefaultStateFileCandidates(executablePath) {
+		bundledSnapshot, bundledErr := loadSnapshotFromFile(candidate, s.state)
+		if bundledErr != nil {
+			continue
+		}
+		if !isSupportedBundledSnapshotSchemaVersion(bundledSnapshot.SchemaVersion) {
+			continue
+		}
+		s.applyLoadedSnapshot(bundledSnapshot)
+		_ = persistSnapshotToFile(s.stateFile, s.state)
+		return stateBootstrapSourceBundledDefault, nil
+	}
+	return stateBootstrapSourceKernelDefault, nil
+}
+
+func isSupportedBundledSnapshotSchemaVersion(schemaVersion int) bool {
+	if schemaVersion <= 0 {
+		return true
+	}
+	return schemaVersion <= currentSnapshotSchemaVersion
+}
+
+func (s *RuntimeStore) applyLoadedSnapshot(loaded StateSnapshot) {
+	s.state = loaded
+	s.ensureValidLocked()
+	stripSnapshotNodePoolAvailableNodeIDs(&s.state)
+	stripBackgroundTasks(&s.state)
+	// Runtime logs are session-scoped and should not survive daemon restart.
+	stripRuntimeLogs(&s.state)
+}
+
+func loadSnapshotFromFile(stateFile string, fallback StateSnapshot) (StateSnapshot, error) {
+	data, err := os.ReadFile(stateFile)
+	if err != nil {
+		return StateSnapshot{}, err
 	}
 	var loaded StateSnapshot
 	if err := json.Unmarshal(data, &loaded); err != nil {
-		return err
+		return StateSnapshot{}, err
 	}
 	if loaded.SchemaVersion == 0 {
 		loaded.SchemaVersion = 1
 	}
 	if loaded.RuntimeLabel == "" {
-		loaded.RuntimeLabel = s.state.RuntimeLabel
+		loaded.RuntimeLabel = fallback.RuntimeLabel
 	}
 	if loaded.CoreVersion == "" {
-		loaded.CoreVersion = s.state.CoreVersion
+		loaded.CoreVersion = fallback.CoreVersion
 	}
-	s.state = loaded
-	return nil
+	if loaded.ProxyVersion == "" {
+		loaded.ProxyVersion = fallback.ProxyVersion
+	}
+	return loaded, nil
+}
+
+func resolveBundledDefaultStateFileCandidates(executablePath string) []string {
+	relativePaths := []string{
+		filepath.Join("default-config", "waterayd_state.json"),
+	}
+	baseDirs := resolveBundledInstallDirCandidates(executablePath)
+	candidates := make([]string, 0, len(baseDirs)*len(relativePaths))
+	seen := map[string]struct{}{}
+	for _, baseDir := range baseDirs {
+		for _, relativePath := range relativePaths {
+			candidate := filepath.Clean(filepath.Join(baseDir, relativePath))
+			normalizedKey := strings.ToLower(candidate)
+			if _, exists := seen[normalizedKey]; exists {
+				continue
+			}
+			seen[normalizedKey] = struct{}{}
+			candidates = append(candidates, candidate)
+		}
+	}
+	return candidates
+}
+
+func resolveBundledInstallDirCandidates(executablePath string) []string {
+	candidates := make([]string, 0, 10)
+	seen := map[string]struct{}{}
+	appendDir := func(path string) {
+		trimmed := strings.TrimSpace(path)
+		if trimmed == "" {
+			return
+		}
+		cleaned := filepath.Clean(trimmed)
+		key := strings.ToLower(cleaned)
+		if _, exists := seen[key]; exists {
+			return
+		}
+		seen[key] = struct{}{}
+		candidates = append(candidates, cleaned)
+	}
+	appendExecutableDirs := func(resolvedExecutablePath string) {
+		trimmedExecutablePath := strings.TrimSpace(resolvedExecutablePath)
+		if trimmedExecutablePath == "" {
+			return
+		}
+		executableDir := strings.TrimSpace(filepath.Dir(trimmedExecutablePath))
+		installDir := strings.TrimSpace(filepath.Dir(executableDir))
+		if installDir != "" {
+			appendDir(installDir)
+		}
+		if executableDir != "" && !strings.EqualFold(executableDir, installDir) {
+			appendDir(executableDir)
+		}
+	}
+
+	trimmedExecutablePath := strings.TrimSpace(executablePath)
+	appendDir(os.Getenv("WATERAY_APP_INSTALL_DIR"))
+	appendExecutableDirs(trimmedExecutablePath)
+	if trimmedExecutablePath == "" {
+		if autoExecutablePath, err := os.Executable(); err == nil {
+			appendExecutableDirs(autoExecutablePath)
+		}
+		if cwd, err := os.Getwd(); err == nil && strings.TrimSpace(cwd) != "" {
+			current := filepath.Clean(cwd)
+			for depth := 0; depth < 4; depth++ {
+				appendDir(current)
+				appendDir(filepath.Join(current, "ElectronApp"))
+				parent := filepath.Dir(current)
+				if parent == current {
+					break
+				}
+				current = parent
+			}
+		}
+	}
+	return candidates
 }
 
 func (s *RuntimeStore) saveLocked() error {
+	s.refreshSessionObservabilityLocked(time.Now().UnixMilli())
 	if s.state.StateRevision <= 0 {
 		s.state.StateRevision = 1
 	} else {
 		s.state.StateRevision++
 	}
 	pushSnapshot := cloneSnapshot(s.state)
+	pushSnapshot.Operations = s.currentOperationSnapshot()
 	if !s.logPushEnabled {
 		stripRuntimeLogs(&pushSnapshot)
 	}
 	pushEvent := newSnapshotChangedEvent(pushSnapshot)
 	if s.stateFile == "" {
+		s.trafficStatsDirty = false
+		s.lastTrafficPersistMS = time.Now().UnixMilli()
 		s.publishPushEventLocked(pushEvent)
 		return nil
 	}
-	if err := os.MkdirAll(filepath.Dir(s.stateFile), 0o755); err != nil {
-		s.publishPushEventLocked(pushEvent)
-		return err
-	}
-	data, err := json.MarshalIndent(s.state, "", "  ")
-	if err != nil {
-		s.publishPushEventLocked(pushEvent)
-		return err
-	}
-	tmp := s.stateFile + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		s.publishPushEventLocked(pushEvent)
-		return err
-	}
-	if err := os.Rename(tmp, s.stateFile); err != nil {
-		s.publishPushEventLocked(pushEvent)
-		return err
-	}
+	persisted := cloneSnapshot(s.state)
+	// Persist runtime state without volatile logs to avoid replaying old logs after restart.
+	stripRuntimeLogs(&persisted)
+	stripSnapshotNodePoolAvailableNodeIDs(&persisted)
+	stripBackgroundTasks(&persisted)
+	stripOperationStatuses(&persisted)
+	s.enqueuePersistSnapshotLocked(persisted)
+	s.trafficStatsDirty = false
+	s.lastTrafficPersistMS = time.Now().UnixMilli()
 	s.publishPushEventLocked(pushEvent)
 	return nil
 }

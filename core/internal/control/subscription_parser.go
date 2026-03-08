@@ -24,10 +24,19 @@ import (
 
 var errUnsupportedSubscriptionURL = errors.New("unsupported subscription url scheme")
 
+const (
+	maxSubscriptionURLLength        = 2048
+	maxSubscriptionResponseBytes    = 8 * 1024 * 1024
+	maxConverterResponseBytes       = 8 * 1024 * 1024
+	maxSubscriptionRedirects        = 5
+	maxSubscriptionBodyPreviewBytes = 256
+)
+
 var (
 	subscriptionTrafficPattern          = regexp.MustCompile(`(?i)\d+(?:\.\d+)?\s*(?:[KMGTP]i?B)\s*/\s*\d+(?:\.\d+)?\s*(?:[KMGTP]i?B)`)
 	subscriptionDateTimePattern         = regexp.MustCompile(`\d{4}[-/]\d{1,2}[-/]\d{1,2}(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?`)
 	subscriptionTrafficSeparatorPattern = regexp.MustCompile(`\s*/\s*`)
+	subscriptionURLLogPattern           = regexp.MustCompile(`https?://[^\s"'<>]+`)
 )
 
 type SubscriptionParser struct {
@@ -38,9 +47,8 @@ type SubscriptionParser struct {
 }
 
 type SubscriptionParseResult struct {
-	Nodes     []Node
-	Status    string
-	DebugLogs []string
+	Nodes  []Node
+	Status string
 }
 
 func NewSubscriptionParser() *SubscriptionParser {
@@ -50,107 +58,269 @@ func NewSubscriptionParser() *SubscriptionParser {
 		converterClientType = "JSON"
 	}
 	return &SubscriptionParser{
-		client:              &http.Client{Timeout: 20 * time.Second},
-		converterClient:     &http.Client{Timeout: 8 * time.Second},
+		client:              newSafeSubscriptionHTTPClient(20 * time.Second),
+		converterClient:     newSafeSubscriptionHTTPClient(8 * time.Second),
 		converterURL:        converterURL,
 		converterClientType: converterClientType,
 	}
 }
 
-func (p *SubscriptionParser) FetchAndParse(ctx context.Context, rawURL string, groupID string) (SubscriptionParseResult, error) {
-	result := SubscriptionParseResult{
-		DebugLogs: make([]string, 0, 16),
+func newSafeSubscriptionHTTPClient(timeout time.Duration) *http.Client {
+	dialer := &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
 	}
-	debugLogs := make([]string, 0, 16)
-	appendDebugLog := func(format string, args ...any) {
-		debugLogs = append(debugLogs, fmt.Sprintf(format, args...))
+	return &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			Proxy:                 http.ProxyFromEnvironment,
+			DialContext:           safeSubscriptionDialContext(dialer),
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          16,
+			IdleConnTimeout:       30 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: time.Second,
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= maxSubscriptionRedirects {
+				return errors.New("too many redirects")
+			}
+			return validateSubscriptionURL(req.URL.String())
+		},
 	}
-	appendDebugLog("request url=%s", strings.TrimSpace(rawURL))
+}
 
-	parsed, err := url.Parse(rawURL)
+func safeSubscriptionDialContext(dialer *net.Dialer) func(context.Context, string, string) (net.Conn, error) {
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		host, _, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, err
+		}
+		if err := validateSubscriptionHost(host); err != nil {
+			return nil, err
+		}
+		return dialer.DialContext(ctx, network, address)
+	}
+}
+
+func validateSubscriptionURL(rawURL string) error {
+	value := strings.TrimSpace(rawURL)
+	if value == "" {
+		return errors.New("subscription url is required")
+	}
+	if len(value) > maxSubscriptionURLLength {
+		return fmt.Errorf("subscription url exceeds %d characters", maxSubscriptionURLLength)
+	}
+	for _, r := range value {
+		if unicode.IsControl(r) {
+			return errors.New("subscription url contains invalid control characters")
+		}
+	}
+	parsed, err := url.Parse(value)
 	if err != nil {
-		appendDebugLog("url parse failed: %v", err)
-		result.DebugLogs = debugLogs
-		return result, fmt.Errorf("invalid url: %w", err)
+		return fmt.Errorf("invalid url: %w", err)
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		appendDebugLog("unsupported url scheme=%s", parsed.Scheme)
-		result.DebugLogs = debugLogs
-		return result, errUnsupportedSubscriptionURL
+		return errUnsupportedSubscriptionURL
 	}
-	appendDebugLog(
-		"url parsed: scheme=%s host=%s path=%s queryLength=%d",
-		parsed.Scheme,
-		parsed.Host,
-		parsed.Path,
-		len(parsed.RawQuery),
-	)
+	if parsed.User != nil {
+		return errors.New("subscription url must not include userinfo")
+	}
+	host := strings.TrimSpace(parsed.Hostname())
+	if host == "" {
+		return errors.New("subscription url host is required")
+	}
+	return validateSubscriptionHost(host)
+}
 
-	content, statusCode, bytesLen, err := p.downloadText(ctx, parsed.String())
-	if err != nil {
-		appendDebugLog("download failed: status=%d bytes=%d err=%v", statusCode, bytesLen, err)
-		result.DebugLogs = debugLogs
-		return result, err
+func validateSubscriptionHost(host string) error {
+	if strings.TrimSpace(host) == "" {
+		return errors.New("subscription host is required")
 	}
-	appendDebugLog("download success: status=%d bytes=%d", statusCode, bytesLen)
-	appendDebugLog("raw preview: %s", previewText(content, 220))
-	content = strings.TrimSpace(content)
-	if content == "" {
-		appendDebugLog("content empty after trim")
-		result.DebugLogs = debugLogs
+	if strings.EqualFold(host, "localhost") {
+		return errors.New("subscription host must not target localhost")
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if isBlockedSubscriptionIP(ip) {
+			return fmt.Errorf("subscription host %s is not allowed", host)
+		}
+		return nil
+	}
+	ips, err := net.DefaultResolver.LookupIP(context.Background(), "ip", host)
+	if err != nil {
+		return fmt.Errorf("resolve host failed: %w", err)
+	}
+	if len(ips) == 0 {
+		return errors.New("resolve host returned no address")
+	}
+	for _, ip := range ips {
+		if isBlockedSubscriptionIP(ip) {
+			return fmt.Errorf("subscription host %s resolves to disallowed address %s", host, ip.String())
+		}
+	}
+	return nil
+}
+
+func isBlockedSubscriptionIP(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	return ip.IsLoopback() ||
+		ip.IsPrivate() ||
+		ip.IsMulticast() ||
+		ip.IsLinkLocalMulticast() ||
+		ip.IsLinkLocalUnicast() ||
+		ip.IsUnspecified()
+}
+
+func isAllowedSubscriptionContentType(raw string) bool {
+	value := strings.ToLower(strings.TrimSpace(strings.Split(raw, ";")[0]))
+	if value == "" {
+		return true
+	}
+	switch value {
+	case "text/plain",
+		"application/json",
+		"application/yaml",
+		"application/x-yaml",
+		"text/yaml",
+		"text/x-yaml",
+		"application/octet-stream":
+		return true
+	}
+	if strings.HasPrefix(value, "text/") && value != "text/html" {
+		return true
+	}
+	return false
+}
+
+func readLimitedBody(reader io.Reader, limit int64) ([]byte, error) {
+	limited := &io.LimitedReader{R: reader, N: limit + 1}
+	body, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > limit {
+		return nil, fmt.Errorf("response exceeds %d bytes", limit)
+	}
+	return body, nil
+}
+
+func looksLikeBinaryPayload(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	sample := body
+	if len(sample) > maxSubscriptionBodyPreviewBytes {
+		sample = sample[:maxSubscriptionBodyPreviewBytes]
+	}
+	nonPrintable := 0
+	for _, b := range sample {
+		if b == 0 {
+			return true
+		}
+		if b < 0x09 || (b > 0x0D && b < 0x20) {
+			nonPrintable++
+		}
+	}
+	return nonPrintable > len(sample)/8
+}
+
+func sanitizeURLForLog(rawURL string) string {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return "<invalid>"
+	}
+	parsed.User = nil
+	query := parsed.Query()
+	for key := range query {
+		query.Set(key, "***")
+	}
+	parsed.RawQuery = query.Encode()
+	return parsed.String()
+}
+
+func sanitizeURLsInText(raw string) string {
+	return subscriptionURLLogPattern.ReplaceAllStringFunc(raw, sanitizeURLForLog)
+}
+
+func (p *SubscriptionParser) ParseText(ctx context.Context, content string, groupID string) (SubscriptionParseResult, error) {
+	result := SubscriptionParseResult{}
+	text := strings.TrimSpace(strings.TrimPrefix(content, "\uFEFF"))
+	if text == "" {
 		return result, errors.New("subscription content is empty")
 	}
-	appendDebugLog("trimmed content bytes=%d", len(content))
+	result.Status = parseSubscriptionStatus(text)
 
-	if decoded, ok := decodeBase64String(content); ok {
-		appendDebugLog(
-			"whole content base64 decode success: decodedBytes=%d containsURI=%t preview=%s",
-			len(decoded),
-			strings.Contains(decoded, "://"),
-			previewText(decoded, 180),
+	if singboxNodes := p.parseSingBoxJSON(text, groupID); len(singboxNodes) > 0 {
+		result.Nodes, result.Status = postProcessParsedNodesAndStatus(text, singboxNodes, result.Status)
+		return result, nil
+	}
+	if clashNodes := p.parseClashYAML(text, groupID); len(clashNodes) > 0 {
+		result.Nodes, result.Status = postProcessParsedNodesAndStatus(text, clashNodes, result.Status)
+		return result, nil
+	}
+	if uriNodes := p.parseURILines(text, groupID); len(uriNodes) > 0 {
+		result.Nodes, result.Status = postProcessParsedNodesAndStatus(text, uriNodes, result.Status)
+		return result, nil
+	}
+	convertedNodes, convertedStatus, convertedContent, _, ok := p.tryExternalConverter(ctx, text, groupID)
+	if ok && len(convertedNodes) > 0 {
+		if strings.TrimSpace(result.Status) == "" && strings.TrimSpace(convertedStatus) != "" {
+			result.Status = strings.TrimSpace(convertedStatus)
+		}
+		result.Nodes, result.Status = postProcessParsedNodesAndStatus(convertedContent, convertedNodes, result.Status)
+		return result, nil
+	}
+	return result, errors.New("no supported nodes parsed")
+}
+
+func (p *SubscriptionParser) FetchAndParse(ctx context.Context, rawURL string, groupID string) (SubscriptionParseResult, error) {
+	result := SubscriptionParseResult{}
+	trimmedURL := strings.TrimSpace(rawURL)
+	if err := validateSubscriptionURL(trimmedURL); err != nil {
+		return result, err
+	}
+	parsed, _ := url.Parse(trimmedURL)
+	content, statusCode, bytesLen, err := p.downloadText(ctx, parsed.String())
+	if err != nil {
+		return result, fmt.Errorf(
+			"download subscription failed: url=%s status=%d bytes=%d err=%s",
+			sanitizeURLForLog(trimmedURL),
+			statusCode,
+			bytesLen,
+			sanitizeURLsInText(err.Error()),
 		)
-	} else {
-		appendDebugLog("whole content base64 decode failed")
+	}
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return result, errors.New("subscription content is empty")
 	}
 
 	status := parseSubscriptionStatus(content)
 	result.Status = status
-	appendDebugLog("header status=%q", status)
-
 	singboxNodes := p.parseSingBoxJSON(content, groupID)
-	appendDebugLog("parse try singbox_json nodes=%d", len(singboxNodes))
 	if len(singboxNodes) > 0 {
 		result.Nodes, result.Status = postProcessParsedNodesAndStatus(content, singboxNodes, result.Status)
-		result.DebugLogs = debugLogs
 		return result, nil
 	}
 
 	clashNodes := p.parseClashYAML(content, groupID)
-	appendDebugLog("parse try clash_yaml nodes=%d", len(clashNodes))
 	if len(clashNodes) > 0 {
 		result.Nodes, result.Status = postProcessParsedNodesAndStatus(content, clashNodes, result.Status)
-		result.DebugLogs = debugLogs
 		return result, nil
 	}
 
 	uriNodes := p.parseURILines(content, groupID)
-	appendDebugLog("parse try uri_lines nodes=%d", len(uriNodes))
 	if len(uriNodes) > 0 {
 		result.Nodes, result.Status = postProcessParsedNodesAndStatus(content, uriNodes, result.Status)
-		result.DebugLogs = debugLogs
 		return result, nil
 	}
 
-	convertedNodes, convertedStatus, convertedContent, converted, ok := p.tryExternalConverter(
+	convertedNodes, convertedStatus, convertedContent, _, ok := p.tryExternalConverter(
 		ctx,
 		content,
 		groupID,
-	)
-	appendDebugLog(
-		"parse try external_converter enabled=%t converted=%t nodes=%d",
-		strings.TrimSpace(p.converterURL) != "",
-		converted,
-		len(convertedNodes),
 	)
 	if ok && len(convertedNodes) > 0 {
 		if strings.TrimSpace(result.Status) == "" && strings.TrimSpace(convertedStatus) != "" {
@@ -161,12 +331,8 @@ func (p *SubscriptionParser) FetchAndParse(ctx context.Context, rawURL string, g
 			convertedNodes,
 			result.Status,
 		)
-		result.DebugLogs = debugLogs
 		return result, nil
 	}
-
-	appendDebugLog("parse failed: no supported nodes parsed")
-	result.DebugLogs = debugLogs
 	return result, errors.New("no supported nodes parsed")
 }
 
@@ -182,14 +348,20 @@ func (p *SubscriptionParser) downloadText(ctx context.Context, rawURL string) (s
 		return "", 0, 0, fmt.Errorf("download failed: %w", err)
 	}
 	defer resp.Body.Close()
+	if !isAllowedSubscriptionContentType(resp.Header.Get("Content-Type")) {
+		return "", resp.StatusCode, 0, fmt.Errorf("unexpected content-type: %s", strings.TrimSpace(resp.Header.Get("Content-Type")))
+	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := readLimitedBody(resp.Body, maxSubscriptionResponseBytes)
 	if err != nil {
 		return "", resp.StatusCode, len(body), fmt.Errorf("read response failed: %w", err)
 	}
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return "", resp.StatusCode, len(body), fmt.Errorf("http status %d", resp.StatusCode)
+	}
+	if looksLikeBinaryPayload(body) {
+		return "", resp.StatusCode, len(body), errors.New("subscription response looks like binary content")
 	}
 	text := strings.TrimPrefix(string(body), "\uFEFF")
 	return text, resp.StatusCode, len(body), nil
@@ -257,7 +429,7 @@ func (p *SubscriptionParser) tryExternalConverter(
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return nil, "", "", false, false
 	}
-	rawBody, err := io.ReadAll(resp.Body)
+	rawBody, err := readLimitedBody(resp.Body, maxConverterResponseBytes)
 	if err != nil {
 		return nil, "", "", false, false
 	}
@@ -1558,8 +1730,20 @@ func normalizeCountry(value string) string {
 	if country, ok := countryAliases[normalized]; ok {
 		return country
 	}
+	tokens := strings.Fields(normalized)
 	for alias, country := range countryAliases {
-		if strings.Contains(normalized, alias) {
+		if strings.Contains(alias, " ") {
+			if strings.Contains(normalized, alias) {
+				return country
+			}
+			continue
+		}
+		for _, token := range tokens {
+			if token == alias {
+				return country
+			}
+		}
+		if len(alias) >= 3 && strings.Contains(normalized, alias) {
 			return country
 		}
 	}

@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type { DaemonPushEvent, DaemonSnapshot, RuntimeLogEntry } from "../../../shared/daemon";
 import { daemonApi } from "../services/daemonApi";
+import { daemonTransportStore } from "../services/daemonTransportStore";
+import { useDaemonTransport } from "./useDaemonTransport";
 
 type SnapshotAction = () => Promise<DaemonSnapshot>;
 type UseDaemonSnapshotOptions = {
@@ -10,6 +12,14 @@ type UseDaemonSnapshotOptions = {
 
 const fallbackRefreshIntervalMs = 45000;
 const maxRuntimeLogEntries = 4000;
+const clientSessionHeartbeatIntervalMs = 20000;
+
+function createClientSessionID(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return `renderer-${crypto.randomUUID()}`;
+  }
+  return `renderer-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
 
 function pushLogEntry(list: RuntimeLogEntry[] | undefined, entry: RuntimeLogEntry): RuntimeLogEntry[] {
   const next = [...(list ?? []), entry];
@@ -19,12 +29,22 @@ function pushLogEntry(list: RuntimeLogEntry[] | undefined, entry: RuntimeLogEntr
   return next;
 }
 
+function normalizeNonNegativeInt(value: number | undefined): number {
+  return Math.max(0, Math.trunc(Number(value ?? 0)));
+}
+
 export function useDaemonSnapshot(options: UseDaemonSnapshotOptions = {}) {
   const includeLogs = options.includeLogs === true;
+  const transport = useDaemonTransport();
   const [snapshot, setSnapshot] = useState<DaemonSnapshot | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string>("");
   const latestRevisionRef = useRef<number>(0);
+  const lastRuntimeApplyEventTsRef = useRef<number>(0);
+  const lastTaskQueueEventTsRef = useRef<number>(0);
+  const lastOperationEventTsRef = useRef<number>(0);
+  const sessionIDRef = useRef<string>(createClientSessionID());
+  const sessionDisconnectedRef = useRef(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -92,9 +112,143 @@ export function useDaemonSnapshot(options: UseDaemonSnapshotOptions = {}) {
         return;
       }
       latestRevisionRef.current = Math.max(latestRevisionRef.current, nextRevision);
-      setSnapshot(normalizedSnapshot);
+      setSnapshot((current) => ({
+        ...normalizedSnapshot,
+        sampleIntervalSec: normalizedSnapshot.sampleIntervalSec ?? current?.sampleIntervalSec,
+        uploadBytes: normalizedSnapshot.uploadBytes ?? current?.uploadBytes,
+        downloadBytes: normalizedSnapshot.downloadBytes ?? current?.downloadBytes,
+        uploadDeltaBytes: normalizedSnapshot.uploadDeltaBytes ?? current?.uploadDeltaBytes,
+        downloadDeltaBytes: normalizedSnapshot.downloadDeltaBytes ?? current?.downloadDeltaBytes,
+        uploadRateBps: normalizedSnapshot.uploadRateBps ?? current?.uploadRateBps,
+        downloadRateBps: normalizedSnapshot.downloadRateBps ?? current?.downloadRateBps,
+        nodeUploadRateBps: normalizedSnapshot.nodeUploadRateBps ?? current?.nodeUploadRateBps,
+        nodeDownloadRateBps: normalizedSnapshot.nodeDownloadRateBps ?? current?.nodeDownloadRateBps,
+        totalConnections:
+          normalizedSnapshot.totalConnections ?? current?.totalConnections,
+        tcpConnections: normalizedSnapshot.tcpConnections ?? current?.tcpConnections,
+        udpConnections: normalizedSnapshot.udpConnections ?? current?.udpConnections,
+        activeNodeCount: normalizedSnapshot.activeNodeCount ?? current?.activeNodeCount,
+        activeConnectionNodes:
+          normalizedSnapshot.activeConnectionNodes ?? current?.activeConnectionNodes,
+      }));
       setError("");
       setLoading(false);
+      return;
+    }
+
+    if (event.kind === "traffic_tick") {
+      const traffic = event.payload?.traffic;
+      if (!traffic) {
+        return;
+      }
+      setSnapshot((current) => {
+        if (!current) {
+          return current;
+        }
+        return {
+          ...current,
+          sampleIntervalSec: normalizeNonNegativeInt(traffic.sampleIntervalSec),
+          uploadBytes: normalizeNonNegativeInt(traffic.uploadBytes),
+          downloadBytes: normalizeNonNegativeInt(traffic.downloadBytes),
+          uploadDeltaBytes: normalizeNonNegativeInt(traffic.uploadDeltaBytes),
+          downloadDeltaBytes: normalizeNonNegativeInt(traffic.downloadDeltaBytes),
+          uploadRateBps: normalizeNonNegativeInt(traffic.uploadRateBps),
+          downloadRateBps: normalizeNonNegativeInt(traffic.downloadRateBps),
+          nodeUploadRateBps: normalizeNonNegativeInt(traffic.nodeUploadRateBps),
+          nodeDownloadRateBps: normalizeNonNegativeInt(traffic.nodeDownloadRateBps),
+          totalConnections: normalizeNonNegativeInt(traffic.totalConnections),
+          tcpConnections: normalizeNonNegativeInt(traffic.tcpConnections),
+          udpConnections: normalizeNonNegativeInt(traffic.udpConnections),
+          activeNodeCount: normalizeNonNegativeInt(traffic.activeNodeCount),
+          activeConnectionNodes: (traffic.nodes ?? [])
+            .filter((item) => typeof item?.nodeId === "string" && item.nodeId.trim() !== "")
+            .map((item) => ({
+              nodeId: item.nodeId.trim(),
+              connections: normalizeNonNegativeInt(item.connections),
+              uploadBytes: normalizeNonNegativeInt(item.uploadBytes),
+              downloadBytes: normalizeNonNegativeInt(item.downloadBytes),
+              uploadDeltaBytes: normalizeNonNegativeInt(item.uploadDeltaBytes),
+              downloadDeltaBytes: normalizeNonNegativeInt(item.downloadDeltaBytes),
+              uploadRateBps: normalizeNonNegativeInt(item.uploadRateBps),
+              downloadRateBps: normalizeNonNegativeInt(item.downloadRateBps),
+              totalUploadBytes: normalizeNonNegativeInt(item.totalUploadBytes),
+              totalDownloadBytes: normalizeNonNegativeInt(item.totalDownloadBytes),
+            })),
+        };
+      });
+      return;
+    }
+
+    if (event.kind === "runtime_apply") {
+      const eventTimestamp = Number(event.timestampMs ?? 0);
+      if (eventTimestamp > 0 && eventTimestamp < lastRuntimeApplyEventTsRef.current) {
+        return;
+      }
+      const runtimeApply = event.payload?.runtimeApply;
+      if (!runtimeApply) {
+        return;
+      }
+      lastRuntimeApplyEventTsRef.current = eventTimestamp;
+      setSnapshot((current) => {
+        if (!current) {
+          return current;
+        }
+        return {
+          ...current,
+          lastRuntimeApply: runtimeApply,
+        };
+      });
+      return;
+    }
+
+    if (event.kind === "task_queue") {
+      const eventTimestamp = Number(event.timestampMs ?? 0);
+      if (eventTimestamp > 0 && eventTimestamp < lastTaskQueueEventTsRef.current) {
+        return;
+      }
+      const tasks = event.payload?.taskQueue?.tasks ?? [];
+      lastTaskQueueEventTsRef.current = eventTimestamp;
+      setSnapshot((current) => {
+        if (!current) {
+          return current;
+        }
+        return {
+          ...current,
+          backgroundTasks: tasks,
+        };
+      });
+      return;
+    }
+
+    if (event.kind === "operation_status") {
+      const eventTimestamp = Number(event.timestampMs ?? 0);
+      if (eventTimestamp > 0 && eventTimestamp < lastOperationEventTsRef.current) {
+        return;
+      }
+      const operation = event.payload?.operation;
+      if (!operation) {
+        return;
+      }
+      lastOperationEventTsRef.current = eventTimestamp;
+      setSnapshot((current) => {
+        if (!current) {
+          return current;
+        }
+        const existing = current.operations ?? [];
+        const nextOperations = [operation, ...existing.filter((item) => item.id !== operation.id)].slice(
+          0,
+          24,
+        );
+        return {
+          ...current,
+          operations: nextOperations,
+        };
+      });
+      return;
+    }
+
+    if (event.kind === "transport_status") {
+      daemonTransportStore.applyPushEvent(event);
       return;
     }
 
@@ -167,14 +321,61 @@ export function useDaemonSnapshot(options: UseDaemonSnapshotOptions = {}) {
     };
   }, [includeLogs]);
 
+  useEffect(() => {
+    const touchSession = () => {
+      if (sessionDisconnectedRef.current) {
+        return;
+      }
+      const touchedAtMs = Date.now();
+      void daemonApi
+        .touchClientSession(sessionIDRef.current)
+        .then((activeSessions) => {
+          setSnapshot((current) => {
+            if (!current) {
+              return current;
+            }
+            return {
+              ...current,
+              activeClientSessions: activeSessions,
+              lastClientHeartbeatMs: touchedAtMs,
+            };
+          });
+        })
+        .catch(() => {
+          // Best effort heartbeat.
+        });
+    };
+    const disconnectSession = () => {
+      if (sessionDisconnectedRef.current) {
+        return;
+      }
+      sessionDisconnectedRef.current = true;
+      void daemonApi.disconnectClientSession(sessionIDRef.current).catch(() => {
+        // Best effort disconnect.
+      });
+    };
+    const handleBeforeUnload = () => {
+      disconnectSession();
+    };
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    touchSession();
+    const timer = window.setInterval(touchSession, clientSessionHeartbeatIntervalMs);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("beforeunload", handleBeforeUnload);
+      disconnectSession();
+    };
+  }, []);
+
   return useMemo(
     () => ({
       snapshot,
+      transport,
       loading,
       error,
       refresh,
       runAction,
     }),
-    [snapshot, loading, error, refresh, runAction],
+    [snapshot, transport, loading, error, refresh, runAction],
   );
 }

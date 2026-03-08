@@ -1,20 +1,26 @@
-import { Card, Divider, Space, Typography, message } from "antd";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Card, Divider, Space, Typography } from "antd";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type {
-  BaseRuleItem,
-  ComposedRuleGroup,
+  DaemonSnapshot,
   RuleConfigV2,
+  RuleGroup,
   RulePolicyGroup,
+  VpnNode,
 } from "../../../../shared/daemon";
 import type { DaemonPageProps } from "../../app/types";
+import { useAppNotice } from "../../components/notify/AppNoticeProvider";
+import {
+  notifyConfigActionFailed,
+  notifyConfigApplied,
+  notifyConfigSaved,
+} from "../../services/configChangeMessage";
 import { daemonApi } from "../../services/daemonApi";
-import { BaseRulesTable } from "./components/BaseRulesTable";
 import { ComposedRulesTabs } from "./components/ComposedRulesTabs";
 import { NodePoolTable } from "./components/NodePoolTable";
 import {
   createEmptyRuleConfig,
-  ensureComposedRuleGroups,
+  ensureRuleGroups,
   normalizeRuleConfigForEditor,
 } from "./components/ruleEditorUtils";
 
@@ -23,6 +29,21 @@ const rulesPendingConfigStorageKey = "wateray.rules.pendingRuleConfigV2";
 interface PendingRuleConfigCache {
   config: RuleConfigV2;
   baseRevision: number;
+}
+
+function notifyRuleConfigResult(notice: ReturnType<typeof useAppNotice>, snapshot: DaemonSnapshot): void {
+  const result = snapshot.lastRuntimeApply?.result;
+  if (result === "hot_applied") {
+    notifyConfigApplied(notice, "规则配置");
+    return;
+  }
+  if (result === "restart_required") {
+    notifyConfigSaved(notice, "规则配置", {
+      restartRequired: true,
+    });
+    return;
+  }
+  notifyConfigSaved(notice, "规则配置");
 }
 
 function readPendingRuleConfig(): PendingRuleConfigCache | null {
@@ -78,6 +99,7 @@ function clearPendingRuleConfig(): void {
 }
 
 export function RulesPage({ snapshot, loading, runAction }: DaemonPageProps) {
+  const notice = useAppNotice();
   const initialPendingConfigRef = useRef<PendingRuleConfigCache | null>(readPendingRuleConfig());
   const [editingConfig, setEditingConfig] = useState<RuleConfigV2>(
     () => initialPendingConfigRef.current?.config ?? createEmptyRuleConfig(),
@@ -99,22 +121,17 @@ export function RulesPage({ snapshot, loading, runAction }: DaemonPageProps) {
     }
   }, [snapshot?.stateRevision]);
 
-  const composedGroupState = useMemo(
-    () =>
-      ensureComposedRuleGroups(
-        editingConfig.composedRuleGroups,
-        editingConfig.composedRules,
-        editingConfig.applyMode === "direct" ? "direct" : "proxy",
-      ),
-    [editingConfig.composedRuleGroups, editingConfig.composedRules, editingConfig.applyMode],
+  const groupState = useMemo(
+    () => ensureRuleGroups(editingConfig.groups, editingConfig.rules),
+    [editingConfig.groups, editingConfig.rules],
   );
-  const activeComposedGroupID = useMemo(() => {
-    const fromConfig = editingConfig.activeComposedRuleGroupId ?? "";
-    if (composedGroupState.groups.some((group) => group.id === fromConfig)) {
+  const activeGroupID = useMemo(() => {
+    const fromConfig = editingConfig.activeGroupId ?? "";
+    if (groupState.groups.some((group) => group.id === fromConfig)) {
       return fromConfig;
     }
-    return composedGroupState.activeGroupId;
-  }, [editingConfig.activeComposedRuleGroupId, composedGroupState]);
+    return groupState.activeGroupId;
+  }, [editingConfig.activeGroupId, groupState]);
 
   const activeGroupNodes = useMemo(() => {
     const groups = snapshot?.groups ?? [];
@@ -154,13 +171,13 @@ export function RulesPage({ snapshot, loading, runAction }: DaemonPageProps) {
           editingConfigRef.current = committed;
           setEditingConfig(committed);
           setDirty(false);
+          notifyRuleConfigResult(notice, nextSnapshot);
           return true;
         } catch (error) {
           if (saveVersion !== saveVersionRef.current) {
             return false;
           }
-          const errorText = error instanceof Error ? error.message : "未知错误";
-          message.error(`规则保存失败：${errorText}`);
+          notifyConfigActionFailed(notice, "规则配置", error, "保存失败");
           setDirty(true);
           return false;
         }
@@ -192,69 +209,51 @@ export function RulesPage({ snapshot, loading, runAction }: DaemonPageProps) {
     void persistRuleConfig(pending.config);
   }, [snapshot]);
 
-  const replaceComposedGroups = (
-    nextGroups: ComposedRuleGroup[],
+  const replaceGroups = (
+    nextGroups: RuleGroup[],
     nextActiveGroupID: string,
   ): Promise<boolean> => {
     return updateConfig((prev) => {
-      const normalized = ensureComposedRuleGroups(nextGroups, undefined, "proxy");
-      const activeGroup = normalized.groups.find((group) => group.id === nextActiveGroupID) ?? normalized.groups[0];
-      const mode = activeGroup.mode === "direct" ? "direct" : "proxy";
+      const normalized = ensureRuleGroups(nextGroups);
+      const activeGroup =
+        normalized.groups.find((group) => group.id === nextActiveGroupID) ??
+        normalized.groups[0];
       return {
         ...prev,
-        applyMode: mode,
-        defaults: mode === "direct" ? { onMatch: "direct", onMiss: "proxy" } : { onMatch: "proxy", onMiss: "direct" },
-        composedRuleGroups: normalized.groups,
-        activeComposedRuleGroupId: activeGroup.id,
-        composedRules: activeGroup.items ?? [],
+        groups: normalized.groups,
+        activeGroupId: activeGroup.id,
+        rules: activeGroup.rules ?? [],
       };
     });
   };
 
-  const sendBaseRulesToComposedGroup = (groupID: string, baseRuleIDs: string[]): Promise<boolean> => {
-    if (baseRuleIDs.length === 0) {
-      return Promise.resolve(false);
+  const probeActiveGroupRealConnect = useCallback(async (): Promise<VpnNode[]> => {
+    if (!snapshot) {
+      return [];
     }
-    const now = Date.now();
-    return replaceComposedGroups(
-      composedGroupState.groups.map((group) =>
-        group.id === groupID
-          ? {
-              ...group,
-              items: [
-                ...(group.items ?? []),
-                ...baseRuleIDs.map((baseRuleID, index) => ({
-                  id: `composed-rule-${now}-${index + 1}`,
-                  name: "",
-                  baseRuleId: baseRuleID,
-                  enabled: true,
-                })),
-              ],
-            }
-          : group,
-      ),
-      activeComposedGroupID,
-    );
-  };
-
-  const hotReloadRules = async (): Promise<{ status: "updated" | "noop"; message: string }> => {
-    try {
-      await runAction(() => daemonApi.hotReloadRules());
-      return {
-        status: "updated",
-        message: "规则已热更到内核",
-      };
-    } catch (error) {
-      const errorText = error instanceof Error ? error.message : "未知错误";
-      if (errorText.includes("无需更新")) {
-        return {
-          status: "noop",
-          message: "无需更新：活动规则数据与激活分组未变化",
-        };
-      }
-      throw error;
+    const groups = snapshot.groups ?? [];
+    if (groups.length === 0) {
+      return [];
     }
-  };
+    const activeGroup =
+      groups.find((group) => group.id === snapshot.activeGroupId) ?? groups[0];
+    const targetNodeIDs = activeGroup.nodes.map((node) => node.id).filter(Boolean);
+    if (!activeGroup.id || targetNodeIDs.length === 0) {
+      return [];
+    }
+    const probeResult = await daemonApi.probeNodesWithSummary({
+      groupId: activeGroup.id,
+      nodeIds: targetNodeIDs,
+      probeTypes: ["real_connect"],
+    });
+    const nextSnapshot = await runAction(async () => probeResult.snapshot);
+    const nextGroups = nextSnapshot.groups ?? [];
+    const nextActiveGroup =
+      nextGroups.find((group) => group.id === nextSnapshot.activeGroupId) ??
+      nextGroups.find((group) => group.id === activeGroup.id) ??
+      nextGroups[0];
+    return nextActiveGroup?.nodes ?? [];
+  }, [snapshot, runAction]);
 
   return (
     <Card loading={loading}>
@@ -263,9 +262,19 @@ export function RulesPage({ snapshot, loading, runAction }: DaemonPageProps) {
         size={16}
         style={{ width: "100%" }}
       >
+        <ComposedRulesTabs
+          groups={groupState.groups}
+          activeGroupId={activeGroupID}
+          policyGroups={editingConfig.policyGroups ?? []}
+          onChange={replaceGroups}
+        />
+
+        <Divider style={{ margin: "6px 0" }} />
+
         <NodePoolTable
           value={editingConfig.policyGroups ?? []}
           activeNodes={activeGroupNodes}
+          onProbeActiveGroupRealConnect={probeActiveGroupRealConnect}
           onChange={(next: RulePolicyGroup[]) =>
             updateConfig((prev) => ({
               ...prev,
@@ -274,32 +283,7 @@ export function RulesPage({ snapshot, loading, runAction }: DaemonPageProps) {
           }
         />
 
-        <Divider style={{ margin: "6px 0" }} />
-
-        <BaseRulesTable
-          value={editingConfig.baseRules ?? []}
-          policyGroups={editingConfig.policyGroups ?? []}
-          composedGroups={composedGroupState.groups}
-          onSendToComposed={sendBaseRulesToComposedGroup}
-          onChange={(next: BaseRuleItem[]) =>
-            updateConfig((prev) => ({
-              ...prev,
-              baseRules: next,
-            }))
-          }
-        />
-
-        <Divider style={{ margin: "6px 0" }} />
-
-        <ComposedRulesTabs
-          groups={composedGroupState.groups}
-          activeGroupId={activeComposedGroupID}
-          baseRules={editingConfig.baseRules ?? []}
-          onChange={replaceComposedGroups}
-          onHotReloadRules={hotReloadRules}
-        />
-
-        <Typography.Text type="secondary">{dirty ? "存在未保存修改" : "已同步到当前快照"}</Typography.Text>
+        {/* <Typography.Text type="secondary">{dirty ? "存在未保存修改" : "已同步到当前快照"}</Typography.Text> */}
       </Space>
     </Card>
   );
