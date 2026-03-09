@@ -188,7 +188,11 @@ func (s *RuntimeStore) RestoreConfig(
 			SuccessText:  "配置恢复完成",
 		},
 		func(taskHandle runtimeTaskHandle) error {
-			snapshot, summary, err := s.restoreConfigNow(context.Background(), req)
+			snapshot, summary, err := s.restoreConfigNowWithTaskHandle(
+				context.Background(),
+				req,
+				taskHandle,
+			)
 			resultCh <- restoreResult{snapshot: snapshot, summary: summary, err: err}
 			return err
 		},
@@ -210,6 +214,11 @@ func (s *RuntimeStore) ImportConfigContent(
 	if s == nil || s.taskQueue == nil {
 		return s.importConfigContentNow(ctx, req)
 	}
+	if s.hasPendingTaskByType(BackgroundTaskTypeConfigImport) {
+		return StateSnapshot{}, ImportConfigSummary{}, errors.New(
+			"已有导入配置任务正在执行或排队；若代理服务正在运行，请先停止代理后等待任务执行",
+		)
+	}
 	type importResult struct {
 		snapshot StateSnapshot
 		summary  ImportConfigSummary
@@ -221,11 +230,15 @@ func (s *RuntimeStore) ImportConfigContent(
 			TaskType:     BackgroundTaskTypeConfigImport,
 			ScopeKey:     "config_import_restore:import",
 			Title:        "导入配置",
-			ProgressText: "等待导入配置",
+			ProgressText: "等待导入配置（如代理运行中，停止代理后自动执行）",
 			SuccessText:  "配置导入完成",
 		},
 		func(taskHandle runtimeTaskHandle) error {
-			snapshot, summary, err := s.importConfigContentNow(context.Background(), req)
+			snapshot, summary, err := s.importConfigContentNowWithTaskHandle(
+				context.Background(),
+				req,
+				taskHandle,
+			)
 			resultCh <- importResult{snapshot: snapshot, summary: summary, err: err}
 			return err
 		},
@@ -238,4 +251,21 @@ func (s *RuntimeStore) ImportConfigContent(
 	case <-timer.C:
 		return s.snapshotWithOperations(), ImportConfigSummary{}, nil
 	}
+}
+
+func (s *RuntimeStore) hasPendingTaskByType(taskType BackgroundTaskType) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, task := range s.state.BackgroundTasks {
+		if task.Type != taskType {
+			continue
+		}
+		if task.Status == BackgroundTaskStatusRunning || task.Status == BackgroundTaskStatusQueued {
+			return true
+		}
+	}
+	return false
 }

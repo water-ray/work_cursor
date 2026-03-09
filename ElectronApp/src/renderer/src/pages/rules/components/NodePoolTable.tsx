@@ -13,8 +13,9 @@ import {
   Typography,
 } from "antd";
 import type { ColumnsType } from "antd/es/table";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { DraftActionBar } from "../../../components/draft/DraftActionBar";
+import { CountryFlag } from "../../../components/flag/CountryFlag";
 import { HelpLabel } from "../../../components/form/HelpLabel";
 import { BiIcon } from "../../../components/icons/BiIcon";
 import { useAppNotice } from "../../../components/notify/AppNoticeProvider";
@@ -58,7 +59,7 @@ const strictRefTypeOptions: Array<{ value: NodeRefType; label: string }> = [
 
 interface CountryQuickSelectOption {
   value: string;
-  label: string;
+  label: ReactNode;
   searchText: string;
   sortLabel: string;
 }
@@ -66,7 +67,12 @@ interface CountryQuickSelectOption {
 const countryQuickSelectOptions: CountryQuickSelectOption[] = [...countryMetadataList]
   .map((item) => ({
     value: item.code,
-    label: `${item.flagEmoji} ${item.chineseName}`,
+    label: (
+      <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+        <CountryFlag code={item.code} ariaLabel={item.chineseName} />
+        <span>{item.chineseName}</span>
+      </span>
+    ),
     searchText: item.searchText,
     sortLabel: item.chineseName,
   }))
@@ -269,11 +275,9 @@ function renderPoolConditionLabel(ref: { type: string; node: string }) {
       return (
         <span
           style={{ display: "inline-flex", alignItems: "center", gap: 4 }}
-          title={`${metadata.flagEmoji} ${metadata.chineseName} · ${metadata.code} · ${metadata.englishName}`}
+          title={`${metadata.chineseName} · ${metadata.code} · ${metadata.englishName}`}
         >
-          <span role="img" aria-label={metadata.chineseName}>
-            {metadata.flagEmoji}
-          </span>
+          <CountryFlag code={metadata.code} ariaLabel={metadata.chineseName} />
           <span>{metadata.chineseName}</span>
         </span>
       );

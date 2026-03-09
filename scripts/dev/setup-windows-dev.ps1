@@ -57,5 +57,5 @@ if (Test-Path $electronDir) {
 Write-Host "=== Setup done ==="
 Write-Host "Next:"
 Write-Host "1) Verify DLL and header under core/prebuilt/windows"
-Write-Host "2) Start core daemon: cd core && go run -tags with_clash_api,with_gvisor ./cmd/waterayd"
+Write-Host "2) Start core daemon: cd core && go run -tags with_clash_api,with_gvisor,with_quic ./cmd/waterayd"
 Write-Host "3) Start Electron frontend: cd ElectronApp && npm run dev"

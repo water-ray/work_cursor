@@ -10,6 +10,7 @@ export const probeRealConnectTestUrlOptions = [
   "http://cp.cloudflare.com",
   "https://www.apple.com/library/test/success.html",
   "http://www.msftconnecttest.com/connecttest.txt",
+  "https://time.tv.cctv.com/time.php"
 ];
 
 export const probeNodeInfoQueryUrlOptions = [

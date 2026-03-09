@@ -1,6 +1,6 @@
 {
   "schemaVersion": 20,
-  "stateRevision": 1667,
+  "stateRevision": 1694,
   "connectionStage": "connected",
   "lastRuntimeApply": {
     "operation": "stop_connection",
@@ -9,7 +9,7 @@
     "changeSetSummary": "stop_connection",
     "success": true,
     "rollbackApplied": false,
-    "timestampMs": 1772921369060
+    "timestampMs": 1773020246464
   },
   "routingMode": "recommended",
   "proxyMode": "off",
@@ -18,7 +18,7 @@
   "sniffEnabled": true,
   "sniffOverrideDestination": true,
   "sniffTimeoutMs": 1000,
-  "blockQuic": false,
+  "blockQuic": true,
   "blockUdp": false,
   "mux": {
     "enabled": false,
@@ -122,7 +122,7 @@
       "id": "rule-profile-default",
       "name": "Default Rules",
       "sourceKind": "manual",
-      "lastUpdatedMs": 1772921330631,
+      "lastUpdatedMs": 1773018300235,
       "config": {
         "version": 3,
         "probeIntervalSec": 180,
@@ -192,7 +192,7 @@
             "rules": [
               {
                 "id": "rule-mmgb2rvm-0mkzq2",
-                "name": "谷歌",
+                "name": "谷歌-谷歌上不了就改动作为代理",
                 "enabled": true,
                 "match": {
                   "domain": {
@@ -325,7 +325,7 @@
                 }
               ],
               "nodeSelectStrategy": "fastest",
-              "fallbackMode": "reject"
+              "fallbackMode": "active_node"
             }
           },
           {
@@ -351,7 +351,7 @@
         "rules": [
           {
             "id": "rule-mmgb2rvm-0mkzq2",
-            "name": "谷歌",
+            "name": "谷歌-谷歌上不了就改动作为代理",
             "enabled": true,
             "match": {
               "domain": {
@@ -463,7 +463,7 @@
         "rules": [
           {
             "id": "rule-mmgb2rvm-0mkzq2",
-            "name": "谷歌",
+            "name": "谷歌-谷歌上不了就改动作为代理",
             "enabled": true,
             "match": {
               "domain": {
@@ -596,7 +596,7 @@
             }
           ],
           "nodeSelectStrategy": "fastest",
-          "fallbackMode": "reject"
+          "fallbackMode": "active_node"
         }
       },
       {
@@ -622,7 +622,7 @@
     "rules": [
       {
         "id": "rule-mmgb2rvm-0mkzq2",
-        "name": "谷歌",
+        "name": "谷歌-谷歌上不了就改动作为代理",
         "enabled": true,
         "match": {
           "domain": {
@@ -664,11 +664,11 @@
   },
   "systemType": "windows",
   "runtimeAdmin": true,
-  "coreVersion": "0.4.1",
+  "coreVersion": "1.0.7",
   "proxyVersion": "unknown",
   "runtimeLabel": "waterayd:http://127.0.0.1:39080",
-  "daemonStartedAtMs": 1772921116079,
-  "activeClientSessions": 0,
-  "lastClientHeartbeatMs": 1772921125238,
+  "daemonStartedAtMs": 1773020219826,
+  "activeClientSessions": 1,
+  "lastClientHeartbeatMs": 1773020240793,
   "activePushSubscribers": 1
 }

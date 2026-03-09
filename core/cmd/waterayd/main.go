@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -22,6 +24,9 @@ import (
 )
 
 const defaultUnifiedVersion = "0.1.0"
+const daemonListenAddr = "127.0.0.1:39080"
+const daemonDefaultOrigin = "http://127.0.0.1:39080"
+const daemonLocalhostOrigin = "http://localhost:39080"
 
 var (
 	appVersion          string
@@ -29,7 +34,7 @@ var (
 )
 
 func main() {
-	const addr = "127.0.0.1:39080"
+	const addr = daemonListenAddr
 
 	lock, err := acquireDaemonInstanceLock()
 	if err != nil {
@@ -60,7 +65,7 @@ func main() {
 
 	server := &http.Server{
 		Addr:              addr,
-		Handler:           mux,
+		Handler:           withRequestSecurityGuards(mux),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -878,6 +883,69 @@ func logCoreAction(store *control.RuntimeStore, action string, err error) {
 		return
 	}
 	store.LogCore(control.LogLevelInfo, fmt.Sprintf("%s success", action))
+}
+
+func withRequestSecurityGuards(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !allowTrustedLocalRequest(w, r) {
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func allowTrustedLocalRequest(w http.ResponseWriter, r *http.Request) bool {
+	if !isTrustedLocalHostHeader(r.Host) {
+		writeError(w, http.StatusForbidden, "forbidden host")
+		return false
+	}
+	originRaw := strings.TrimSpace(r.Header.Get("Origin"))
+	if originRaw != "" {
+		origin, ok := normalizeOrigin(originRaw)
+		if !ok || (origin != daemonDefaultOrigin && origin != daemonLocalhostOrigin) {
+			writeError(w, http.StatusForbidden, "forbidden origin")
+			return false
+		}
+	}
+	switch strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))) {
+	case "cross-site":
+		writeError(w, http.StatusForbidden, "cross-site requests are forbidden")
+		return false
+	}
+	return true
+}
+
+func normalizeOrigin(raw string) (string, bool) {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return "", false
+	}
+	if parsed == nil || parsed.Scheme == "" || parsed.Host == "" || parsed.Opaque != "" {
+		return "", false
+	}
+	scheme := strings.ToLower(strings.TrimSpace(parsed.Scheme))
+	if scheme != "http" && scheme != "https" {
+		return "", false
+	}
+	host := strings.ToLower(strings.TrimSpace(parsed.Host))
+	return fmt.Sprintf("%s://%s", scheme, host), true
+}
+
+func isTrustedLocalHostHeader(rawHost string) bool {
+	host := strings.ToLower(strings.TrimSpace(rawHost))
+	if host == "" {
+		return false
+	}
+	if splitHost, _, err := net.SplitHostPort(host); err == nil {
+		host = splitHost
+	}
+	host = strings.Trim(host, "[]")
+	switch host {
+	case "127.0.0.1", "localhost":
+		return true
+	default:
+		return false
+	}
 }
 
 func allowMethod(w http.ResponseWriter, r *http.Request, methods ...string) bool {

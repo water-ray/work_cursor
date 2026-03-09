@@ -2,6 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type { DaemonPushEvent, DaemonSnapshot, RuntimeLogEntry } from "../../../shared/daemon";
 import { daemonApi } from "../services/daemonApi";
+import {
+  daemonSnapshotRefreshEventName,
+} from "../services/daemonSnapshotRefresh";
 import { daemonTransportStore } from "../services/daemonTransportStore";
 import { useDaemonTransport } from "./useDaemonTransport";
 
@@ -298,12 +301,23 @@ export function useDaemonSnapshot(options: UseDaemonSnapshotOptions = {}) {
     const unsubscribe = window.waterayDesktop.daemon.onPushEvent((event) => {
       applyPushEvent(event);
     });
+    const onRefreshRequest = () => {
+      void refresh();
+    };
     const timer = window.setInterval(() => {
       void refresh();
     }, fallbackRefreshIntervalMs);
+    window.addEventListener(
+      daemonSnapshotRefreshEventName,
+      onRefreshRequest as EventListener,
+    );
     return () => {
       window.clearInterval(timer);
       unsubscribe();
+      window.removeEventListener(
+        daemonSnapshotRefreshEventName,
+        onRefreshRequest as EventListener,
+      );
     };
   }, [applyPushEvent, refresh]);
 

@@ -152,6 +152,14 @@ func (s *RuntimeStore) restoreConfigNow(
 	_ context.Context,
 	req RestoreConfigRequest,
 ) (StateSnapshot, ImportConfigSummary, error) {
+	return s.restoreConfigNowWithTaskHandle(context.Background(), req, runtimeTaskHandle{})
+}
+
+func (s *RuntimeStore) restoreConfigNowWithTaskHandle(
+	_ context.Context,
+	req RestoreConfigRequest,
+	taskHandle runtimeTaskHandle,
+) (StateSnapshot, ImportConfigSummary, error) {
 	entryID := strings.TrimSpace(req.EntryID)
 	if entryID == "" {
 		return StateSnapshot{}, ImportConfigSummary{}, errors.New("entryId is required")
@@ -169,7 +177,7 @@ func (s *RuntimeStore) restoreConfigNow(
 
 	var snapshot StateSnapshot
 	summary := ImportConfigSummary{}
-	err = s.withForegroundTask(
+	err = s.runConfigTaskWithHandle(
 		runtimeTaskOptions{
 			TaskType:     BackgroundTaskTypeConfigImport,
 			ScopeKey:     "config_import_restore:restore",
@@ -177,6 +185,7 @@ func (s *RuntimeStore) restoreConfigNow(
 			ProgressText: "读取备份配置",
 			SuccessText:  "配置恢复完成",
 		},
+		taskHandle,
 		func(handle runtimeTaskHandle) error {
 			s.mu.RLock()
 			fallback := cloneSnapshot(s.state)
@@ -199,7 +208,12 @@ func (s *RuntimeStore) restoreConfigNow(
 				config := cloneRuleConfigV2(nextSnapshot.RuleConfigV2)
 				selectedRuleConfig = &config
 			}
-			applied, applySummary, applyErr := s.applyExternalConfigSnapshot(nextSnapshot, false, selectedRuleConfig)
+			applied, applySummary, applyErr := s.applyExternalConfigSnapshot(
+				nextSnapshot,
+				false,
+				selectedRuleConfig,
+				false,
+			)
 			if applyErr != nil {
 				return applyErr
 			}
@@ -275,6 +289,14 @@ func (s *RuntimeStore) importConfigContentNow(
 	_ context.Context,
 	req ImportConfigContentRequest,
 ) (StateSnapshot, ImportConfigSummary, error) {
+	return s.importConfigContentNowWithTaskHandle(context.Background(), req, runtimeTaskHandle{})
+}
+
+func (s *RuntimeStore) importConfigContentNowWithTaskHandle(
+	_ context.Context,
+	req ImportConfigContentRequest,
+	taskHandle runtimeTaskHandle,
+) (StateSnapshot, ImportConfigSummary, error) {
 	content := strings.TrimSpace(req.Content)
 	if content == "" {
 		return StateSnapshot{}, ImportConfigSummary{}, errors.New("import content is empty")
@@ -284,7 +306,7 @@ func (s *RuntimeStore) importConfigContentNow(
 	}
 	var snapshot StateSnapshot
 	summary := ImportConfigSummary{}
-	err := s.withForegroundTask(
+	err := s.runConfigTaskWithHandle(
 		runtimeTaskOptions{
 			TaskType:     BackgroundTaskTypeConfigImport,
 			ScopeKey:     "config_import_restore:import",
@@ -292,6 +314,7 @@ func (s *RuntimeStore) importConfigContentNow(
 			ProgressText: "解析导入内容",
 			SuccessText:  "配置导入完成",
 		},
+		taskHandle,
 		func(handle runtimeTaskHandle) error {
 			loadedSnapshot, selectedRuleConfig, err := parseImportedSnapshotDocument(content, StateSnapshot{})
 			if err != nil {
@@ -309,7 +332,12 @@ func (s *RuntimeStore) importConfigContentNow(
 				config := cloneRuleConfigV2(nextSnapshot.RuleConfigV2)
 				selectedRuleConfig = &config
 			}
-			applied, applySummary, applyErr := s.applyExternalConfigSnapshot(nextSnapshot, true, selectedRuleConfig)
+			applied, applySummary, applyErr := s.applyExternalConfigSnapshot(
+				nextSnapshot,
+				!req.ReplaceExisting,
+				selectedRuleConfig,
+				req.ReplaceExisting,
+			)
 			if applyErr != nil {
 				return applyErr
 			}
@@ -330,6 +358,21 @@ func (s *RuntimeStore) importConfigContentNow(
 		return StateSnapshot{}, ImportConfigSummary{}, err
 	}
 	return snapshot, summary, nil
+}
+
+func (s *RuntimeStore) runConfigTaskWithHandle(
+	options runtimeTaskOptions,
+	taskHandle runtimeTaskHandle,
+	run func(runtimeTaskHandle) error,
+) error {
+	if strings.TrimSpace(taskHandle.ID()) != "" {
+		progress := strings.TrimSpace(options.ProgressText)
+		if progress != "" {
+			taskHandle.UpdateProgress(progress)
+		}
+		return run(taskHandle)
+	}
+	return s.withForegroundTask(options, run)
 }
 
 func (s *RuntimeStore) resolveCatalogEntryByID(entryID string) (ConfigCatalogEntry, error) {
@@ -380,6 +423,7 @@ func (s *RuntimeStore) applyExternalConfigSnapshot(
 	nextSnapshot StateSnapshot,
 	appendImportedSubscriptions bool,
 	importedRuleConfig *RuleConfigV2,
+	replaceRuleConfig bool,
 ) (StateSnapshot, ImportConfigSummary, error) {
 	s.mu.Lock()
 	previous := cloneSnapshot(s.state)
@@ -388,7 +432,13 @@ func (s *RuntimeStore) applyExternalConfigSnapshot(
 	if appendImportedSubscriptions {
 		summary = mergeImportedSubscriptionData(previous, &normalizedNext)
 	}
-	summary, err := mergeImportedRuleData(previous, &normalizedNext, importedRuleConfig, summary)
+	summary, err := mergeImportedRuleData(
+		previous,
+		&normalizedNext,
+		importedRuleConfig,
+		summary,
+		replaceRuleConfig,
+	)
 	if err != nil {
 		s.mu.Unlock()
 		return StateSnapshot{}, ImportConfigSummary{}, err
@@ -494,9 +544,56 @@ func mergeImportedRuleData(
 	next *StateSnapshot,
 	importedRuleConfig *RuleConfigV2,
 	baseSummary ImportConfigSummary,
+	replaceRuleConfig bool,
 ) (ImportConfigSummary, error) {
 	summary := baseSummary
 	if next == nil {
+		return summary, nil
+	}
+	if replaceRuleConfig {
+		nowMS := time.Now().UnixMilli()
+		if importedRuleConfig != nil && hasRuleConfigMergeContent(*importedRuleConfig) {
+			normalizedSource, normalizeErr := normalizeRuleConfigV2(*importedRuleConfig)
+			if normalizeErr != nil {
+				return summary, normalizeErr
+			}
+			next.RuleConfigV2 = normalizedSource
+		} else {
+			normalizedConfig, normalizeErr := normalizeRuleConfigV2(next.RuleConfigV2)
+			if normalizeErr != nil {
+				normalizedConfig = defaultRuleConfigV2()
+			}
+			next.RuleConfigV2 = normalizedConfig
+		}
+		if len(next.RuleProfiles) == 0 {
+			next.RuleProfiles = []RuleProfile{
+				{
+					ID:            defaultRuleProfileID,
+					Name:          defaultRuleProfileName,
+					SourceKind:    RuleProfileSourceManual,
+					LastUpdatedMS: nowMS,
+					Config:        cloneRuleConfigV2(next.RuleConfigV2),
+				},
+			}
+			next.ActiveRuleProfileID = defaultRuleProfileID
+			return summary, nil
+		}
+		next.ActiveRuleProfileID = strings.TrimSpace(next.ActiveRuleProfileID)
+		activeIndex := -1
+		for index, profile := range next.RuleProfiles {
+			if profile.ID == next.ActiveRuleProfileID {
+				activeIndex = index
+				break
+			}
+		}
+		if activeIndex < 0 {
+			activeIndex = 0
+			next.ActiveRuleProfileID = next.RuleProfiles[0].ID
+		}
+		next.RuleProfiles[activeIndex].Config = cloneRuleConfigV2(next.RuleConfigV2)
+		next.RuleProfiles[activeIndex].LastUpdatedMS = nowMS
+		next.RuleProfiles[activeIndex].SourceKind = RuleProfileSourceManual
+		next.RuleProfiles[activeIndex].SourceRefID = ""
 		return summary, nil
 	}
 	previousConfig, err := normalizeRuleConfigV2(previous.RuleConfigV2)
@@ -968,7 +1065,7 @@ func sanitizeBackupFileName(raw string) (string, error) {
 		fileName += ".json"
 		extension = ".json"
 	}
-	if extension != ".json" && extension != ".json" {
+	if extension != ".json" {
 		return "", errors.New("backup file extension must be .json")
 	}
 	return fileName, nil
@@ -1222,7 +1319,7 @@ func isBackupConfigFileName(fileName string) bool {
 		return false
 	}
 	lowerExt := strings.ToLower(filepath.Ext(trimmed))
-	return lowerExt == ".json" || lowerExt == ".json"
+	return lowerExt == ".json"
 }
 
 func readConfigBackupMeta(dataFilePath string) (configBackupMeta, error) {

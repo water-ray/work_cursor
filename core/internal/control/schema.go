@@ -711,7 +711,9 @@ type UpdateGroupRequest struct {
 }
 
 type SelectGroupRequest struct {
-	GroupID string `json:"groupId"`
+	GroupID           string `json:"groupId"`
+	ApplyRuntime      *bool  `json:"applyRuntime,omitempty"`
+	ResetSelectedNode bool   `json:"resetSelectedNode,omitempty"`
 }
 
 type SelectNodeRequest struct {
@@ -991,7 +993,8 @@ type ExportConfigContentResult struct {
 }
 
 type ImportConfigContentRequest struct {
-	Content string `json:"content"`
+	Content         string `json:"content"`
+	ReplaceExisting bool   `json:"replaceExisting,omitempty"`
 }
 
 type ImportConfigSummary struct {

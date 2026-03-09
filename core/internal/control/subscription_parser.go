@@ -90,16 +90,34 @@ func newSafeSubscriptionHTTPClient(timeout time.Duration) *http.Client {
 	}
 }
 
+const subscriptionResolverTimeout = 5 * time.Second
+
+var trustedSubscriptionResolverAddresses = []string{
+	"1.1.1.1:53",
+	"8.8.8.8:53",
+	"[2606:4700:4700::1111]:53",
+	"[2001:4860:4860::8888]:53",
+}
+
+type subscriptionIPLookup func(ctx context.Context, host string) ([]net.IP, error)
+
 func safeSubscriptionDialContext(dialer *net.Dialer) func(context.Context, string, string) (net.Conn, error) {
 	return func(ctx context.Context, network, address string) (net.Conn, error) {
-		host, _, err := net.SplitHostPort(address)
+		host, port, err := net.SplitHostPort(address)
 		if err != nil {
 			return nil, err
 		}
-		if err := validateSubscriptionHost(host); err != nil {
+		targetAddress, err := resolveSubscriptionDialAddress(
+			ctx,
+			host,
+			port,
+			lookupSubscriptionIPsWithSystemResolver,
+			lookupSubscriptionIPsWithTrustedResolvers,
+		)
+		if err != nil {
 			return nil, err
 		}
-		return dialer.DialContext(ctx, network, address)
+		return dialer.DialContext(ctx, network, targetAddress)
 	}
 }
 
@@ -134,28 +152,155 @@ func validateSubscriptionURL(rawURL string) error {
 }
 
 func validateSubscriptionHost(host string) error {
-	if strings.TrimSpace(host) == "" {
+	normalizedHost := strings.TrimSpace(host)
+	if normalizedHost == "" {
 		return errors.New("subscription host is required")
 	}
-	if strings.EqualFold(host, "localhost") {
+	if strings.EqualFold(normalizedHost, "localhost") {
 		return errors.New("subscription host must not target localhost")
 	}
-	if ip := net.ParseIP(host); ip != nil {
+	if ip := net.ParseIP(normalizedHost); ip != nil {
 		if isBlockedSubscriptionIP(ip) {
-			return fmt.Errorf("subscription host %s is not allowed", host)
+			return fmt.Errorf("subscription host %s is not allowed", normalizedHost)
 		}
 		return nil
 	}
-	ips, err := net.DefaultResolver.LookupIP(context.Background(), "ip", host)
+	return nil
+}
+
+func resolveSubscriptionDialAddress(
+	ctx context.Context,
+	host string,
+	port string,
+	systemLookup subscriptionIPLookup,
+	trustedLookup subscriptionIPLookup,
+) (string, error) {
+	normalizedHost := strings.TrimSpace(host)
+	if err := validateSubscriptionHost(normalizedHost); err != nil {
+		return "", err
+	}
+	if ip := net.ParseIP(normalizedHost); ip != nil {
+		return net.JoinHostPort(ip.String(), port), nil
+	}
+	ips, err := resolveAllowedSubscriptionHostIPs(ctx, normalizedHost, systemLookup, trustedLookup)
 	if err != nil {
-		return fmt.Errorf("resolve host failed: %w", err)
+		return "", err
 	}
 	if len(ips) == 0 {
-		return errors.New("resolve host returned no address")
+		return "", errors.New("resolve host returned no address")
 	}
+	return net.JoinHostPort(ips[0].String(), port), nil
+}
+
+func resolveAllowedSubscriptionHostIPs(
+	ctx context.Context,
+	host string,
+	systemLookup subscriptionIPLookup,
+	trustedLookup subscriptionIPLookup,
+) ([]net.IP, error) {
+	resolveCtx, cancel := ensureSubscriptionResolveTimeout(ctx)
+	defer cancel()
+
+	systemIPs, systemErr := lookupSubscriptionIPs(resolveCtx, host, systemLookup)
+	systemAllowed := filterAllowedSubscriptionIPs(systemIPs)
+	if len(systemAllowed) > 0 {
+		return systemAllowed, nil
+	}
+
+	trustedIPs, trustedErr := lookupSubscriptionIPs(resolveCtx, host, trustedLookup)
+	trustedAllowed := filterAllowedSubscriptionIPs(trustedIPs)
+	if len(trustedAllowed) > 0 {
+		return trustedAllowed, nil
+	}
+
+	if blocked := firstBlockedSubscriptionIP(trustedIPs); blocked != nil {
+		return nil, fmt.Errorf("subscription host %s resolves to disallowed address %s", host, blocked.String())
+	}
+	if blocked := firstBlockedSubscriptionIP(systemIPs); blocked != nil {
+		return nil, fmt.Errorf("subscription host %s resolves to disallowed address %s", host, blocked.String())
+	}
+
+	if systemErr != nil && trustedErr != nil {
+		return nil, fmt.Errorf("resolve host failed: system=%v trusted=%v", systemErr, trustedErr)
+	}
+	if systemErr != nil {
+		return nil, fmt.Errorf("resolve host failed: %w", systemErr)
+	}
+	if trustedErr != nil {
+		return nil, fmt.Errorf("resolve host failed: %w", trustedErr)
+	}
+	return nil, errors.New("resolve host returned no address")
+}
+
+func ensureSubscriptionResolveTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		return context.WithTimeout(context.Background(), subscriptionResolverTimeout)
+	}
+	if _, hasDeadline := ctx.Deadline(); hasDeadline {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, subscriptionResolverTimeout)
+}
+
+func lookupSubscriptionIPs(ctx context.Context, host string, lookup subscriptionIPLookup) ([]net.IP, error) {
+	if lookup == nil {
+		return nil, nil
+	}
+	return lookup(ctx, host)
+}
+
+func lookupSubscriptionIPsWithSystemResolver(ctx context.Context, host string) ([]net.IP, error) {
+	return net.DefaultResolver.LookupIP(ctx, "ip", host)
+}
+
+func lookupSubscriptionIPsWithTrustedResolvers(ctx context.Context, host string) ([]net.IP, error) {
+	var lastErr error
+	for _, resolverAddress := range trustedSubscriptionResolverAddresses {
+		ips, err := lookupSubscriptionIPsByResolver(ctx, host, resolverAddress)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if len(ips) > 0 {
+			return ips, nil
+		}
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, nil
+}
+
+func lookupSubscriptionIPsByResolver(ctx context.Context, host string, resolverAddress string) ([]net.IP, error) {
+	resolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			transport := "udp"
+			if strings.HasPrefix(strings.ToLower(strings.TrimSpace(network)), "tcp") {
+				transport = "tcp"
+			}
+			dialer := &net.Dialer{Timeout: 2 * time.Second}
+			return dialer.DialContext(ctx, transport, resolverAddress)
+		},
+	}
+	return resolver.LookupIP(ctx, "ip", host)
+}
+
+func filterAllowedSubscriptionIPs(ips []net.IP) []net.IP {
+	allowed := make([]net.IP, 0, len(ips))
 	for _, ip := range ips {
-		if isBlockedSubscriptionIP(ip) {
-			return fmt.Errorf("subscription host %s resolves to disallowed address %s", host, ip.String())
+		if ip == nil || isBlockedSubscriptionIP(ip) {
+			continue
+		}
+		allowed = append(allowed, ip)
+	}
+	return allowed
+}
+
+func firstBlockedSubscriptionIP(ips []net.IP) net.IP {
+	for _, ip := range ips {
+		if ip != nil && isBlockedSubscriptionIP(ip) {
+			return ip
 		}
 	}
 	return nil
@@ -1583,6 +1728,9 @@ func buildURIRawConfig(
 			"security":  strings.TrimSpace(query.Get("security")),
 		},
 	}
+	if insecure, ok := resolveURIInsecure(query); ok {
+		raw["insecure"] = insecure
+	}
 
 	switch protocol {
 	case NodeProtocol("vless"):
@@ -1596,6 +1744,39 @@ func buildURIRawConfig(
 	}
 
 	return marshalRawConfig(raw)
+}
+
+func resolveURIInsecure(query url.Values) (bool, bool) {
+	return readBoolQueryValue(
+		query,
+		"insecure",
+		"allowInsecure",
+		"allow_insecure",
+		"allow-insecure",
+		"skip-cert-verify",
+		"skip_cert_verify",
+		"skipCertVerify",
+	)
+}
+
+func readBoolQueryValue(query url.Values, keys ...string) (bool, bool) {
+	for _, key := range keys {
+		values, exists := query[key]
+		if !exists || len(values) == 0 {
+			continue
+		}
+		raw := strings.TrimSpace(values[len(values)-1])
+		if raw == "" {
+			return true, true
+		}
+		switch strings.ToLower(raw) {
+		case "1", "true", "yes", "on":
+			return true, true
+		case "0", "false", "no", "off":
+			return false, true
+		}
+	}
+	return false, false
 }
 
 func guessRegion(name string, host string) string {

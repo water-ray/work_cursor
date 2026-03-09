@@ -118,8 +118,8 @@ def load_release_version() -> str:
 
 def clean_outputs() -> None:
     print_step("清理旧产物")
-    if BIN_DIR.exists():
-        shutil.rmtree(BIN_DIR)
+    if BIN_WINDOWS_DIR.exists():
+        shutil.rmtree(BIN_WINDOWS_DIR)
     BIN_CORE_DIR.mkdir(parents=True, exist_ok=True)
     if ELECTRON_PACKAGE_OUT_DIR.exists():
         shutil.rmtree(ELECTRON_PACKAGE_OUT_DIR)
@@ -182,7 +182,7 @@ def build_backend_release(release_version: str) -> None:
                 "go",
                 "build",
                 "-tags",
-                "with_clash_api,with_gvisor",
+                "with_clash_api,with_gvisor,with_quic",
                 "-trimpath",
                 "-ldflags",
                 ldflags_value,

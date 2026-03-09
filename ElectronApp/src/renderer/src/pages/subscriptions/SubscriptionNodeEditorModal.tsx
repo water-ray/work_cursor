@@ -2,6 +2,7 @@ import { Alert, AutoComplete, Card, Col, Form, Input, InputNumber, Modal, Row, S
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { NodeGroup, NodeProtocol, VpnNode } from "../../../../shared/daemon";
 import { countryMetadataList } from "../../app/data/countryMetadata";
+import { CountryFlag } from "../../components/flag/CountryFlag";
 import { HelpLabel } from "../../components/form/HelpLabel";
 import type { HelpContent } from "../../components/form/HelpLabel";
 import {
@@ -53,7 +54,12 @@ interface SubscriptionNodeEditorModalProps {
 
 const countryOptions = countryMetadataList.map((metadata) => ({
   value: metadata.code,
-  label: `${metadata.flagEmoji} ${metadata.chineseName} · ${metadata.code}`,
+  label: (
+    <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+      <CountryFlag code={metadata.code} ariaLabel={metadata.chineseName} />
+      <span>{metadata.chineseName} · {metadata.code}</span>
+    </span>
+  ),
   searchText: metadata.searchText,
 }));
 
@@ -64,10 +70,10 @@ const compactWrapperCol = { flex: "auto" as const };
 
 const fieldHelpMap: Partial<Record<SubscriptionNodeFieldKey | "address" | "port" | "country", HelpContent>> = {
   groupId: {
-    scene: "选择节点要写入的手动分组。",
+    scene: "选择节点要写入的普通分组。",
     effect: "决定该节点出现在什么分组里，后续右键编辑也基于这个分组。",
-    caution: "只能写入手动分组，订阅分组节点不直接编辑。",
-    recommendation: "建议按用途拆分手动分组，例如“自建节点”“临时测试”。",
+    caution: "只能写入普通分组，订阅分组节点不直接编辑。",
+    recommendation: "建议按用途拆分普通分组，例如“自建节点”“临时测试”。",
   },
   name: {
     scene: "用于列表展示和快速识别节点。",
@@ -493,8 +499,8 @@ export function SubscriptionNodeEditorModal({
         <Alert
           type="warning"
           showIcon
-          message="当前没有可写入的手动分组"
-          description="请先创建一个手动分组，再添加或编辑手动节点。"
+          message="当前没有可写入的普通分组"
+          description="请先创建一个普通分组，再添加或编辑手动节点。"
         />
       ) : null}
       <Form<SubscriptionNodeFormValues>

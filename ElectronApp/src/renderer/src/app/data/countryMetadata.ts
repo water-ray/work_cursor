@@ -257,7 +257,6 @@ export interface CountryMetadata {
   code: CountryRegionCode;
   englishName: string;
   chineseName: string;
-  flagEmoji: string;
   searchText: string;
 }
 
@@ -316,12 +315,6 @@ function normalizeCountrySearchText(value: string | undefined): string {
     .replace(/\s+/g, " ");
 }
 
-function buildFlagEmoji(code: CountryRegionCode): string {
-  return String.fromCodePoint(
-    ...code.split("").map((char) => 127397 + char.charCodeAt(0)),
-  );
-}
-
 function resolveDisplayName(
   displayNames: Intl.DisplayNames | null,
   code: CountryRegionCode,
@@ -341,7 +334,6 @@ export const countryMetadataList: CountryMetadata[] = COUNTRY_REGION_CODES.map((
   const override = COUNTRY_NAME_OVERRIDES[code];
   const englishName = override?.englishName ?? resolveDisplayName(englishDisplayNames, code);
   const chineseName = override?.chineseName ?? resolveDisplayName(chineseDisplayNames, code);
-  const flagEmoji = buildFlagEmoji(code);
   const searchText = normalizeCountrySearchText(
     `${code} ${englishName} ${chineseName}`,
   );
@@ -349,7 +341,6 @@ export const countryMetadataList: CountryMetadata[] = COUNTRY_REGION_CODES.map((
     code,
     englishName,
     chineseName,
-    flagEmoji,
     searchText,
   };
 });
@@ -416,11 +407,6 @@ export function normalizeCountryCode(value: string | undefined): string {
     countryLookupByText.get(normalized.replace(/\s+/g, "")) ??
     ""
   );
-}
-
-export function resolveCountryFlagEmoji(value: string | undefined): string {
-  const metadata = resolveCountryMetadata(value);
-  return metadata?.flagEmoji ?? "";
 }
 
 export function buildCountrySearchText(value: string | undefined): string {

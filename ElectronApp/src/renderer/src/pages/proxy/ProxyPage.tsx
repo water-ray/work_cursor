@@ -26,6 +26,7 @@ import {
   normalizeCountryCode,
   resolveCountryMetadata,
 } from "../../app/data/countryMetadata";
+import { CountryFlag } from "../../components/flag/CountryFlag";
 import {
   readProxyStartupSmartOptimizePreference,
   writeProxyStartupSmartOptimizePreference,
@@ -42,8 +43,14 @@ import type {
   ProxyTunStack,
 } from "../../../../shared/daemon";
 import type { DaemonPageProps } from "../../app/types";
-import { notifyStartPrecheckResult } from "../../services/configChangeMessage";
 import { daemonApi } from "../../services/daemonApi";
+import {
+  buildServiceStartedMessage,
+  startServiceWithSmartOptimize,
+  startupCancelledErrorMessage,
+  stopServiceWithFeedback,
+  type ServiceStartupStage,
+} from "../../services/serviceControl";
 
 const defaultSniffTimeoutMs = 1000;
 const defaultTunMtu = 1420;
@@ -118,10 +125,13 @@ function buildSmartOptimizeCountryLabel(value: string, missing = false) {
   return (
     <span
       className="proxy-startup-smart-optimize-option"
-      title={`${metadata.flagEmoji} ${metadata.chineseName} · ${metadata.code} · ${metadata.englishName}${missing ? "（当前分组无匹配）" : ""}`}
+      title={`${metadata.chineseName} · ${metadata.code} · ${metadata.englishName}${missing ? "（当前分组无匹配）" : ""}`}
     >
       <span className="proxy-startup-smart-optimize-flag" aria-hidden="true">
-        {metadata.flagEmoji}
+        <CountryFlag
+          code={metadata.code}
+          ariaLabel={metadata.chineseName}
+        />
       </span>
       <span className="proxy-startup-smart-optimize-primary">
         {metadata.chineseName}
@@ -160,51 +170,6 @@ function buildSmartOptimizeCountrySearchText(value: string, missing = false): st
   return buildCountrySearchText(
     `${metadata.code} ${metadata.chineseName} ${metadata.englishName}${missing ? " 当前分组无匹配" : ""}`,
   );
-}
-
-function hasUsableNodeScore(node: {
-  latencyMs?: number;
-  probeRealConnectMs?: number;
-  probeScore?: number;
-}): boolean {
-  return (
-    Number(node.latencyMs ?? 0) > 0 &&
-    Number(node.probeRealConnectMs ?? 0) > 0 &&
-    Number(node.probeScore ?? 0) > 0
-  );
-}
-
-function compareNodesByProbeScoreDesc(
-  left: {
-    probeScore?: number;
-    latencyMs?: number;
-    probeRealConnectMs?: number;
-    name?: string;
-  },
-  right: {
-    probeScore?: number;
-    latencyMs?: number;
-    probeRealConnectMs?: number;
-    name?: string;
-  },
-): number {
-  const scoreDelta = Number(right.probeScore ?? 0) - Number(left.probeScore ?? 0);
-  if (scoreDelta !== 0) {
-    return scoreDelta;
-  }
-  const latencyDelta =
-    Number(left.latencyMs ?? Number.POSITIVE_INFINITY) -
-    Number(right.latencyMs ?? Number.POSITIVE_INFINITY);
-  if (latencyDelta !== 0) {
-    return latencyDelta;
-  }
-  const realConnectDelta =
-    Number(left.probeRealConnectMs ?? Number.POSITIVE_INFINITY) -
-    Number(right.probeRealConnectMs ?? Number.POSITIVE_INFINITY);
-  if (realConnectDelta !== 0) {
-    return realConnectDelta;
-  }
-  return String(left.name ?? "").localeCompare(String(right.name ?? ""), "zh-CN");
 }
 
 function resolveTrafficMonitorIntervalSec(
@@ -363,7 +328,7 @@ function buildConfigMergeSuccessMessage(
 
 type ConfigExportMode = "save_file" | "copy_file" | "copy_text";
 type ConfigImportMode = "select_file" | "clipboard_file" | "clipboard_text";
-type StartupProgressStage = "precheck" | "probe" | "select" | "apply_mode" | "start";
+type StartupProgressStage = ServiceStartupStage;
 type StartupProgressStatus = "running" | "success" | "error";
 
 const startupProgressStages: Array<{
@@ -376,8 +341,6 @@ const startupProgressStages: Array<{
   { key: "apply_mode", title: "写入本次启动模式" },
   { key: "start", title: "启动代理服务" },
 ];
-const startupCancelledErrorMessage = "启动过程已被强制停止";
-
 function proxyModeLabel(mode: ProxyMode): string {
   return mode === "tun" ? "虚拟网卡模式" : mode === "system" ? "系统代理模式" : "最小实例";
 }
@@ -506,6 +469,11 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
     updatingConfiguredProxyMode;
   const isServiceTransitioning =
     snapshot?.connectionStage === "connecting" || snapshot?.connectionStage === "disconnecting";
+  const isStoppingTransition = snapshot?.connectionStage === "disconnecting";
+  const isStartingTransition = snapshot?.connectionStage === "connecting";
+  const mainToggleVisualOff = proxyMode === "off" && !isStoppingTransition;
+  const mainToggleActionLabel =
+    isStoppingTransition ? "停止中" : isStartingTransition ? "启动中" : proxyMode === "off" ? "启动" : "停止";
   const activeGroup = useMemo(
     () => snapshot?.groups.find((group) => group.id === snapshot.activeGroupId) ?? null,
     [snapshot],
@@ -587,7 +555,7 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
       return "当前没有激活分组，仅支持关闭优选或订阅激活分组最佳。";
     }
     if (activeGroup.kind !== "subscription") {
-      return "当前为手动分组，智能优选仅对订阅激活分组生效。";
+      return "当前为普通分组，智能优选仅对订阅激活分组生效。";
     }
     if (smartOptimizeCountryEntries.length === 0) {
       return "当前订阅分组未识别到国家字段，仅支持关闭优选或订阅激活分组最佳。";
@@ -795,104 +763,6 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
     }
   };
 
-  const resolveSmartOptimizeTargetNode = async (
-    onStageChange?: (stage: StartupProgressStage, detail: string) => void,
-  ): Promise<{
-    selectedNodeName: string;
-    fallbackWarning: string;
-  }> => {
-    if (startupSmartOptimize === startupSmartOptimizeOff) {
-      return { selectedNodeName: "", fallbackWarning: "" };
-    }
-    const currentGroup = activeGroup;
-    if (!snapshot || !currentGroup || currentGroup.nodes.length === 0) {
-      return {
-        selectedNodeName: "",
-        fallbackWarning: "智能优选未找到可评估分组，已回退当前激活节点继续启动。",
-      };
-    }
-    if (currentGroup.kind !== "subscription") {
-      return {
-        selectedNodeName: "",
-        fallbackWarning: "当前激活分组不是订阅分组，已跳过智能优选并继续启动。",
-      };
-    }
-
-    let probeTargetNodes = [...(currentGroup.nodes ?? [])];
-    if (startupSmartOptimize !== startupSmartOptimizeBest) {
-      const targetCountry = parseStartupSmartOptimizeCountry(startupSmartOptimize);
-      probeTargetNodes = probeTargetNodes.filter(
-        (node) => resolveNodeCountryValue(node) === targetCountry,
-      );
-      if (probeTargetNodes.length === 0) {
-        return {
-          selectedNodeName: "",
-          fallbackWarning: "当前订阅分组没有该国家节点，已回退当前激活节点继续启动。",
-        };
-      }
-    }
-
-    let probeSnapshot = snapshot;
-    try {
-      onStageChange?.(
-        "probe",
-        startupSmartOptimize === startupSmartOptimizeBest
-          ? "正在为当前激活订阅分组全部节点执行评分，请稍候..."
-          : `正在仅为目标国家候选节点执行评分（${probeTargetNodes.length} 个）...`,
-      );
-      probeSnapshot = await runAction(async () => {
-        const result = await daemonApi.probeNodesWithSummary({
-          groupId: currentGroup.id,
-          nodeIds: probeTargetNodes.map((node) => node.id),
-          probeTypes: ["real_connect"],
-        });
-        return result.snapshot;
-      });
-    } catch {
-      return {
-        selectedNodeName: "",
-        fallbackWarning: "启动前节点评分失败，已回退当前激活节点继续启动。",
-      };
-    }
-
-    const probeGroup =
-      probeSnapshot.groups.find((group) => group.id === currentGroup.id) ?? currentGroup;
-    const allowedNodeIDs = new Set(probeTargetNodes.map((node) => node.id));
-    onStageChange?.("select", "正在根据智能优选配置筛选候选节点...");
-    let candidateNodes = [...(probeGroup.nodes ?? [])].filter(
-      (node) => allowedNodeIDs.has(node.id) && hasUsableNodeScore(node),
-    );
-    if (startupSmartOptimize !== startupSmartOptimizeBest) {
-      const targetCountry = parseStartupSmartOptimizeCountry(startupSmartOptimize);
-      candidateNodes = candidateNodes.filter(
-        (node) => resolveNodeCountryValue(node) === targetCountry,
-      );
-    }
-    candidateNodes.sort(compareNodesByProbeScoreDesc);
-    const nextNode = candidateNodes[0] ?? null;
-    if (!nextNode) {
-      return {
-        selectedNodeName: "",
-        fallbackWarning: "智能优选未找到可用候选节点，已回退当前激活节点继续启动。",
-      };
-    }
-    if (nextNode.id !== probeSnapshot.selectedNodeId) {
-      try {
-        onStageChange?.("select", `正在切换到优选节点：${nextNode.name}`);
-        await runAction(() => daemonApi.selectNode(nextNode.id, probeGroup.id));
-      } catch {
-        return {
-          selectedNodeName: "",
-          fallbackWarning: "智能优选切换节点失败，已回退当前激活节点继续启动。",
-        };
-      }
-    }
-    return {
-      selectedNodeName: nextNode.name,
-      fallbackWarning: "",
-    };
-  };
-
   const updateStartupStage = (
     stage: StartupProgressStage,
     detail: string,
@@ -1002,12 +872,15 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
   };
 
   const toggleServiceState = async () => {
-    startupCancelRequestedRef.current = false;
-    const startupSessionID = startupSessionRef.current + 1;
-    startupSessionRef.current = startupSessionID;
+    if (!snapshot || loading || serviceActionBusy || isServiceTransitioning) {
+      return;
+    }
     setTogglingService(true);
     try {
       if (proxyMode === "off") {
+        startupCancelRequestedRef.current = false;
+        const startupSessionID = startupSessionRef.current + 1;
+        startupSessionRef.current = startupSessionID;
         const targetMode = configuredProxyMode === "tun" ? "tun" : "system";
         const startedAtMs = Date.now();
         setStartupProgress({
@@ -1022,11 +895,22 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
           closeAtMs: undefined,
           precheckResult: undefined,
         });
-        const precheck = await daemonApi.checkStartPreconditions();
-        if (startupSessionRef.current !== startupSessionID) {
-          throw new Error(startupCancelledErrorMessage);
-        }
-        if (!notifyStartPrecheckResult(notice, precheck.result)) {
+        const startResult = await startServiceWithSmartOptimize({
+          snapshot,
+          runAction,
+          notice,
+          startupSmartOptimize,
+          onStageChange: (stage, detail) => {
+            if (startupSessionRef.current !== startupSessionID) {
+              return;
+            }
+            updateStartupStage(stage, detail, targetMode);
+          },
+          isCancelled: () =>
+            startupSessionRef.current !== startupSessionID || startupCancelRequestedRef.current,
+          cancellationErrorMessage: startupCancelledErrorMessage,
+        });
+        if (startResult.aborted) {
           setStartupProgress((current) =>
             current
               ? {
@@ -1035,68 +919,28 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
                   status: "error",
                   errorDetail: "启动参数或运行环境不满足当前启动条件。",
                   closeAtMs: undefined,
-                  precheckResult: precheck.result,
+                  precheckResult: startResult.precheckResult,
                 }
               : current,
           );
           return;
         }
-        await stopStartupIfCancelled(startupSessionID);
-        const smartOptimizeResult = await resolveSmartOptimizeTargetNode((stage, detail) => {
-          if (startupSessionRef.current !== startupSessionID) {
-            return;
-          }
-          updateStartupStage(stage, detail, targetMode, {
-            precheckResult: precheck.result,
-          });
-        });
         if (startupSessionRef.current !== startupSessionID) {
           throw new Error(startupCancelledErrorMessage);
         }
         await stopStartupIfCancelled(startupSessionID);
-        if (smartOptimizeResult.fallbackWarning) {
-          notice.warning(smartOptimizeResult.fallbackWarning);
-        }
-        updateStartupStage("apply_mode", `正在应用本次启动模式：${proxyModeLabel(targetMode)}...`, targetMode, {
-          precheckResult: precheck.result,
-        });
-        await runAction(() =>
-          daemonApi.setSettings({
-            proxyMode: targetMode,
-            applyRuntime: false,
-          }),
-        );
-        if (startupSessionRef.current !== startupSessionID) {
-          throw new Error(startupCancelledErrorMessage);
-        }
-        await stopStartupIfCancelled(startupSessionID);
-        updateStartupStage("start", "正在启动代理服务...", targetMode, {
-          precheckResult: precheck.result,
-        });
-        const nextSnapshot = await runAction(() => daemonApi.startConnection());
-        if (startupSessionRef.current !== startupSessionID) {
-          throw new Error(startupCancelledErrorMessage);
-        }
-        await stopStartupIfCancelled(startupSessionID);
-        finishStartupStage("success", "启动完成，代理服务已就绪。", targetMode, {
+        finishStartupStage("success", "启动完成，代理服务已就绪。", startResult.targetMode, {
           closeAtMs: Date.now() + 3000,
-          precheckResult: precheck.result,
+          precheckResult: startResult.precheckResult,
         });
-        const selectedNodeSuffix = smartOptimizeResult.selectedNodeName
-          ? `，智能优选：${smartOptimizeResult.selectedNodeName}`
-          : "";
-        if (nextSnapshot.proxyMode === "tun") {
-          notice.success(`服务已启动（虚拟网卡模式${selectedNodeSuffix}）`);
-        } else {
-          notice.success(`服务已启动（系统代理模式${selectedNodeSuffix}）`);
-        }
+        notice.success(
+          buildServiceStartedMessage(startResult.targetMode, startResult.selectedNodeName),
+        );
       } else {
-        const nextSnapshot = await runAction(() => daemonApi.stopConnection());
-        if (nextSnapshot.connectionStage === "connected" && nextSnapshot.proxyMode === "off") {
-          notice.success("服务已停止（最小实例）");
-        } else {
-          notice.info("正在停止服务，请稍候...");
-        }
+        await stopServiceWithFeedback({
+          runAction,
+          notice,
+        });
       }
     } catch (error) {
       if (proxyMode === "off") {
@@ -1123,10 +967,8 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
         notice.error(error instanceof Error ? error.message : "切换服务状态失败");
       }
     } finally {
-      if (startupSessionRef.current === startupSessionID) {
-        setForcingCloseStartup(false);
-        setTogglingService(false);
-      }
+      setForcingCloseStartup(false);
+      setTogglingService(false);
     }
   };
 
@@ -1895,16 +1737,25 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
               <div className="proxy-main-toggle-wrap">
                 <Button
                   type="primary"
-                  className={`proxy-main-toggle-btn ${proxyMode === "off" ? "is-off" : "is-on"}`}
-                  loading={togglingService}
-                  disabled={!snapshot || loading || serviceActionBusy}
+                  className={`proxy-main-toggle-btn ${mainToggleVisualOff ? "is-off" : "is-on"}`}
+                  loading={togglingService || isServiceTransitioning}
+                  disabled={!snapshot || loading || serviceActionBusy || isServiceTransitioning}
+                  title={mainToggleActionLabel}
                   onClick={() => {
                     void toggleServiceState();
                   }}
                 >
                   <span className="proxy-main-toggle-btn-content">
-                    <BiIcon name={proxyMode === "off" ? "play-fill" : "stop-fill"} />
-                    <span>{proxyMode === "off" ? "启动" : "停止"}</span>
+                    <BiIcon
+                      name={
+                        isServiceTransitioning
+                          ? "arrow-repeat"
+                          : proxyMode === "off"
+                            ? "play-fill"
+                            : "stop-fill"
+                      }
+                    />
+                    <span>{mainToggleActionLabel}</span>
                   </span>
                 </Button>
               </div>
@@ -1915,7 +1766,7 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
                   className="proxy-restart-btn"
                   icon={<BiIcon name="arrow-clockwise" />}
                   loading={restartingService}
-                  disabled={!snapshot || loading || serviceActionBusy}
+                  disabled={!snapshot || loading || serviceActionBusy || isServiceTransitioning}
                   onClick={() => {
                     void restartService();
                   }}

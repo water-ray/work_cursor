@@ -1,16 +1,23 @@
 import { Button, Checkbox, Modal, Radio, Space, Typography } from "antd";
 import { useEffect, useMemo, useState } from "react";
 import type { DaemonSnapshot, ProxyMode, VpnConnectionStage } from "../../../../shared/daemon";
+import { CountryFlag } from "../flag/CountryFlag";
 import { BiIcon } from "../icons/BiIcon";
-import { useAppNotice } from "../notify/AppNoticeProvider";
+import { useAppNotice, useAppNoticeHistory } from "../notify/AppNoticeProvider";
 import { daemonApi } from "../../services/daemonApi";
-import { notifyStartPrecheckResult } from "../../services/configChangeMessage";
 import { resolveCountryMetadata } from "../../app/data/countryMetadata";
 import {
   type CloseBehavior,
   readCloseBehavior,
+  readProxyStartupSmartOptimizePreference,
   writeCloseBehavior,
 } from "../../app/settings/uiPreferences";
+import {
+  buildServiceStartedMessage,
+  resolveModeLabel,
+  startServiceWithSmartOptimize,
+  stopServiceWithFeedback,
+} from "../../services/serviceControl";
 
 interface WindowTitleBarProps {
   title: string;
@@ -24,16 +31,6 @@ interface WindowTitleBarProps {
   onTaskCenterToggle: () => void;
 }
 
-function resolveModeLabel(mode: ProxyMode): string {
-  if (mode === "tun") {
-    return "虚拟网卡模式";
-  }
-  if (mode === "system") {
-    return "系统代理模式";
-  }
-  return "最小实例";
-}
-
 function formatRateToKM(value: number | undefined): string {
   const normalized = Math.max(0, Math.trunc(Number(value ?? 0)));
   const valueK = normalized / 1024;
@@ -41,6 +38,14 @@ function formatRateToKM(value: number | undefined): string {
     return `${(valueK / 1024).toFixed(2)}M`;
   }
   return `${valueK.toFixed(2)}K`;
+}
+
+function formatNoticeTime(value: number): string {
+  try {
+    return new Date(value).toLocaleString("zh-CN", { hour12: false });
+  } catch {
+    return "-";
+  }
 }
 
 export function WindowTitleBar({
@@ -55,7 +60,9 @@ export function WindowTitleBar({
   onTaskCenterToggle,
 }: WindowTitleBarProps) {
   const notice = useAppNotice();
+  const noticeHistory = useAppNoticeHistory();
   const [maximized, setMaximized] = useState(false);
+  const [noticeCenterOpen, setNoticeCenterOpen] = useState(false);
   const [closingApp, setClosingApp] = useState(false);
   const [togglingService, setTogglingService] = useState(false);
   const [restartingService, setRestartingService] = useState(false);
@@ -202,6 +209,13 @@ export function WindowTitleBar({
     };
   }, []);
 
+  useEffect(() => {
+    if (!noticeCenterOpen) {
+      return;
+    }
+    noticeHistory.markAllRead();
+  }, [noticeCenterOpen, noticeHistory]);
+
   const executeCloseBehavior = async (behavior: CloseBehavior) => {
     if (closingApp || quittingAll) {
       return;
@@ -234,23 +248,31 @@ export function WindowTitleBar({
     setTogglingService(true);
     try {
       if (proxyMode === "off") {
-        const precheck = await daemonApi.checkStartPreconditions();
-        if (!notifyStartPrecheckResult(notice, precheck.result)) {
-          return;
-        }
+        const startupSmartOptimize = readProxyStartupSmartOptimizePreference();
         const targetMode: ProxyMode = configuredProxyMode === "tun" ? "tun" : "system";
         setOptimisticProxyMode(targetMode);
         setOptimisticConnectionStage("connecting");
-        const nextSnapshot = await runAction(() => daemonApi.startConnection());
-        notice.success(`服务已启动（${resolveModeLabel(nextSnapshot.proxyMode)}）`);
-      } else {
-        setOptimisticConnectionStage("disconnecting");
-        const nextSnapshot = await runAction(() => daemonApi.stopConnection());
-        if (nextSnapshot.connectionStage === "connected" && nextSnapshot.proxyMode === "off") {
-          notice.success("服务已停止（最小实例）");
-        } else {
-          notice.info("正在停止服务，请稍候...");
+        const startResult = await startServiceWithSmartOptimize({
+          snapshot,
+          runAction,
+          notice,
+          startupSmartOptimize,
+        });
+        if (startResult.aborted) {
+          setOptimisticProxyMode(null);
+          setOptimisticConnectionStage(null);
+          return;
         }
+        notice.success(
+          buildServiceStartedMessage(startResult.targetMode, startResult.selectedNodeName),
+        );
+      } else {
+        setOptimisticProxyMode(proxyMode);
+        setOptimisticConnectionStage("disconnecting");
+        await stopServiceWithFeedback({
+          runAction,
+          notice,
+        });
       }
     } catch (error) {
       setOptimisticProxyMode(null);
@@ -343,6 +365,16 @@ export function WindowTitleBar({
             icon={<BiIcon name="list-task" />}
             onClick={onTaskCenterToggle}
           />
+          <Button
+            size="small"
+            type="text"
+            className={`window-task-center-btn window-notice-center-btn${noticeHistory.unreadCount > 0 ? " is-unread" : ""}${noticeCenterOpen ? " is-open" : ""}`}
+            title="近期通知"
+            icon={<BiIcon name="bell" />}
+            onClick={() => {
+              setNoticeCenterOpen(true);
+            }}
+          />
         </div>
         <div className="window-title-wrap">
           <Typography.Text className="window-title">{title}</Typography.Text>
@@ -360,10 +392,13 @@ export function WindowTitleBar({
           {activeNodeSummary ? (
             <span
               className="window-active-node-flag"
-              title={`${activeNodeSummary.metadata.flagEmoji} ${activeNodeSummary.metadata.chineseName} · ${activeNodeSummary.metadata.code} · 评分(${Math.max(0, Math.round(activeNodeSummary.probeScore))}分) · 真连延迟(${Math.max(0, Math.round(activeNodeSummary.probeRealConnectMs))}ms)`}
+              title={`${activeNodeSummary.metadata.chineseName} · ${activeNodeSummary.metadata.code} · 评分(${Math.max(0, Math.round(activeNodeSummary.probeScore))}分) · 真连延迟(${Math.max(0, Math.round(activeNodeSummary.probeRealConnectMs))}ms)`}
               aria-label={activeNodeSummary.metadata.chineseName}
             >
-              {activeNodeSummary.metadata.flagEmoji}
+              <CountryFlag
+                code={activeNodeSummary.metadata.code}
+                ariaLabel={activeNodeSummary.metadata.chineseName}
+              />
             </span>
           ) : null}
           <Button
@@ -440,6 +475,51 @@ export function WindowTitleBar({
           />
         </Space>
       </div>
+      <Modal
+        title={`近期通知${noticeHistory.recentItems.length > 0 ? `（最近 ${noticeHistory.recentItems.length} 条）` : ""}`}
+        open={noticeCenterOpen}
+        footer={null}
+        width={520}
+        onCancel={() => {
+          setNoticeCenterOpen(false);
+        }}
+      >
+        <div className="notice-center-list">
+          {noticeHistory.recentItems.length > 0 ? (
+            noticeHistory.recentItems.map((item) => (
+              <div
+                key={item.id}
+                className={`notice-center-item notice-center-item-${item.level}`}
+              >
+                <div className="notice-center-item-head">
+                  <span className="notice-center-item-icon">
+                    <BiIcon
+                      name={item.level === "success"
+                        ? "check-circle-fill"
+                        : item.level === "warning"
+                          ? "exclamation-triangle-fill"
+                          : item.level === "error"
+                            ? "x-circle-fill"
+                            : "info-circle-fill"}
+                    />
+                  </span>
+                  <div className="notice-center-item-main">
+                    <div className="notice-center-item-title-row">
+                      <Typography.Text strong>{item.title}</Typography.Text>
+                      <Typography.Text type="secondary" className="notice-center-item-time">
+                        {formatNoticeTime(item.createdAtMs)}
+                      </Typography.Text>
+                    </div>
+                    <div className="notice-center-item-text">{item.content}</div>
+                  </div>
+                </div>
+              </div>
+            ))
+          ) : (
+            <Typography.Text type="secondary">暂无通知记录</Typography.Text>
+          )}
+        </div>
+      </Modal>
       <Modal
         title="关闭窗口"
         open={closeDialogOpen}

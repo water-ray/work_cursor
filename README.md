@@ -12,15 +12,19 @@
 
 - `ElectronApp/`：Electron UI 层（React + TypeScript + Ant Design）
 - `core/`：Go 内核层（封装 sing-box 能力）
+- `adsroot/server/`：广告后端（Express + SQLite + JWT）
+- `adsroot/web/`：广告前端（React + TypeScript）
 - `scripts/`：构建、CI、打包脚本
 
 ## 目录结构
 
 ```text
 ElectronApp/  # Electron 前端控制台
-core/     # Go 内核守护进程与控制面 API
-scripts/  # 构建与发布脚本
-docs/     # 架构、测试与设计文档
+core/            # Go 内核守护进程与控制面 API
+adsroot/server/  # 广告后端服务
+adsroot/web/     # 广告前端单页应用
+scripts/         # 构建与发布脚本
+docs/            # 架构、测试与设计文档
 ```
 
 ## 开发原则
@@ -86,8 +90,12 @@ docs/     # 架构、测试与设计文档
 ## 本地 Windows 开发环境初始化
 
 - 启动 core：
-  - `cd core && go run -tags with_clash_api,with_gvisor ./cmd/waterayd`
+  - `cd core && go run -tags with_clash_api,with_gvisor,with_quic ./cmd/waterayd`
 - 启动 Electron 前端：
   - `cd ElectronApp && npm install && npm run dev`
+- 启动广告后端：
+  - `cd adsroot/server && npm install && npm run dev`
+- 启动广告前端：
+  - `cd adsroot/web && npm install && npm run dev`
 - 或使用 VSCode 任务一键启动：
-  - `wateray: run desktop stack`
+  - `客户端：开发：运行桌面整套`

@@ -1,14 +1,41 @@
 {
   "version": "2.0.0",
+  "inputs": [
+    {
+      "id": "githubPrivateRepoUrl",
+      "type": "promptString",
+      "description": "输入私有源码仓库 Git URL",
+      "default": "https://github.com/water-ray/wateray-src.git"
+    },
+    {
+      "id": "githubPrivateRemoteName",
+      "type": "promptString",
+      "description": "输入私有源码仓库 remote 名称",
+      "default": "source-private"
+    },
+    {
+      "id": "githubPrivateBranch",
+      "type": "promptString",
+      "description": "输入要推送到私有源码仓库的分支名",
+      "default": "main"
+    },
+    {
+      "id": "githubPublicRepo",
+      "type": "promptString",
+      "description": "输入公开发布仓库 owner/name",
+      "default": "water-ray/wateray"
+    }
+  ],
   "tasks": [
     {
-      "label": "wateray: run electron app",
+      "label": "客户端：开发：运行 Electron 前端",
       "type": "shell",
       "command": "npm run dev",
       "options": {
         "cwd": "${workspaceFolder}/ElectronApp",
         "env": {
-          "WATERAY_APP_MODE": "dev"
+          "WATERAY_APP_MODE": "dev",
+          "VITE_AIRPORT_WEB_URL": "http://127.0.0.1:5179/"
         }
       },
       "group": "build",
@@ -21,11 +48,14 @@
       }
     },
     {
-      "label": "wateray: build electron app",
+      "label": "客户端：构建：Electron 前端",
       "type": "shell",
       "command": "npm run build",
       "options": {
-        "cwd": "${workspaceFolder}/ElectronApp"
+        "cwd": "${workspaceFolder}/ElectronApp",
+        "env": {
+          "VITE_AIRPORT_WEB_URL": "https://wateray.net/"
+        }
       },
       "group": "build",
       "problemMatcher": [],
@@ -36,7 +66,7 @@
       }
     },
     {
-      "label": "wateray: typecheck electron app",
+      "label": "客户端：检查：Electron 类型检查",
       "type": "shell",
       "command": "npm run typecheck",
       "options": {
@@ -51,11 +81,11 @@
       }
     },
     {
-      "label": "wateray: run ads server",
+      "label": "广告端：开发：运行服务端",
       "type": "shell",
       "command": "npm run dev",
       "options": {
-        "cwd": "${workspaceFolder}/ads-server"
+        "cwd": "${workspaceFolder}/adsroot/server"
       },
       "group": "build",
       "isBackground": true,
@@ -67,9 +97,64 @@
       }
     },
     {
-      "label": "wateray: run vpn core",
+      "label": "广告端：开发：运行前端",
       "type": "shell",
-      "command": "go run -tags with_clash_api,with_gvisor ./cmd/waterayd",
+      "command": "npm run dev",
+      "options": {
+        "cwd": "${workspaceFolder}/adsroot/web"
+      },
+      "group": "build",
+      "isBackground": true,
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": false
+      }
+    },
+    {
+      "label": "广告端：发布：服务端",
+      "type": "shell",
+      "command": "$ErrorActionPreference = 'Stop'; $serverSrc = Join-Path '${workspaceFolder}' 'adsroot/server'; $publishServer = Join-Path '${workspaceFolder}' 'Bin/adsroot/server'; npm run build --prefix $serverSrc; if (Test-Path $publishServer) { Remove-Item -Path $publishServer -Recurse -Force }; New-Item -ItemType Directory -Path $publishServer -Force | Out-Null; Copy-Item -Path (Join-Path $serverSrc 'dist') -Destination $publishServer -Recurse -Force; Set-Content -Path (Join-Path $publishServer 'main.js') -Value 'import ''./dist/main.js'';' -Encoding UTF8; $serverFiles = @('package.json', 'package-lock.json', '.env.example', 'README.md', 'install.sh'); foreach ($name in $serverFiles) { $sourcePath = Join-Path $serverSrc $name; if (Test-Path $sourcePath) { Copy-Item -Path $sourcePath -Destination $publishServer -Force } }; Get-ChildItem -Path $publishServer -Recurse -File | Where-Object { $_.Extension -eq '.sqlite' -or $_.Name.EndsWith('.sqlite-wal') -or $_.Name.EndsWith('.sqlite-shm') } | Remove-Item -Force",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": "build",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": false
+      }
+    },
+    {
+      "label": "广告端：发布：前端",
+      "type": "shell",
+      "command": "$ErrorActionPreference = 'Stop'; npm run build --prefix \"${workspaceFolder}/adsroot/web\"; $publishWeb = Join-Path '${workspaceFolder}' 'Bin/adsroot/web'; if (Test-Path $publishWeb) { Remove-Item -Path $publishWeb -Recurse -Force }; New-Item -ItemType Directory -Path $publishWeb -Force | Out-Null; Copy-Item -Path \"${workspaceFolder}/adsroot/web/dist\" -Destination $publishWeb -Recurse -Force",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": "build",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": false
+      }
+    },
+    {
+      "label": "广告端：发布：前后端整套",
+      "dependsOn": [
+        "广告端：发布：服务端",
+        "广告端：发布：前端"
+      ],
+      "dependsOrder": "sequence",
+      "problemMatcher": []
+    },
+    {
+      "label": "客户端：开发：运行 VPN 内核",
+      "type": "shell",
+      "command": "go run -tags with_clash_api,with_gvisor,with_quic ./cmd/waterayd",
       "options": {
         "cwd": "${workspaceFolder}/core"
       },
@@ -83,7 +168,7 @@
       }
     },
     {
-      "label": "wateray: build windows client",
+      "label": "客户端：构建：Windows 客户端整包",
       "type": "shell",
       "command": "python scripts/build/build_windows_client.py",
       "options": {
@@ -98,7 +183,7 @@
       }
     },
     {
-      "label": "wateray: release dry-run (patch)",
+      "label": "客户端：版本：补丁版预演",
       "type": "shell",
       "command": "python scripts/release/release_version.py patch --dry-run",
       "options": {
@@ -113,7 +198,7 @@
       }
     },
     {
-      "label": "wateray: release patch",
+      "label": "客户端：版本：发布补丁版",
       "type": "shell",
       "command": "python scripts/release/release_version.py patch",
       "options": {
@@ -128,7 +213,7 @@
       }
     },
     {
-      "label": "wateray: release minor",
+      "label": "客户端：版本：发布次版本",
       "type": "shell",
       "command": "python scripts/release/release_version.py minor",
       "options": {
@@ -143,7 +228,7 @@
       }
     },
     {
-      "label": "wateray: release major",
+      "label": "客户端：版本：发布主版本",
       "type": "shell",
       "command": "python scripts/release/release_version.py major",
       "options": {
@@ -158,30 +243,244 @@
       }
     },
     {
-      "label": "wateray: release patch + build windows client",
+      "label": "客户端：版本：补丁版并构建 Windows 客户端",
       "dependsOn": [
-        "wateray: release patch",
-        "wateray: build windows client"
+        "客户端：版本：发布补丁版",
+        "客户端：构建：Windows 客户端整包"
       ],
       "dependsOrder": "sequence",
       "problemMatcher": []
     },
     {
-      "label": "wateray: run desktop stack",
+      "label": "客户端：开发：运行桌面整套",
       "dependsOn": [
-        "wateray: run vpn core",
-        "wateray: run electron app"
+        "客户端：开发：运行 VPN 内核",
+        "客户端：开发：运行 Electron 前端"
       ],
       "dependsOrder": "sequence",
       "problemMatcher": []
     },
     {
-      "label": "wateray: run windows stack",
+      "label": "客户端：开发：运行 Windows 整套",
       "dependsOn": [
-        "wateray: run desktop stack"
+        "客户端：开发：运行桌面整套"
       ],
       "dependsOrder": "sequence",
       "problemMatcher": []
+    },
+    {
+      "label": "GitHub：检查：当前仓库状态",
+      "type": "shell",
+      "command": "git remote -v; git branch --show-current; git status --short",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": false
+      }
+    },
+    {
+      "label": "GitHub：检查：GitHub 登录状态",
+      "type": "shell",
+      "command": "$gh = Get-Command gh -ErrorAction SilentlyContinue; if ($gh) { gh auth status } else { Write-Host '未检测到 gh CLI。当前任务已跳过命令行登录检查。'; Write-Host '如果后续 git push 与浏览器打开 GitHub 页面都正常，可继续使用其余 GitHub 任务。'; }",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": false
+      }
+    },
+    {
+      "label": "GitHub：私有源码：打开新建仓库页面",
+      "type": "shell",
+      "command": "Start-Process 'https://github.com/new'",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "focus": false
+      }
+    },
+    {
+      "label": "GitHub：私有源码：添加或更新远程仓库",
+      "type": "shell",
+      "command": "$ErrorActionPreference = 'Stop'; $remote = '${input:githubPrivateRemoteName}'; $url = '${input:githubPrivateRepoUrl}'; $exists = git remote get-url $remote 2>$null; if ($LASTEXITCODE -eq 0) { git remote set-url $remote $url; Write-Host \"updated remote $remote -> $url\" } else { git remote add $remote $url; Write-Host \"added remote $remote -> $url\" }; git remote -v",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": false
+      }
+    },
+    {
+      "label": "GitHub：私有源码：推送当前分支",
+      "type": "shell",
+      "command": "$ErrorActionPreference = 'Stop'; git push -u '${input:githubPrivateRemoteName}' \"HEAD:${input:githubPrivateBranch}\"",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": true
+      }
+    },
+    {
+      "label": "GitHub：公开发布：打开公开仓库首页",
+      "type": "shell",
+      "command": "Start-Process \"https://github.com/${input:githubPublicRepo}\"",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "focus": false
+      }
+    },
+    {
+      "label": "GitHub：公开发布：打开 Releases 列表页",
+      "type": "shell",
+      "command": "Start-Process \"https://github.com/${input:githubPublicRepo}/releases\"",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "focus": false
+      }
+    },
+    {
+      "label": "GitHub：公开发布：打开新建 Release 页面",
+      "type": "shell",
+      "command": "Start-Process \"https://github.com/${input:githubPublicRepo}/releases/new\"",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "focus": false
+      }
+    },
+    {
+      "label": "GitHub：公开发布：构建全部发布产物",
+      "dependsOn": [
+        "客户端：构建：Windows 客户端整包",
+        "广告端：发布：前后端整套"
+      ],
+      "dependsOrder": "sequence",
+      "problemMatcher": []
+    },
+    {
+      "label": "GitHub：公开发布：生成 Release 素材",
+      "type": "shell",
+      "command": "python scripts/release/prepare_github_release.py --repo \"${input:githubPublicRepo}\"",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": false
+      }
+    },
+    {
+      "label": "GitHub：公开发布：构建并生成 Release 素材",
+      "dependsOn": [
+        "GitHub：公开发布：构建全部发布产物",
+        "GitHub：公开发布：生成 Release 素材"
+      ],
+      "dependsOrder": "sequence",
+      "problemMatcher": []
+    },
+    {
+      "label": "GitHub：公开发布：打开客户端产物目录",
+      "type": "shell",
+      "command": "explorer \"${workspaceFolder}\\Bin\\Wateray-windows\"",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "focus": false
+      }
+    },
+    {
+      "label": "GitHub：公开发布：打开广告产物目录",
+      "type": "shell",
+      "command": "explorer \"${workspaceFolder}\\Bin\\adsroot\"",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "focus": false
+      }
+    },
+    {
+      "label": "GitHub：公开发布：打开 Release 素材目录",
+      "type": "shell",
+      "command": "explorer \"${workspaceFolder}\\Bin\\github-release\"",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "focus": false
+      }
+    },
+    {
+      "label": "GitHub：公开发布：打开本次发布说明",
+      "type": "shell",
+      "command": "$version = (Get-Content -Raw \"${workspaceFolder}\\VERSION\").Trim(); $path = Join-Path \"${workspaceFolder}\\Bin\\github-release\" (\"v\" + $version + \"\\release-notes-v\" + $version + \".md\"); if (-not (Test-Path $path)) { throw \"未找到本次发布说明，请先执行“GitHub：公开发布：生成 Release 素材”\" }; $resolved = (Resolve-Path $path).Path; code $resolved",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "focus": false
+      }
+    },
+    {
+      "label": "GitHub：公开发布：复制本次发布说明到剪贴板",
+      "type": "shell",
+      "command": "$version = (Get-Content -Raw \"${workspaceFolder}\\VERSION\").Trim(); $path = Join-Path \"${workspaceFolder}\\Bin\\github-release\" (\"v\" + $version + \"\\release-notes-v\" + $version + \".md\"); if (-not (Test-Path $path)) { throw \"未找到本次发布说明，请先执行“GitHub：公开发布：生成 Release 素材”\" }; $resolved = (Resolve-Path $path).Path; Get-Content -Raw $resolved | Set-Clipboard; Write-Host \"已复制到剪贴板：$resolved\"",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "focus": false
+      }
     }
   ]
 }

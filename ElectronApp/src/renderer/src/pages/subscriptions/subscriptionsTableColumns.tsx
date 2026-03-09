@@ -2,6 +2,7 @@ import { Tag } from "antd";
 import type { MenuProps } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import { resolveCountryMetadata } from "../../app/data/countryMetadata";
+import { CountryFlag } from "../../components/flag/CountryFlag";
 import { BiIcon } from "../../components/icons/BiIcon";
 import type { NodeProtocol, ProbeType, VpnNode } from "../../../../shared/daemon";
 
@@ -312,15 +313,20 @@ export function buildSubscriptionsColumns({
             {country ? (
               <span
                 className="subscriptions-node-flag"
-                role="img"
-                aria-label={countryMetadata?.chineseName ?? country}
                 title={
                   countryMetadata
-                    ? `${countryMetadata.flagEmoji} ${countryMetadata.chineseName} · ${countryMetadata.code} · ${countryMetadata.englishName}`
+                    ? `${countryMetadata.chineseName} · ${countryMetadata.code} · ${countryMetadata.englishName}`
                     : country
                 }
               >
-                {countryMetadata?.flagEmoji ?? country}
+                {countryMetadata ? (
+                  <CountryFlag
+                    code={countryMetadata.code}
+                    ariaLabel={countryMetadata.chineseName}
+                  />
+                ) : (
+                  country
+                )}
               </span>
             ) : (
               <Tag>[未知]</Tag>

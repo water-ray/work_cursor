@@ -996,6 +996,10 @@ func (s *RuntimeStore) selectActiveGroupNow(_ context.Context, req SelectGroupRe
 	if groupID == "" {
 		return StateSnapshot{}, errors.New("groupId is required")
 	}
+	applyRuntime := true
+	if req.ApplyRuntime != nil {
+		applyRuntime = *req.ApplyRuntime
+	}
 	s.mu.Lock()
 	if s.indexGroupByIDLocked(groupID) < 0 {
 		s.mu.Unlock()
@@ -1003,18 +1007,26 @@ func (s *RuntimeStore) selectActiveGroupNow(_ context.Context, req SelectGroupRe
 	}
 	previous := cloneSnapshot(s.state)
 	if previous.ActiveGroupID == groupID {
+		if req.ResetSelectedNode {
+			s.state.SelectedNodeID = ""
+			s.ensureValidLocked()
+			_ = s.saveLocked()
+		}
 		snapshot := cloneSnapshot(s.state)
 		s.mu.Unlock()
 		return snapshot, nil
 	}
 	s.state.ActiveGroupID = groupID
+	if req.ResetSelectedNode {
+		s.state.SelectedNodeID = ""
+	}
 	s.ensureValidLocked()
 	snapshot := cloneSnapshot(s.state)
 	isConnected := s.state.ConnectionStage == ConnectionConnected && s.state.ProxyMode != ProxyModeOff
 	needReload := shouldReloadRuntimeForActiveGroupChange(previous, snapshot)
 	_ = s.saveLocked()
 	s.mu.Unlock()
-	if !isConnected {
+	if !applyRuntime || !isConnected {
 		return snapshot, nil
 	}
 	hotSwitchErr := error(nil)
@@ -4782,6 +4794,30 @@ func (s *RuntimeStore) startNow(ctx context.Context) (StateSnapshot, error) {
 func (s *RuntimeStore) stopNow(_ context.Context) (StateSnapshot, error) {
 	s.mu.Lock()
 	s.ensureValidLocked()
+	if s.state.ConnectionStage == ConnectionDisconnecting {
+		snapshot := cloneSnapshot(s.state)
+		s.mu.Unlock()
+		s.LogCore(LogLevelInfo, "stop connection skipped: already disconnecting")
+		return snapshot, nil
+	}
+	if s.state.ProxyMode == ProxyModeOff &&
+		(s.state.ConnectionStage == ConnectionConnected ||
+			s.state.ConnectionStage == ConnectionIdle ||
+			s.state.ConnectionStage == ConnectionError) {
+		s.state.LastRuntimeApply = newRuntimeApplyStatus(
+			RuntimeApplyOperationStopConnection,
+			RuntimeApplyStrategyNoop,
+			"already_stopped",
+			true,
+			false,
+			nil,
+		)
+		_ = s.saveLocked()
+		snapshot := cloneSnapshot(s.state)
+		s.mu.Unlock()
+		s.LogCore(LogLevelInfo, "stop connection skipped: already stopped")
+		return snapshot, nil
+	}
 	previous := cloneSnapshot(s.state)
 	applyProxyModeToState(&s.state, ProxyModeOff)
 	s.state.ConnectionStage = ConnectionDisconnecting

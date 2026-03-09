@@ -94,8 +94,8 @@ export function useSubscriptionsRowActions({
       const manualGroups = orderedGroups.filter((group) => group.kind === "manual");
       if (manualGroups.length === 0) {
         Modal.warning({
-          title: "缺少手动分组",
-          content: "请先创建至少一个手动分组，再添加节点。",
+          title: "缺少普通分组",
+          content: "请先创建至少一个普通分组，再添加节点。",
           okText: "确定",
         });
         return;

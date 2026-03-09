@@ -58,6 +58,7 @@ export function AppShell() {
     notice,
   );
   const defaultRoutePath = navRoutes[0]?.path ?? "/subscriptions";
+  const airportRouteActive = location.pathname.startsWith("/airport");
   const selectedKey =
     navRoutes.find((item) => location.pathname.startsWith(item.path))?.path ??
     defaultRoutePath;
@@ -332,9 +333,9 @@ export function AppShell() {
       <Layout.Content className="content-area">
         <div
           ref={contentScrollRef}
-          className={`content-scroll-view${dragScrollEnabled ? " drag-scroll-enabled" : ""}`}
+          className={`content-scroll-view${dragScrollEnabled && !airportRouteActive ? " drag-scroll-enabled" : ""}${airportRouteActive ? " airport-web-content-mode" : ""}`}
         >
-          {daemonState.error ? (
+          {daemonState.error && !airportRouteActive ? (
             <Alert
               type="error"
               showIcon
@@ -365,7 +366,7 @@ export function AppShell() {
             />
             <Route
               path="/airport"
-              element={<AirportPage />}
+              element={<AirportPage command={null} />}
             />
             <Route
               path="/settings"
@@ -389,11 +390,14 @@ export function AppShell() {
           className="app-bottom-overlay-root"
         />
         <Menu
+          key="main-bottom-menu"
           mode="horizontal"
           selectedKeys={[selectedKey]}
           className="bottom-nav-menu"
           items={bottomNavItems}
-          onClick={(event) => navigate(event.key)}
+          onClick={(event) => {
+            navigate(event.key);
+          }}
         />
       </div>
     </Layout>

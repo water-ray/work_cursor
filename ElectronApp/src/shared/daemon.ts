@@ -478,6 +478,7 @@ export interface ExportConfigContentResult {
 
 export interface ImportConfigContentRequestPayload extends Record<string, unknown> {
   content: string;
+  replaceExisting?: boolean;
 }
 
 export interface ImportConfigSummary {

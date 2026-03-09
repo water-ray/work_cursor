@@ -158,11 +158,23 @@ export const daemonApi = {
       body: { groupId },
     });
   },
-  selectActiveGroup(groupId: string): Promise<DaemonSnapshot> {
+  selectActiveGroup(
+    groupId: string,
+    options?: {
+      applyRuntime?: boolean;
+      resetSelectedNode?: boolean;
+    },
+  ): Promise<DaemonSnapshot> {
     return requestSnapshot({
       method: "POST",
       path: "/v1/groups/active",
-      body: { groupId },
+      body: {
+        groupId,
+        ...(typeof options?.applyRuntime === "boolean"
+          ? { applyRuntime: options.applyRuntime }
+          : {}),
+        ...(options?.resetSelectedNode ? { resetSelectedNode: true } : {}),
+      },
     });
   },
   selectNode(nodeId: string, groupId = ""): Promise<DaemonSnapshot> {
@@ -339,7 +351,10 @@ export const daemonApi = {
     }
     return response.exportContent;
   },
-  async importConfigContent(content: string): Promise<{
+  async importConfigContent(
+    content: string,
+    options?: { replaceExisting?: boolean },
+  ): Promise<{
     snapshot: DaemonSnapshot;
     summary?: ImportConfigSummary;
     task?: BackgroundTask;
@@ -350,6 +365,7 @@ export const daemonApi = {
       path: "/v1/config/import/content",
       body: {
         content,
+        replaceExisting: options?.replaceExisting === true,
       },
     });
   },

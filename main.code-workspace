@@ -49,5 +49,11 @@
       "**/ElectronApp/out-package/**": true,
       "**/node_modules/**": true
     }
+  },
+  "launch": {
+    "version": "0.2.0",
+    "configurations": [
+
+    ]
   }
 }

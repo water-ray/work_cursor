@@ -1,0 +1,128 @@
+:root {
+  color-scheme: light;
+  --app-embedded-bottom-reserve: 112px;
+  --app-embedded-bottom-safe-area: env(safe-area-inset-bottom, 0px);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: #f1f3f8;
+  font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+.app-layout {
+  min-height: 100%;
+  background: #f1f3f8;
+}
+
+.app-header.ant-layout-header {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  height: 56px;
+  padding: 0 16px;
+  background: #ffffff;
+  border-bottom: 1px solid #e9edf5;
+  line-height: 1;
+}
+
+.app-brand {
+  flex: 0 0 auto;
+  font-size: 16px;
+  font-weight: 700;
+  color: #17345f;
+  white-space: nowrap;
+}
+
+.top-nav-menu.ant-menu {
+  flex: 1;
+  min-width: 0;
+  border-bottom: 0;
+  background: transparent;
+}
+
+.app-content.ant-layout-content {
+  padding: 14px;
+}
+
+.app-content.ant-layout-content.app-content-embedded {
+  padding-bottom: calc(
+    14px + var(--app-embedded-bottom-reserve) + var(--app-embedded-bottom-safe-area)
+  );
+}
+
+.page-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.page-loading {
+  min-height: 280px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.hero-card.ant-card {
+  border-radius: 16px;
+  background: linear-gradient(140deg, #132445 0%, #203c71 52%, #2a5bad 100%);
+}
+
+.hero-card .ant-typography,
+.hero-card li {
+  color: #eef5ff !important;
+}
+
+.hero-card .hero-slogan {
+  color: #9fd3ff !important;
+  font-size: 16px;
+  margin-bottom: 10px;
+}
+
+.hero-tech-list {
+  margin: 0;
+  padding-left: 20px;
+}
+
+.ad-card-link {
+  display: block;
+}
+
+.ad-card.ant-card .ant-card-cover img {
+  width: 100%;
+  height: 160px;
+  object-fit: cover;
+}
+
+.table-thumb {
+  width: 140px;
+  height: 78px;
+  border-radius: 8px;
+  object-fit: cover;
+  border: 1px solid #e5eaf4;
+}
+
+.muted-line {
+  color: #6b7280;
+  margin-top: 4px;
+}
+
+.captcha-image {
+  width: 220px;
+  height: 64px;
+  border-radius: 10px;
+  border: 1px solid #d4ddee;
+  display: block;
+}

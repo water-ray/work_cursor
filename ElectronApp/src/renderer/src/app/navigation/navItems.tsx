@@ -56,7 +56,7 @@ export const navRoutes: NavRoute[] = [
     key: "airport",
     path: "/airport",
     title: "机场",
-    tip: "访问机场广告与评测页面",
+    tip: "直连本地 Web 管理首页",
     label: "机场",
     icon: <BiIcon name="airplane" />,
   },

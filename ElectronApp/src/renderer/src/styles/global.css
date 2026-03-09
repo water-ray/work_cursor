@@ -25,6 +25,17 @@ body {
   font-style: normal;
 }
 
+.country-flag-icon {
+  display: inline-block;
+  width: 18px;
+  height: 13px;
+  border-radius: 2px;
+  background-position: center;
+  background-size: cover;
+  background-repeat: no-repeat;
+  flex-shrink: 0;
+}
+
 .help-popover-anchor {
   display: inline-flex;
   align-items: center;
@@ -467,6 +478,10 @@ body {
   line-height: 1;
 }
 
+.window-notice-center-btn {
+  margin-left: 2px;
+}
+
 .window-task-center-btn.is-unread {
   color: #475467 !important;
   background: rgba(34, 197, 94, 0.18);
@@ -477,6 +492,91 @@ body {
 .window-task-center-btn.is-open {
   color: #2563eb !important;
   background: rgba(59, 130, 246, 0.12);
+}
+
+.notice-center-list {
+  max-height: min(60vh, 520px);
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-right: 4px;
+}
+
+.notice-center-item {
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 12px;
+  background: #f8fafc;
+  padding: 10px 12px;
+}
+
+.notice-center-item-success {
+  border-color: rgba(34, 197, 94, 0.24);
+}
+
+.notice-center-item-warning {
+  border-color: rgba(245, 158, 11, 0.28);
+}
+
+.notice-center-item-error {
+  border-color: rgba(239, 68, 68, 0.26);
+}
+
+.notice-center-item-info {
+  border-color: rgba(59, 130, 246, 0.22);
+}
+
+.notice-center-item-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.notice-center-item-icon {
+  flex: 0 0 auto;
+  margin-top: 1px;
+  font-size: 16px;
+  line-height: 1;
+}
+
+.notice-center-item-success .notice-center-item-icon {
+  color: #16a34a;
+}
+
+.notice-center-item-warning .notice-center-item-icon {
+  color: #d97706;
+}
+
+.notice-center-item-error .notice-center-item-icon {
+  color: #dc2626;
+}
+
+.notice-center-item-info .notice-center-item-icon {
+  color: #2563eb;
+}
+
+.notice-center-item-main {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.notice-center-item-title-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.notice-center-item-time {
+  flex: 0 0 auto;
+  font-size: 11px;
+}
+
+.notice-center-item-text {
+  margin-top: 4px;
+  color: #334155;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .window-brand {
@@ -586,6 +686,11 @@ body {
   border-radius: 8px;
   background: rgba(22, 119, 255, 0.08);
   white-space: nowrap;
+}
+
+.window-active-node-flag .country-flag-icon {
+  width: 17px;
+  height: 12px;
 }
 
 .window-quick-action-btn {
@@ -724,106 +829,27 @@ body {
   user-select: none;
 }
 
-.airport-page {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-}
-
-.airport-page-loading {
-  display: inline-flex;
-  align-items: center;
-  gap: 10px;
-  padding: 2px 4px;
-}
-
-.airport-page-alert {
-  margin-bottom: 2px;
-}
-
-.airport-page-hero.ant-card {
-  border-radius: 18px;
-  background: linear-gradient(135deg, rgba(53, 118, 246, 0.16), rgba(115, 103, 240, 0.12));
-  box-shadow: 0 14px 30px rgba(15, 23, 42, 0.08);
-}
-
-.airport-page-banner {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 10px;
-  padding: 26px 28px;
-  border-radius: 22px;
-  background: linear-gradient(135deg, #1d4ed8 0%, #2563eb 48%, #4f46e5 100%);
-  color: #fff;
-  box-shadow: 0 18px 36px rgba(37, 99, 235, 0.28);
-}
-
-.airport-page-banner-link {
-  text-decoration: none;
-}
-
-.airport-page-banner-badge {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  padding: 4px 10px;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.16);
-  font-size: 12px;
-  font-weight: 600;
-  letter-spacing: 0.08em;
-}
-
-.airport-page-banner-title.ant-typography {
-  margin: 0;
-  color: #fff;
-}
-
-.airport-page-banner-text.ant-typography {
-  max-width: 760px;
-  margin: 0;
-  color: rgba(255, 255, 255, 0.9);
-}
-
-.airport-page-banner-image-wrap {
-  width: 100%;
-  border-radius: 16px;
+.content-scroll-view.airport-web-content-mode {
+  padding: 0;
   overflow: hidden;
-  background: rgba(255, 255, 255, 0.14);
 }
 
-.airport-page-banner-image {
+.airport-web-page {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  border-radius: 0;
+  overflow: hidden;
+  background: #fff;
+}
+
+.airport-web-frame {
   display: block;
   width: 100%;
-  max-height: 300px;
-  object-fit: cover;
-}
-
-.airport-page-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 14px;
-}
-
-.airport-page-panel.ant-card {
-  min-height: 168px;
-  border-radius: 16px;
-  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.06);
-}
-
-.airport-page-card-image-wrap {
-  margin-bottom: 10px;
-  border-radius: 12px;
-  overflow: hidden;
-  background: #eef2ff;
-}
-
-.airport-page-card-image {
-  display: block;
-  width: 100%;
-  height: 140px;
-  object-fit: cover;
+  height: 100%;
+  border: 0;
+  background: #fff;
 }
 
 .bottom-nav-wrap {
@@ -910,11 +936,11 @@ body.settings-draft-nav-lock .bottom-nav-menu.ant-menu {
 
 .node-table-context-area {
   position: relative;
-  min-height: 450px;
+  min-height: 400px;
 }
 
 .subscriptions-table-deferred-placeholder {
-  min-height: 410px;
+  min-height: 360px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1117,6 +1143,11 @@ body.settings-draft-nav-lock .bottom-nav-menu.ant-menu {
   line-height: 1;
 }
 
+.subscriptions-node-flag .country-flag-icon {
+  width: 18px;
+  height: 13px;
+}
+
 .subscriptions-node-name-text {
   display: inline-block;
   max-width: 102px;
@@ -1176,6 +1207,28 @@ body.settings-draft-nav-lock .bottom-nav-menu.ant-menu {
   position: absolute;
   right: -10px;
   top: -6px;
+}
+
+.subscriptions-group-tabs .ant-tabs-nav .ant-tabs-tab {
+  overflow: visible;
+  position: relative;
+}
+
+.subscriptions-group-tabs .ant-tabs-nav {
+  overflow: visible;
+  position: relative;
+  z-index: 130;
+}
+
+.subscriptions-group-tabs .ant-tabs-nav-wrap,
+.subscriptions-group-tabs .ant-tabs-nav-list,
+.subscriptions-group-tabs .ant-tabs-tab-btn {
+  overflow: visible !important;
+}
+
+.subscriptions-group-tabs {
+  position: relative;
+  z-index: 128;
 }
 
 .group-tab-close-btn.ant-btn {
@@ -1696,6 +1749,11 @@ body.settings-draft-nav-lock .bottom-nav-menu.ant-menu {
   flex: 0 0 auto;
   font-size: 16px;
   line-height: 1;
+}
+
+.proxy-startup-smart-optimize-flag .country-flag-icon {
+  width: 18px;
+  height: 13px;
 }
 
 .proxy-startup-smart-optimize-preset-icon {

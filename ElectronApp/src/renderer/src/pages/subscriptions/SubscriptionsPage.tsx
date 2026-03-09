@@ -77,6 +77,7 @@ import { daemonApi } from "../../services/daemonApi";
 
 const ALL_GROUP_TAB_ID = "__all_groups__";
 const ADD_GROUP_TAB_ID = "__add_group__";
+const subscriptionsTableScrollHeightPx = 360;
 function formatProbeExecutionHint(summary: ProbeNodesSummary | undefined): string {
   const cachedCount = Math.max(0, Number(summary?.cachedResultCount ?? 0));
   const freshCount = Math.max(0, Number(summary?.freshProbeCount ?? 0));
@@ -862,6 +863,31 @@ export function SubscriptionsPage({
     [runAction, notice],
   );
 
+  const activateGroupWithoutRuntimeReload = useCallback(
+    async (group: NodeGroup): Promise<void> => {
+      if (group.nodes.length === 0) {
+        return;
+      }
+      try {
+        initializedDefaultTabRef.current = true;
+        setContextMenu(null);
+        setActiveTabId(group.id);
+        setSelectedRowKeys([]);
+        const next = await runAction(() =>
+          daemonApi.selectActiveGroup(group.id, {
+            applyRuntime: false,
+            resetSelectedNode: true,
+          }),
+        );
+        setLocalActiveNodeID(next.selectedNodeId || group.nodes[0]?.id || "");
+        notice.success(`已激活分组：${group.name}`);
+      } catch (error) {
+        notice.error(error instanceof Error ? error.message : "激活分组失败");
+      }
+    },
+    [notice, runAction],
+  );
+
   const probeLatencyFromContext = async (): Promise<void> => {
     if (!snapshot || snapshot.connectionStage !== "connected" || probeRows.length === 0) {
       return;
@@ -1338,7 +1364,7 @@ export function SubscriptionsPage({
 
   const pasteNodesFromClipboard = useCallback(async (): Promise<void> => {
     if (currentTabGroup?.kind !== "manual") {
-      notice.warning("只有手动分组才可以粘贴节点。");
+      notice.warning("只有普通分组才可以粘贴节点。");
       return;
     }
     try {
@@ -1361,7 +1387,7 @@ export function SubscriptionsPage({
       if (importedIDs.length > 0) {
         setSelectedRowKeys(importedIDs);
       }
-      notice.success(`已粘贴导入 ${importedIDs.length} 条节点到手动分组：${currentTabGroup.name}`);
+      notice.success(`已粘贴导入 ${importedIDs.length} 条节点到普通分组：${currentTabGroup.name}`);
     } catch (error) {
       notice.error(error instanceof Error ? error.message : "粘贴节点失败");
     }
@@ -2051,11 +2077,11 @@ export function SubscriptionsPage({
               }
               helpContent={{
                 effect:
-                  "上方工具栏用于处理当前视图或当前分组的数据；下方分组 TAB 用于切换、整理和维护订阅来源。",
+                  "用于管理订阅分组和普通分组，以及它们之间的节点复制和迁移。",
                 caution:
-                  "一键探测、一键评分、重置评分和重置流量等操作都会作用于当前分组或当前视图，请确认分组后再执行。",
+                  "添加分组时输入订阅地址/URL则视为订阅分组，留空则为普通分组。订阅分组无法编辑/粘贴节点，普通分组可以。",
                 recommendation:
-                  "复制订阅分组常用高质量节点到手动分组中使用，加快[一键评分]筛选节点池。",
+                  "订阅分组常用高质量节点复制到普通分组中使用，加快[一键评分]筛选节点池。",
               }}
             />
             <Tooltip title={canCopySubscriptionUrl ? "复制订阅地址" : "仅订阅分组可复制 URL"}>
@@ -2087,7 +2113,7 @@ export function SubscriptionsPage({
               />
             </Tooltip>
             <Tooltip
-              title={canAddNodeFromHeader ? "添加节点" : "仅手动分组可添加节点"}
+              title={canAddNodeFromHeader ? "添加节点" : "仅普通分组可用"}
             >
               <Button
                 type="text"
@@ -2250,7 +2276,7 @@ export function SubscriptionsPage({
                     title={
                       group.kind === "subscription"
                         ? "URL 订阅分组，可拉取订阅"
-                        : "手动分组，可自定义节点与分类"
+                        : "普通分组，可自定义节点与分类"
                     }
                   >
                     {group.kind === "subscription" ? (
@@ -2262,6 +2288,24 @@ export function SubscriptionsPage({
                   <Typography.Text>{group.name}</Typography.Text>
                   {snapshot?.activeGroupId === group.id ? (
                     <span className="active-group-dot" />
+                  ) : null}
+                  {group.nodes.length > 0 && snapshot?.activeGroupId !== group.id ? (
+                    <Button
+                      size="small"
+                      type="primary"
+                      className="group-tab-activate-popover"
+                      onMouseDown={(event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                      }}
+                      onClick={(event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        void activateGroupWithoutRuntimeReload(group);
+                      }}
+                    >
+                      激活
+                    </Button>
                   ) : null}
                   <Button
                     size="small"
@@ -2284,7 +2328,7 @@ export function SubscriptionsPage({
             {
               key: ADD_GROUP_TAB_ID,
               label: (
-                <Tooltip title="添加订阅分组">
+                <Tooltip title="添加订阅/普通分组">
                   <Button
                     type="text"
                     size="small"
@@ -2326,7 +2370,7 @@ export function SubscriptionsPage({
                 columns={columns}
                 dataSource={rows}
                 pagination={false}
-                scroll={{ x: "max-content", y: 410 }}
+                scroll={{ x: "max-content", y: subscriptionsTableScrollHeightPx }}
                 rowClassName={(row) => {
                   const classNames: string[] = [];
                   if (row.node.id === activeNodeID) {
@@ -2509,7 +2553,7 @@ export function SubscriptionsPage({
 
       {addSubOpen ? (
         <Modal
-          title="添加订阅分组"
+          title="添加订阅/普通分组"
           open={addSubOpen}
           onCancel={closeAddSubscriptionModal}
           onOk={submitAddSubscription}
@@ -2542,14 +2586,14 @@ export function SubscriptionsPage({
             form={subscriptionForm}
           >
             <Form.Item
-              label="名称"
+              label="分组名称"
               name="name"
               rules={[{ required: true, message: "请输入订阅名称" }]}
             >
-              <Input placeholder="例如：机场A / 手动分组A" />
+              <Input placeholder="例如：机场A / 普通分组A" />
             </Form.Item>
             <Form.Item
-              label="URL（留空表示普通分组）"
+              label="URL/订阅地址（留空=普通分组,否则=订阅分组）"
               name="url"
             >
               <Input placeholder="https://example.com/subscription" />
@@ -2574,14 +2618,14 @@ export function SubscriptionsPage({
             form={editGroupForm}
           >
             <Form.Item
-              label="名称"
+              label="分组名称"
               name="name"
               rules={[{ required: true, message: "请输入分组名称" }]}
             >
-              <Input placeholder="例如：机场A / 手动分组A" />
+              <Input placeholder="例如：机场A / 普通分组A" />
             </Form.Item>
             <Form.Item
-              label="URL（留空表示普通分组）"
+              label="URL/订阅地址（留空=普通分组,否则=订阅分组）"
               name="url"
             >
               <Input placeholder="https://example.com/subscription" />

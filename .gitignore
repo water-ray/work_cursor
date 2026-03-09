@@ -23,9 +23,13 @@ ElectronApp/node_modules/
 ElectronApp/out/
 ElectronApp/.electron-vite/
 ElectronApp/out-package/
-ads-server/node_modules/
-ads-server/data/*.sqlite
-ads-server/data/*.sqlite-*
+ads-server/
+adsroot/server/node_modules/
+adsroot/server/dist/
+adsroot/server/data/*.sqlite
+adsroot/server/data/*.sqlite-*
+adsroot/web/node_modules/
+adsroot/web/dist/
 
 # One-click build outputs
 Bin/
