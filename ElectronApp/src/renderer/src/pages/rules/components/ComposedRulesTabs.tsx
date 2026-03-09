@@ -1252,8 +1252,8 @@ export function ComposedRulesTabs({
                         void commitGroups(nextGroups, resolvedActiveGroupID);
                       }}
                     >
-                      <Radio value="proxy">*走代理</Radio>
-                      <Radio value="direct">*走直连</Radio>
+                      <Radio value="proxy">走代理</Radio>
+                      <Radio value="direct">走直连</Radio>
                     </Radio.Group>
                     <Tooltip
                       title={

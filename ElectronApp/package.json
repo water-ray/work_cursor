@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "electron-vite dev",
     "build": "electron-vite build",
-    "package:win-unpacked": "electron-packager . WaterayApp --platform=win32 --arch=x64 --icon=ico.ico --out=out-package --overwrite --asar --prune=true",
+    "package:desktop": "electron-packager . WaterayApp --out=out-package --overwrite --asar",
     "preview": "electron-vite preview",
     "typecheck": "tsc --noEmit"
   },

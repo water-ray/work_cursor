@@ -1,5 +1,5 @@
 import { promises as fsp } from "node:fs";
-import { basename, dirname, extname, isAbsolute, join } from "node:path";
+import { basename, dirname, extname, join } from "node:path";
 import { tmpdir } from "node:os";
 
 import {
@@ -12,6 +12,7 @@ import {
 } from "electron";
 
 import { ipcChannels } from "../../shared/ipc";
+import { platformServices } from "../platform/common/platformServices";
 
 const maxClipboardTextBytes = 16 * 1024 * 1024;
 
@@ -36,71 +37,6 @@ function normalizeFileName(raw: string | undefined): string {
     return `${base}.json`;
   }
   return base;
-}
-
-function parseWindowsFileNameWBuffer(raw: Buffer): string[] {
-  if (!raw || raw.length === 0) {
-    return [];
-  }
-  const decoded = raw.toString("utf16le");
-  const items = decoded
-    .split("\u0000")
-    .map((item) => item.trim())
-    .filter((item) => item.length > 0);
-  const result: string[] = [];
-  const seen = new Set<string>();
-  for (const item of items) {
-    if (!isAbsolute(item)) {
-      continue;
-    }
-    const normalized = item.replace(/\//g, "\\");
-    const key = normalized.toLowerCase();
-    if (seen.has(key)) {
-      continue;
-    }
-    seen.add(key);
-    result.push(normalized);
-  }
-  return result;
-}
-
-function parseClipboardTextFilePaths(text: string): string[] {
-  const lines = text
-    .split(/\r?\n/g)
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0);
-  const result: string[] = [];
-  const seen = new Set<string>();
-  for (const line of lines) {
-    let candidate = line;
-    if (line.startsWith("file://")) {
-      try {
-        candidate = decodeURI(new URL(line).pathname);
-      } catch {
-        continue;
-      }
-      if (process.platform === "win32" && /^\/[a-zA-Z]:/.test(candidate)) {
-        candidate = candidate.slice(1);
-      }
-    }
-    if (!isAbsolute(candidate)) {
-      continue;
-    }
-    const normalized =
-      process.platform === "win32"
-        ? candidate.replace(/\//g, "\\")
-        : candidate;
-    const key =
-      process.platform === "win32"
-        ? normalized.toLowerCase()
-        : normalized;
-    if (seen.has(key)) {
-      continue;
-    }
-    seen.add(key);
-    result.push(normalized);
-  }
-  return result;
 }
 
 async function ensureTextFile(path: string): Promise<void> {
@@ -214,33 +150,7 @@ export function registerSystemIpc(): void {
   });
 
   ipcMain.handle(ipcChannels.systemReadClipboardFilePaths, () => {
-    const result: string[] = [];
-    const seen = new Set<string>();
-    if (process.platform === "win32") {
-      const formats = clipboard.availableFormats();
-      const hasFileNameW = formats.some((format) => format === "FileNameW");
-      if (hasFileNameW) {
-        const paths = parseWindowsFileNameWBuffer(clipboard.readBuffer("FileNameW"));
-        for (const path of paths) {
-          const key = path.toLowerCase();
-          if (seen.has(key)) {
-            continue;
-          }
-          seen.add(key);
-          result.push(path);
-        }
-      }
-    }
-    const textPaths = parseClipboardTextFilePaths(clipboard.readText());
-    for (const path of textPaths) {
-      const key = process.platform === "win32" ? path.toLowerCase() : path;
-      if (seen.has(key)) {
-        continue;
-      }
-      seen.add(key);
-      result.push(path);
-    }
-    return result;
+    return platformServices.clipboard.readClipboardFilePaths();
   });
 
   ipcMain.handle(ipcChannels.systemWriteClipboardFile, async (_event, filePath: string) => {
@@ -249,15 +159,7 @@ export function registerSystemIpc(): void {
       throw new Error("file path is required");
     }
     await ensureTextFile(targetPath);
-    if (process.platform === "win32") {
-      const payload = Buffer.from(`${targetPath}\u0000`, "utf16le");
-      clipboard.clear();
-      clipboard.writeBuffer("FileNameW", payload);
-      clipboard.writeText(targetPath);
-      return { mode: "windows_file_object" };
-    }
-    clipboard.writeText(targetPath);
-    return { mode: "path_text_fallback" };
+    return platformServices.clipboard.writeClipboardFile(targetPath);
   });
 }
 

@@ -1,7 +1,7 @@
 import { app, BrowserWindow, Menu, Tray } from "electron";
 
-import { getProcessIcon } from "./appIcon";
-import { quitAll } from "./windowCloseActions";
+import { getProcessIcon } from "../../services/appIcon";
+import { quitAll } from "../../services/windowCloseActions";
 
 let tray: Tray | null = null;
 let trayInitPromise: Promise<Tray> | null = null;
@@ -83,7 +83,12 @@ async function ensureTray(window?: BrowserWindow | null): Promise<Tray> {
   }
 }
 
-function runTrayInit(window?: BrowserWindow | null): void {
+function hideToTray(window: BrowserWindow): void {
+  window.hide();
+  window.setSkipTaskbar(true);
+}
+
+export function initializeTray(window?: BrowserWindow | null): void {
   if (tray || trayInitPromise) {
     return;
   }
@@ -92,18 +97,6 @@ function runTrayInit(window?: BrowserWindow | null): void {
       error instanceof Error ? error.message : "unknown tray init error";
     console.warn(`[tray] initialize failed: ${message}`);
   });
-}
-
-function hideToTray(window: BrowserWindow): void {
-  window.hide();
-  window.setSkipTaskbar(true);
-}
-
-export function initializeTray(window?: BrowserWindow | null): void {
-  if (process.platform !== "win32") {
-    return;
-  }
-  runTrayInit(window);
 }
 
 export function minimizeToTray(window?: BrowserWindow | null): void {

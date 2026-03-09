@@ -7,7 +7,7 @@ import type {
   TransportStatus,
 } from "../../shared/daemon";
 import { ipcChannels } from "../../shared/ipc";
-import { ensurePackagedDaemonRunning } from "./daemonBootstrap";
+import { platformServices } from "../platform/common/platformServices";
 import { getDaemonWebSocketURL, requestDaemon } from "./daemonClient";
 
 const reconnectBaseDelayMs = 1000;
@@ -217,7 +217,7 @@ class DaemonTransportManager {
     }
     this.recoveryInFlight = true;
     try {
-      await ensurePackagedDaemonRunning();
+      await platformServices.daemon.ensurePackagedDaemonRunning();
     } finally {
       this.recoveryInFlight = false;
     }

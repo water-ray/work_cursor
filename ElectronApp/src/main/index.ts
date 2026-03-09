@@ -1,16 +1,11 @@
 import { BrowserWindow, app } from "electron";
 
 import { registerDaemonIpc } from "./ipc/daemonIpc";
-import { ensurePackagedDaemonRunning } from "./services/daemonBootstrap";
 import { registerWindowIpc } from "./ipc/windowIpc";
 import { registerSystemIpc } from "./ipc/systemIpc";
+import { platformServices } from "./platform/common/platformServices";
 import { daemonTransportManager } from "./services/daemonTransportManager";
-import {
-  destroyTray,
-  initializeTray,
-  restoreMainWindowFromTray,
-} from "./services/trayController";
-import { createMainWindow } from "./windows/mainWindow";
+import { createMainWindow } from "./window/createMainWindow";
 
 function bootstrap(): void {
   registerWindowIpc();
@@ -18,7 +13,7 @@ function bootstrap(): void {
   registerSystemIpc();
   daemonTransportManager.start();
   const mainWindow = createMainWindow();
-  initializeTray(mainWindow);
+  platformServices.tray.initializeTray(mainWindow);
 }
 
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
@@ -29,23 +24,23 @@ if (!gotSingleInstanceLock) {
   app.on("second-instance", () => {
     const mainWindow = BrowserWindow.getAllWindows()[0];
     if (mainWindow) {
-      restoreMainWindowFromTray();
+      platformServices.tray.restoreMainWindowFromTray();
       return;
     }
     const createdWindow = createMainWindow();
-    initializeTray(createdWindow);
+    platformServices.tray.initializeTray(createdWindow);
   });
 
   app.whenReady().then(async () => {
-    await ensurePackagedDaemonRunning();
+    await platformServices.daemon.ensurePackagedDaemonRunning();
     bootstrap();
     app.on("activate", () => {
       if (BrowserWindow.getAllWindows().length === 0) {
         const createdWindow = createMainWindow();
-        initializeTray(createdWindow);
+        platformServices.tray.initializeTray(createdWindow);
         return;
       }
-      restoreMainWindowFromTray();
+      platformServices.tray.restoreMainWindowFromTray();
     });
   });
 
@@ -57,6 +52,6 @@ if (!gotSingleInstanceLock) {
 
   app.on("before-quit", () => {
     daemonTransportManager.stop();
-    destroyTray();
+    platformServices.tray.destroyTray();
   });
 }

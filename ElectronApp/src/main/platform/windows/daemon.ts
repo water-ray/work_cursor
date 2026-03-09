@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 
 import { app } from "electron";
 
-import { DEFAULT_DAEMON_BASE_URL } from "./daemonClient";
+import { DEFAULT_DAEMON_BASE_URL } from "../../services/daemonClient";
 
 const daemonProbePath = "/v1/state?withLogs=0";
 const daemonProbeTimeoutMs = 1200;
@@ -29,12 +29,8 @@ function shouldManagePackagedDaemon(): boolean {
   if (!app.isPackaged) {
     return false;
   }
-  if (process.platform !== "win32") {
-    return false;
-  }
   const daemonURL = process.env.WATERAY_DAEMON_URL?.trim();
   if (daemonURL && daemonURL !== DEFAULT_DAEMON_BASE_URL) {
-    // Respect explicitly configured external daemon endpoint.
     return false;
   }
   return true;

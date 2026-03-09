@@ -1,8 +1,8 @@
 import { BrowserWindow, ipcMain } from "electron";
 
 import { ipcChannels } from "../../shared/ipc";
+import { platformServices } from "../platform/common/platformServices";
 import { getAppIconDataURL } from "../services/appIcon";
-import { minimizeToTray } from "../services/trayController";
 import { closePanelKeepCore, quitAll } from "../services/windowCloseActions";
 
 function resolveWindow(webContentsId: number): BrowserWindow | null {
@@ -30,7 +30,7 @@ export function registerWindowIpc(): void {
 
   ipcMain.handle(ipcChannels.windowMinimizeToTray, (event) => {
     const window = resolveWindow(event.sender.id);
-    minimizeToTray(window);
+    platformServices.tray.minimizeToTray(window);
   });
 
   ipcMain.handle(ipcChannels.windowToggleMaximize, (event) => {

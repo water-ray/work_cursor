@@ -38,6 +38,7 @@ docs/            # 架构、测试与设计文档
 ## 运行框架
 
 - 规范文档：`docs/architecture/RUNTIME_FRAMEWORK.md`
+- 跨平台桌面分层：`docs/architecture/CROSS_PLATFORM_DESKTOP.md`
 - 持久规则：`.cursor/rules/05-runtime-framework.mdc`
 
 ## 当前状态
@@ -99,3 +100,73 @@ docs/            # 架构、测试与设计文档
   - `cd adsroot/web && npm install && npm run dev`
 - 或使用 VSCode 任务一键启动：
   - `客户端：开发：运行桌面整套`
+- 广告端本地发布到 `Bin/adsroot`：
+  - `广告端：本地发布：前后端整套到 Bin/adsroot`
+- GitHub 公开发布只面向 VPN 客户端：
+  - `公开发布：构建并自动发布客户端 Release`
+- 新设备完整拉取与部署说明：
+  - `docs/qa/NEW_DEVICE_SETUP.md`
+
+## 私有源码日常同步
+
+- Windows 主开发机日常提交源码到私有仓库：
+  - `私有源码：提交当前改动`
+  - `私有源码：推送当前分支`
+  - `私有源码：提交并推送当前分支`
+  - `私有源码：提交并推送到 main`
+
+常见使用方式：
+
+- 日常开发分支同步：`私有源码：提交并推送当前分支`
+- 准备让 Linux 机器拉取 `main`：`私有源码：提交并推送到 main`
+
+## Linux 拉取后部署与构建
+
+说明：
+
+- `README.md` 只负责提供部署步骤，不会在拉取后自动安装环境。
+- Linux 新机器拉取源码后，仍需要按下面步骤手动执行一次依赖安装与构建。
+
+### 1. 基础环境
+
+- `git`
+- `go`（建议 `1.24+`）
+- `node`（建议 `20+`）
+- `npm`
+- `Python 3`
+
+### 2. 拉取私有源码
+
+```bash
+git clone https://github.com/water-ray/wateray-src.git
+cd wateray-src
+```
+
+### 3. 安装依赖
+
+```bash
+cd ElectronApp && npm install && cd ..
+cd adsroot/server && npm install && cd ../..
+cd adsroot/web && npm install && cd ../..
+```
+
+### 4. Linux 构建客户端
+
+```bash
+python scripts/build/targets/desktop.py --platform linux
+```
+
+构建结果目录：
+
+- `Bin/Wateray-linux`
+
+### 5. 当前 Linux 状态
+
+- 当前 Linux 构建入口已接好
+- 当前阶段主要目标是“开发态跑通”
+- 以下能力仍是后续待完善项：
+  - daemon 自动拉起
+  - 托盘行为
+  - 系统代理真实实现
+  - TUN / 提权
+  - AppImage 或其他 Linux 发布格式
