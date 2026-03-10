@@ -154,6 +154,51 @@
       }
     },
     {
+      "label": "客户端：版本：发布补丁版",
+      "type": "shell",
+      "command": "python scripts/release/release_version.py patch",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": "build",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": false
+      }
+    },
+    {
+      "label": "客户端：版本：发布次版本",
+      "type": "shell",
+      "command": "python scripts/release/release_version.py minor",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": "build",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": false
+      }
+    },
+    {
+      "label": "客户端：版本：发布主版本",
+      "type": "shell",
+      "command": "python scripts/release/release_version.py major",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": "build",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": false
+      }
+    },
+    {
       "label": "客户端：开发：运行桌面整套",
       "dependsOn": [
         "客户端：开发：运行 VPN 内核",
