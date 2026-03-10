@@ -1,6 +1,6 @@
 {
   "name": "wateray-electron-app",
-  "version": "1.0.17",
+  "version": "1.1.0",
   "private": true,
   "desktopName": "wateray.desktop",
   "description": "Wateray desktop frontend powered by Electron + React + Ant Design",

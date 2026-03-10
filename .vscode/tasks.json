@@ -2,12 +2,6 @@
   "version": "2.0.0",
   "inputs": [
     {
-      "id": "githubPrivateRepoUrl",
-      "type": "promptString",
-      "description": "输入私有源码仓库 Git URL",
-      "default": "https://github.com/water-ray/wateray-src.git"
-    },
-    {
       "id": "githubPrivateRemoteName",
       "type": "promptString",
       "description": "输入私有源码仓库 remote 名称",
@@ -36,12 +30,6 @@
       "type": "promptString",
       "description": "输入目标分支名（例如 feat/my-change、fix/bug-123、release/v1.1.0）",
       "default": "feat/my-change"
-    },
-    {
-      "id": "gitPublicRemoteName",
-      "type": "promptString",
-      "description": "输入公开仓库 remote 名称",
-      "default": "origin"
     }
   ],
   "tasks": [
@@ -64,27 +52,6 @@
         "reveal": "always",
         "panel": "dedicated",
         "focus": true
-      }
-    },
-    {
-      "label": "客户端：构建：Electron 前端",
-      "type": "shell",
-      "command": "npm run build",
-      "linux": {
-        "command": "node node_modules/electron-vite/bin/electron-vite.js build"
-      },
-      "options": {
-        "cwd": "${workspaceFolder}/ElectronApp",
-        "env": {
-          "VITE_AIRPORT_WEB_URL": "https://wateray.net/"
-        }
-      },
-      "group": "build",
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "focus": false
       }
     },
     {
@@ -141,43 +108,19 @@
       }
     },
     {
-      "label": "广告端：本地发布：服务端到 Bin/adsroot",
-      "type": "shell",
-      "command": "$ErrorActionPreference = 'Stop'; $serverSrc = Join-Path '${workspaceFolder}' 'adsroot/server'; $publishServer = Join-Path '${workspaceFolder}' 'Bin/adsroot/server'; npm run build --prefix $serverSrc; if (Test-Path $publishServer) { Remove-Item -Path $publishServer -Recurse -Force }; New-Item -ItemType Directory -Path $publishServer -Force | Out-Null; Copy-Item -Path (Join-Path $serverSrc 'dist') -Destination $publishServer -Recurse -Force; Set-Content -Path (Join-Path $publishServer 'main.js') -Value 'import ''./dist/main.js'';' -Encoding UTF8; $serverFiles = @('package.json', 'package-lock.json', '.env.example', 'README.md', 'install.sh'); foreach ($name in $serverFiles) { $sourcePath = Join-Path $serverSrc $name; if (Test-Path $sourcePath) { Copy-Item -Path $sourcePath -Destination $publishServer -Force } }; Get-ChildItem -Path $publishServer -Recurse -File | Where-Object { $_.Extension -eq '.sqlite' -or $_.Name.EndsWith('.sqlite-wal') -or $_.Name.EndsWith('.sqlite-shm') } | Remove-Item -Force",
-      "options": {
-        "cwd": "${workspaceFolder}"
-      },
-      "group": "build",
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "focus": false
-      }
-    },
-    {
-      "label": "广告端：本地发布：前端到 Bin/adsroot",
-      "type": "shell",
-      "command": "$ErrorActionPreference = 'Stop'; npm run build --prefix \"${workspaceFolder}/adsroot/web\"; $publishWeb = Join-Path '${workspaceFolder}' 'Bin/adsroot/web'; if (Test-Path $publishWeb) { Remove-Item -Path $publishWeb -Recurse -Force }; New-Item -ItemType Directory -Path $publishWeb -Force | Out-Null; Copy-Item -Path \"${workspaceFolder}/adsroot/web/dist\" -Destination $publishWeb -Recurse -Force",
-      "options": {
-        "cwd": "${workspaceFolder}"
-      },
-      "group": "build",
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "focus": false
-      }
-    },
-    {
       "label": "广告端：本地发布：前后端整套到 Bin/adsroot",
-      "dependsOn": [
-        "广告端：本地发布：服务端到 Bin/adsroot",
-        "广告端：本地发布：前端到 Bin/adsroot"
-      ],
-      "dependsOrder": "sequence",
-      "problemMatcher": []
+      "type": "shell",
+      "command": "python scripts/build/targets/publish_adsroot.py",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": "build",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": false
+      }
     },
     {
       "label": "客户端：开发：运行 VPN 内核",
@@ -198,7 +141,7 @@
     {
       "label": "客户端：构建：当前平台客户端",
       "type": "shell",
-      "command": "python scripts/build/targets/desktop.py",
+      "command": "python scripts/build/targets/build_current_platform_client.py",
       "options": {
         "cwd": "${workspaceFolder}"
       },
@@ -209,120 +152,6 @@
         "panel": "dedicated",
         "focus": false
       }
-    },
-    {
-      "label": "客户端：构建：Linux deb 安装包",
-      "type": "shell",
-      "command": "python scripts/build/targets/linux_package.py --format deb",
-      "options": {
-        "cwd": "${workspaceFolder}"
-      },
-      "group": "build",
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "focus": false
-      }
-    },
-    {
-      "label": "客户端：构建：Linux AppImage",
-      "type": "shell",
-      "command": "python scripts/build/targets/linux_package.py --format appimage",
-      "options": {
-        "cwd": "${workspaceFolder}"
-      },
-      "group": "build",
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "focus": false
-      }
-    },
-    {
-      "label": "客户端：构建：Linux 安装包（deb + AppImage）",
-      "type": "shell",
-      "command": "python scripts/build/targets/linux_package.py --format all",
-      "options": {
-        "cwd": "${workspaceFolder}"
-      },
-      "group": "build",
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "focus": false
-      }
-    },
-    {
-      "label": "客户端：版本：补丁版预演",
-      "type": "shell",
-      "command": "python scripts/release/release_version.py patch --dry-run",
-      "options": {
-        "cwd": "${workspaceFolder}"
-      },
-      "group": "build",
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "focus": false
-      }
-    },
-    {
-      "label": "客户端：版本：发布补丁版",
-      "type": "shell",
-      "command": "python scripts/release/release_version.py patch",
-      "options": {
-        "cwd": "${workspaceFolder}"
-      },
-      "group": "build",
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "focus": false
-      }
-    },
-    {
-      "label": "客户端：版本：发布次版本",
-      "type": "shell",
-      "command": "python scripts/release/release_version.py minor",
-      "options": {
-        "cwd": "${workspaceFolder}"
-      },
-      "group": "build",
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "focus": false
-      }
-    },
-    {
-      "label": "客户端：版本：发布主版本",
-      "type": "shell",
-      "command": "python scripts/release/release_version.py major",
-      "options": {
-        "cwd": "${workspaceFolder}"
-      },
-      "group": "build",
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "focus": false
-      }
-    },
-    {
-      "label": "客户端：版本：补丁版并构建当前平台客户端",
-      "dependsOn": [
-        "客户端：版本：发布补丁版",
-        "客户端：构建：当前平台客户端"
-      ],
-      "dependsOrder": "sequence",
-      "problemMatcher": []
     },
     {
       "label": "客户端：开发：运行桌面整套",
@@ -376,6 +205,20 @@
         "reveal": "always",
         "panel": "dedicated",
         "focus": true
+      }
+    },
+    {
+      "label": "私有源码：查看当前分支",
+      "type": "shell",
+      "command": "python scripts/git/private_source_tasks.py show-branch",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": false
       }
     },
     {
@@ -441,51 +284,18 @@
       }
     },
     {
-      "label": "客户端：发布：准备当前平台发布素材",
-      "type": "shell",
-      "command": "python scripts/release/prepare_github_release.py --repo \"${input:githubPublicRepo}\" --platform current --release-root-dir \"Bin/github-staging-release\"",
-      "options": {
-        "cwd": "${workspaceFolder}"
-      },
-      "group": "build",
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "focus": false
-      }
-    },
-    {
-      "label": "客户端：发布：构建当前平台发布产物",
-      "dependsOn": [
-        "客户端：构建：当前平台客户端",
-        "客户端：发布：准备当前平台发布素材"
-      ],
-      "dependsOrder": "sequence",
-      "problemMatcher": []
-    },
-    {
-      "label": "公开发布：上传当前平台产物",
-      "type": "shell",
-      "command": "python scripts/release/upload_current_platform_release.py --repo \"${input:githubPublicRepo}\" --release-root-dir \"Bin/github-staging-release\"",
-      "options": {
-        "cwd": "${workspaceFolder}"
-      },
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "focus": false
-      }
-    },
-    {
       "label": "公开发布：上传当前平台产物到 GitHub",
-      "dependsOn": [
-        "客户端：发布：构建当前平台发布产物",
-        "公开发布：上传当前平台产物"
-      ],
-      "dependsOrder": "sequence",
-      "problemMatcher": []
+      "type": "shell",
+      "command": "python scripts/release/build_and_upload_current_platform_release.py --repo \"${input:githubPublicRepo}\" --release-root-dir \"Bin/github-staging-release\"",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": true
+      }
     },
     {
       "label": "公开发布：触发 GitHub 汇总发布",

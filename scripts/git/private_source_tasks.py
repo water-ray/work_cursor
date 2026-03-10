@@ -151,10 +151,15 @@ def command_switch_branch(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_show_branch(_args: argparse.Namespace) -> int:
+    print_short_status()
+    return 0
+
+
 def command_push_main(args: argparse.Namespace) -> int:
     remote = ensure_non_empty(args.remote, "remote")
     branch = ensure_non_empty(args.branch, "目标远端分支")
-    push(remote, f"HEAD:{branch}", set_upstream=True)
+    push(remote, f"HEAD:{branch}", set_upstream=False)
     return 0
 
 
@@ -173,7 +178,7 @@ def command_commit_push_main(args: argparse.Namespace) -> int:
         return 0
     remote = ensure_non_empty(args.remote, "remote")
     branch = ensure_non_empty(args.branch, "目标远端分支")
-    push(remote, f"HEAD:{branch}", set_upstream=True)
+    push(remote, f"HEAD:{branch}", set_upstream=False)
     print_short_status()
     return 0
 
@@ -198,6 +203,9 @@ def build_parser() -> argparse.ArgumentParser:
     switch_branch = subparsers.add_parser("switch-branch", help="切换或创建本地分支")
     switch_branch.add_argument("--branch", required=True, help="目标分支名")
     switch_branch.set_defaults(handler=command_switch_branch)
+
+    show_branch_parser = subparsers.add_parser("show-branch", help="查看当前分支")
+    show_branch_parser.set_defaults(handler=command_show_branch)
 
     push_main = subparsers.add_parser("push-main", help="推送当前内容到主分支")
     push_main.add_argument("--remote", default=DEFAULT_REMOTE, help=f"远端名称，默认 {DEFAULT_REMOTE}")

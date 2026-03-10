@@ -103,14 +103,13 @@ docs/            # 架构、测试与设计文档
   - Linux 首次启动会通过 `polkit/pkexec` 请求管理员授权，以安装或重启 `waterayd-dev.service`
 - 构建当前宿主机平台客户端：
   - `客户端：构建：当前平台客户端`
-- Linux 安装包构建任务：
-  - `客户端：构建：Linux deb 安装包`
-  - `客户端：构建：Linux AppImage`
-  - `客户端：构建：Linux 安装包（deb + AppImage）`
+  - Windows 会生成 `Bin/Wateray-windows`
+  - Linux 会同时生成 `Bin/Wateray-linux`、`.deb`、`AppImage`
 - 广告端本地发布到 `Bin/adsroot`：
   - `广告端：本地发布：前后端整套到 Bin/adsroot`
 - GitHub 公开发布只面向 VPN 客户端：
   - 先在 Windows / Linux 两台机器分别执行：`公开发布：上传当前平台产物到 GitHub`
+  - 该任务会自动完成当前平台构建、生成 staging 素材并上传
   - 两端产物都上传后，再执行：`公开发布：触发 GitHub 汇总发布`
 - 新设备完整拉取与部署说明：
   - `docs/qa/NEW_DEVICE_SETUP.md`
@@ -118,6 +117,7 @@ docs/            # 架构、测试与设计文档
 ## 私有源码日常同步
 
 - Windows 主开发机日常提交源码到私有仓库：
+  - `私有源码：查看当前分支`
   - `私有源码：提交当前改动`
   - `私有源码：推送当前分支`
   - `私有源码：提交并推送当前分支`
@@ -213,7 +213,7 @@ python scripts/build/targets/linux_package.py --format all
 
 1. Windows / Linux 两台机器分别拉取同一版本源码，并确认 `VERSION` 一致。
 2. 每台机器执行 `公开发布：上传当前平台产物到 GitHub`。
-   - 该流程会先在本地生成当前平台正式资产，再上传到 `staging-v<version>`
+   - 该流程会先构建当前平台正式资产，再生成 staging 素材并上传到 `staging-v<version>`
    - 同时上传 `platform-build-<platform>-v<version>.json`，记录版本、提交和资产清单
    - Linux 当前会上传：
      - `Wateray-linux-v<version>.zip`
