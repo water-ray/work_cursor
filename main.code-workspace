@@ -5,6 +5,14 @@
       "name": "root"
     }
   ],
+  "extensions": {
+    "recommendations": [
+      "golang.go",
+      "ms-python.python",
+      "eamodio.gitlens",
+      "usernamehw.errorlens"
+    ]
+  },
  "settings": {
     "git.enabled": true,
     "taskManager.exclude": "^(?:包|安装|工作流|测试|清理|清理重新生成|生成|配置|(?:build|test|Build|Test) (?:package|workspace|Workspace))(?: - .*)?$",

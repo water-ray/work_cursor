@@ -20,11 +20,16 @@ if hasattr(sys.stderr, "reconfigure"):
 
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from scripts.build.targets.desktop import resolve_current_platform_id
+
 VERSION_PATH = ROOT_DIR / "VERSION"
 CHANGELOG_LATEST_PATH = ROOT_DIR / "docs" / "build" / "CHANGELOG_LATEST.md"
 BIN_DIR = ROOT_DIR / "Bin"
 RELEASE_ROOT_DIR = BIN_DIR / "github-release"
-DEFAULT_PUBLIC_REPO = "water-ray/wateray"
+DEFAULT_PUBLIC_REPO = "water-ray/wateray-release"
 
 PLATFORM_RELEASES = (
     ("windows", "Windows 客户端整包", "Wateray-windows"),
@@ -216,9 +221,51 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--repo",
         default=DEFAULT_PUBLIC_REPO,
-        help="公开发布仓库 owner/name，例如 water-ray/wateray",
+        help="公开发布仓库 owner/name，例如 water-ray/wateray-release",
+    )
+    parser.add_argument(
+        "--platform",
+        choices=("all", "current", "windows", "linux", "macos"),
+        default="all",
+        help="要收集的平台：all / current / windows / linux / macos，默认 all",
+    )
+    parser.add_argument(
+        "--source-archives-dir",
+        default="",
+        help="直接复用已有 zip 包的目录；传入后不会重新打包 Bin/Wateray-* 目录",
+    )
+    parser.add_argument(
+        "--release-root-dir",
+        default="",
+        help="发布素材输出根目录，默认 Bin/github-release",
     )
     return parser.parse_args()
+
+
+def resolve_requested_platforms(platform_arg: str) -> set[str]:
+    if platform_arg == "all":
+        return {platform_id for platform_id, _label, _dir_name in PLATFORM_RELEASES}
+    if platform_arg == "current":
+        return {resolve_current_platform_id()}
+    return {platform_arg}
+
+
+def resolve_release_root_dir(raw_value: str) -> Path:
+    if not raw_value.strip():
+        return RELEASE_ROOT_DIR
+    candidate = Path(raw_value)
+    if not candidate.is_absolute():
+        candidate = ROOT_DIR / candidate
+    return candidate
+
+
+def resolve_source_archives_dir(raw_value: str) -> Path | None:
+    if not raw_value.strip():
+        return None
+    candidate = Path(raw_value)
+    if not candidate.is_absolute():
+        candidate = ROOT_DIR / candidate
+    return candidate
 
 
 def ensure_dir_exists(path: Path, label: str) -> None:
@@ -250,14 +297,20 @@ def zip_directory(source_dir: Path, destination_without_suffix: Path) -> Path:
     return zip_path
 
 
-def build_assets(version: str) -> tuple[Path, list[Path]]:
-    release_dir = RELEASE_ROOT_DIR / f"v{version}"
+def build_assets_from_directories(
+    version: str,
+    release_root_dir: Path,
+    requested_platforms: set[str],
+) -> tuple[Path, list[Path]]:
+    release_dir = release_root_dir / f"v{version}"
     if release_dir.exists():
         shutil.rmtree(release_dir)
     release_dir.mkdir(parents=True, exist_ok=True)
 
     asset_defs: list[ReleaseAsset] = []
     for platform_id, label, dir_name in PLATFORM_RELEASES:
+        if platform_id not in requested_platforms:
+            continue
         source_dir = BIN_DIR / dir_name
         if not source_dir.exists():
             continue
@@ -270,7 +323,11 @@ def build_assets(version: str) -> tuple[Path, list[Path]]:
             ),
         )
     if not asset_defs:
-        supported_dirs = ", ".join(dir_name for _platform_id, _label, dir_name in PLATFORM_RELEASES)
+        supported_dirs = ", ".join(
+            dir_name
+            for platform_id, _label, dir_name in PLATFORM_RELEASES
+            if platform_id in requested_platforms
+        )
         raise ReleasePrepareError(f"未找到可发布客户端目录，请先构建：{supported_dirs}")
 
     archives: list[Path] = []
@@ -279,6 +336,52 @@ def build_assets(version: str) -> tuple[Path, list[Path]]:
         archive = zip_directory(item.source_dir, release_dir / item.zip_name.removesuffix(".zip"))
         archives.append(archive)
     return release_dir, archives
+
+
+def copy_assets_from_archives(
+    version: str,
+    release_root_dir: Path,
+    source_archives_dir: Path,
+    requested_platforms: set[str],
+) -> tuple[Path, list[Path]]:
+    ensure_dir_exists(source_archives_dir, "现成发布压缩包目录")
+    release_dir = release_root_dir / f"v{version}"
+    if release_dir.exists():
+        shutil.rmtree(release_dir)
+    release_dir.mkdir(parents=True, exist_ok=True)
+
+    archives: list[Path] = []
+    for platform_id in sorted(requested_platforms):
+        source_archive = source_archives_dir / f"Wateray-{platform_id}-v{version}.zip"
+        if not source_archive.exists():
+            continue
+        target_archive = release_dir / source_archive.name
+        shutil.copy2(source_archive, target_archive)
+        archives.append(target_archive)
+    if not archives:
+        expected = ", ".join(f"Wateray-{platform_id}-v{version}.zip" for platform_id in sorted(requested_platforms))
+        raise ReleasePrepareError(f"未找到可复用的发布压缩包：{expected}")
+    return release_dir, archives
+
+
+def build_assets(
+    version: str,
+    release_root_dir: Path,
+    requested_platforms: set[str],
+    source_archives_dir: Path | None = None,
+) -> tuple[Path, list[Path]]:
+    if source_archives_dir is not None:
+        return copy_assets_from_archives(
+            version=version,
+            release_root_dir=release_root_dir,
+            source_archives_dir=source_archives_dir,
+            requested_platforms=requested_platforms,
+        )
+    return build_assets_from_directories(
+        version=version,
+        release_root_dir=release_root_dir,
+        requested_platforms=requested_platforms,
+    )
 
 
 def write_sha256_sums(release_dir: Path, archives: list[Path]) -> Path:
@@ -392,7 +495,15 @@ def main() -> int:
     try:
         args = parse_args()
         version = read_version()
-        release_dir, archives = build_assets(version)
+        requested_platforms = resolve_requested_platforms(args.platform)
+        release_root_dir = resolve_release_root_dir(args.release_root_dir)
+        source_archives_dir = resolve_source_archives_dir(args.source_archives_dir)
+        release_dir, archives = build_assets(
+            version=version,
+            release_root_dir=release_root_dir,
+            requested_platforms=requested_platforms,
+            source_archives_dir=source_archives_dir,
+        )
         sha_path = write_sha256_sums(release_dir, archives)
         latest_path = write_latest_json(version, release_dir, archives)
         latest_github_path = write_latest_json_for_github(version, args.repo, release_dir, archives)

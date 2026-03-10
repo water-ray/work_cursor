@@ -46,10 +46,12 @@
   ],
   "tasks": [
     {
-      "label": "内部：客户端：开发：运行 Electron 前端",
+      "label": "客户端：开发：运行 Electron 前端",
       "type": "shell",
-      "hide": true,
       "command": "npm run dev",
+      "linux": {
+        "command": "node node_modules/electron-vite/bin/electron-vite.js dev"
+      },
       "options": {
         "cwd": "${workspaceFolder}/ElectronApp",
         "env": {
@@ -67,10 +69,12 @@
       }
     },
     {
-      "label": "内部：客户端：构建：Electron 前端",
+      "label": "客户端：构建：Electron 前端",
       "type": "shell",
-      "hide": true,
       "command": "npm run build",
+      "linux": {
+        "command": "node node_modules/electron-vite/bin/electron-vite.js build"
+      },
       "options": {
         "cwd": "${workspaceFolder}/ElectronApp",
         "env": {
@@ -86,10 +90,12 @@
       }
     },
     {
-      "label": "内部：客户端：检查：Electron 类型检查",
+      "label": "客户端：检查：Electron 类型检查",
       "type": "shell",
-      "hide": true,
       "command": "npm run typecheck",
+      "linux": {
+        "command": "node node_modules/typescript/bin/tsc --noEmit"
+      },
       "options": {
         "cwd": "${workspaceFolder}/ElectronApp"
       },
@@ -102,9 +108,8 @@
       }
     },
     {
-      "label": "内部：广告端：开发：运行服务端",
+      "label": "广告端：开发：运行服务端",
       "type": "shell",
-      "hide": true,
       "command": "npm run dev",
       "options": {
         "cwd": "${workspaceFolder}/adsroot/server"
@@ -119,10 +124,12 @@
       }
     },
     {
-      "label": "内部：广告端：开发：运行前端",
+      "label": "广告端：开发：运行前端",
       "type": "shell",
-      "hide": true,
       "command": "npm run dev",
+      "linux": {
+        "command": "node node_modules/vite/bin/vite.js"
+      },
       "options": {
         "cwd": "${workspaceFolder}/adsroot/web"
       },
@@ -136,9 +143,8 @@
       }
     },
     {
-      "label": "内部：广告端：本地发布：服务端到 Bin/adsroot",
+      "label": "广告端：本地发布：服务端到 Bin/adsroot",
       "type": "shell",
-      "hide": true,
       "command": "$ErrorActionPreference = 'Stop'; $serverSrc = Join-Path '${workspaceFolder}' 'adsroot/server'; $publishServer = Join-Path '${workspaceFolder}' 'Bin/adsroot/server'; npm run build --prefix $serverSrc; if (Test-Path $publishServer) { Remove-Item -Path $publishServer -Recurse -Force }; New-Item -ItemType Directory -Path $publishServer -Force | Out-Null; Copy-Item -Path (Join-Path $serverSrc 'dist') -Destination $publishServer -Recurse -Force; Set-Content -Path (Join-Path $publishServer 'main.js') -Value 'import ''./dist/main.js'';' -Encoding UTF8; $serverFiles = @('package.json', 'package-lock.json', '.env.example', 'README.md', 'install.sh'); foreach ($name in $serverFiles) { $sourcePath = Join-Path $serverSrc $name; if (Test-Path $sourcePath) { Copy-Item -Path $sourcePath -Destination $publishServer -Force } }; Get-ChildItem -Path $publishServer -Recurse -File | Where-Object { $_.Extension -eq '.sqlite' -or $_.Name.EndsWith('.sqlite-wal') -or $_.Name.EndsWith('.sqlite-shm') } | Remove-Item -Force",
       "options": {
         "cwd": "${workspaceFolder}"
@@ -152,9 +158,8 @@
       }
     },
     {
-      "label": "内部：广告端：本地发布：前端到 Bin/adsroot",
+      "label": "广告端：本地发布：前端到 Bin/adsroot",
       "type": "shell",
-      "hide": true,
       "command": "$ErrorActionPreference = 'Stop'; npm run build --prefix \"${workspaceFolder}/adsroot/web\"; $publishWeb = Join-Path '${workspaceFolder}' 'Bin/adsroot/web'; if (Test-Path $publishWeb) { Remove-Item -Path $publishWeb -Recurse -Force }; New-Item -ItemType Directory -Path $publishWeb -Force | Out-Null; Copy-Item -Path \"${workspaceFolder}/adsroot/web/dist\" -Destination $publishWeb -Recurse -Force",
       "options": {
         "cwd": "${workspaceFolder}"
@@ -170,16 +175,15 @@
     {
       "label": "广告端：本地发布：前后端整套到 Bin/adsroot",
       "dependsOn": [
-        "内部：广告端：本地发布：服务端到 Bin/adsroot",
-        "内部：广告端：本地发布：前端到 Bin/adsroot"
+        "广告端：本地发布：服务端到 Bin/adsroot",
+        "广告端：本地发布：前端到 Bin/adsroot"
       ],
       "dependsOrder": "sequence",
       "problemMatcher": []
     },
     {
-      "label": "内部：客户端：开发：运行 VPN 内核",
+      "label": "客户端：开发：运行 VPN 内核",
       "type": "shell",
-      "hide": true,
       "command": "go run -tags with_clash_api,with_gvisor,with_quic ./cmd/waterayd",
       "options": {
         "cwd": "${workspaceFolder}/core"
@@ -194,9 +198,9 @@
       }
     },
     {
-      "label": "客户端：构建：Windows 客户端整包",
+      "label": "客户端：构建：当前平台客户端",
       "type": "shell",
-      "command": "python scripts/build/targets/desktop.py --platform windows",
+      "command": "python scripts/build/targets/desktop.py",
       "options": {
         "cwd": "${workspaceFolder}"
       },
@@ -209,41 +213,8 @@
       }
     },
     {
-      "label": "内部：客户端：构建：Linux 客户端整包",
+      "label": "客户端：版本：补丁版预演",
       "type": "shell",
-      "hide": true,
-      "command": "python scripts/build/targets/desktop.py --platform linux",
-      "options": {
-        "cwd": "${workspaceFolder}"
-      },
-      "group": "build",
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "focus": false
-      }
-    },
-    {
-      "label": "内部：客户端：构建：macOS 客户端整包",
-      "type": "shell",
-      "hide": true,
-      "command": "python scripts/build/targets/desktop.py --platform macos",
-      "options": {
-        "cwd": "${workspaceFolder}"
-      },
-      "group": "build",
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "focus": false
-      }
-    },
-    {
-      "label": "内部：客户端：版本：补丁版预演",
-      "type": "shell",
-      "hide": true,
       "command": "python scripts/release/release_version.py patch --dry-run",
       "options": {
         "cwd": "${workspaceFolder}"
@@ -257,9 +228,8 @@
       }
     },
     {
-      "label": "内部：客户端：版本：发布补丁版",
+      "label": "客户端：版本：发布补丁版",
       "type": "shell",
-      "hide": true,
       "command": "python scripts/release/release_version.py patch",
       "options": {
         "cwd": "${workspaceFolder}"
@@ -273,9 +243,8 @@
       }
     },
     {
-      "label": "内部：客户端：版本：发布次版本",
+      "label": "客户端：版本：发布次版本",
       "type": "shell",
-      "hide": true,
       "command": "python scripts/release/release_version.py minor",
       "options": {
         "cwd": "${workspaceFolder}"
@@ -289,9 +258,8 @@
       }
     },
     {
-      "label": "内部：客户端：版本：发布主版本",
+      "label": "客户端：版本：发布主版本",
       "type": "shell",
-      "hide": true,
       "command": "python scripts/release/release_version.py major",
       "options": {
         "cwd": "${workspaceFolder}"
@@ -305,11 +273,10 @@
       }
     },
     {
-      "label": "内部：客户端：版本：补丁版并构建 Windows 客户端",
-      "hide": true,
+      "label": "客户端：版本：补丁版并构建当前平台客户端",
       "dependsOn": [
-        "内部：客户端：版本：发布补丁版",
-        "客户端：构建：Windows 客户端整包"
+        "客户端：版本：发布补丁版",
+        "客户端：构建：当前平台客户端"
       ],
       "dependsOrder": "sequence",
       "problemMatcher": []
@@ -317,8 +284,8 @@
     {
       "label": "客户端：开发：运行桌面整套",
       "dependsOn": [
-        "内部：客户端：开发：运行 VPN 内核",
-        "内部：客户端：开发：运行 Electron 前端"
+        "客户端：开发：运行 VPN 内核",
+        "客户端：开发：运行 Electron 前端"
       ],
       "dependsOrder": "sequence",
       "problemMatcher": []
@@ -369,9 +336,8 @@
       }
     },
     {
-      "label": "内部：私有源码：推送当前内容到 main",
+      "label": "私有源码：推送当前内容到 main",
       "type": "shell",
-      "hide": true,
       "command": "$ErrorActionPreference = 'Stop'; git push -u source-private \"HEAD:main\"",
       "options": {
         "cwd": "${workspaceFolder}"
@@ -385,26 +351,41 @@
     },
     {
       "label": "私有源码：提交并推送当前分支",
-      "dependsOn": [
-        "私有源码：提交当前改动",
-        "私有源码：推送当前分支"
-      ],
-      "dependsOrder": "sequence",
-      "problemMatcher": []
+      "type": "shell",
+      "command": "$ErrorActionPreference = 'Stop'; git add -A; git diff --cached --quiet; if ($LASTEXITCODE -eq 0) { Write-Host '没有可提交的改动'; exit 0 }; git commit -m \"$env:WATERAY_GIT_COMMIT_MESSAGE\"; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; git push source-private HEAD; git status --short --branch",
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "WATERAY_GIT_COMMIT_MESSAGE": "${input:gitCommitMessage}"
+        }
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": true
+      }
     },
     {
       "label": "私有源码：提交并推送到 main",
-      "dependsOn": [
-        "私有源码：提交当前改动",
-        "内部：私有源码：推送当前内容到 main"
-      ],
-      "dependsOrder": "sequence",
-      "problemMatcher": []
+      "type": "shell",
+      "command": "$ErrorActionPreference = 'Stop'; git add -A; git diff --cached --quiet; if ($LASTEXITCODE -eq 0) { Write-Host '没有可提交的改动'; exit 0 }; git commit -m \"$env:WATERAY_GIT_COMMIT_MESSAGE\"; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; git push -u source-private \"HEAD:main\"; git status --short --branch",
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "WATERAY_GIT_COMMIT_MESSAGE": "${input:gitCommitMessage}"
+        }
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": true
+      }
     },
     {
-      "label": "内部：私有源码：检查当前提交身份",
+      "label": "私有源码：检查当前提交身份",
       "type": "shell",
-      "hide": true,
       "command": "git config --local --get user.name; git config --local --get user.email; git var GIT_AUTHOR_IDENT; git var GIT_COMMITTER_IDENT",
       "options": {
         "cwd": "${workspaceFolder}"
@@ -417,19 +398,33 @@
       }
     },
     {
-      "label": "内部：公开发布：构建客户端发布产物",
+      "label": "客户端：发布：准备当前平台发布素材",
+      "type": "shell",
+      "command": "python scripts/release/prepare_github_release.py --repo \"${input:githubPublicRepo}\" --platform current --release-root-dir \"Bin/github-staging-release\"",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": "build",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": false
+      }
+    },
+    {
+      "label": "客户端：发布：构建当前平台发布产物",
       "dependsOn": [
-        "客户端：构建：Windows 客户端整包"
+        "客户端：构建：当前平台客户端",
+        "客户端：发布：准备当前平台发布素材"
       ],
-      "hide": true,
       "dependsOrder": "sequence",
       "problemMatcher": []
     },
     {
-      "label": "内部：公开发布：生成客户端 Release 素材",
+      "label": "公开发布：上传当前平台产物",
       "type": "shell",
-      "hide": true,
-      "command": "python scripts/release/prepare_github_release.py --repo \"${input:githubPublicRepo}\"",
+      "command": "python scripts/release/upload_current_platform_release.py --repo \"${input:githubPublicRepo}\" --release-root-dir \"Bin/github-staging-release\"",
       "options": {
         "cwd": "${workspaceFolder}"
       },
@@ -441,20 +436,18 @@
       }
     },
     {
-      "label": "内部：公开发布：构建并生成客户端 Release 素材",
-      "hide": true,
+      "label": "公开发布：上传当前平台产物到 GitHub",
       "dependsOn": [
-        "内部：公开发布：构建客户端发布产物",
-        "内部：公开发布：生成客户端 Release 素材"
+        "客户端：发布：构建当前平台发布产物",
+        "公开发布：上传当前平台产物"
       ],
       "dependsOrder": "sequence",
       "problemMatcher": []
     },
     {
-      "label": "内部：公开发布：自动发布客户端 Release",
+      "label": "公开发布：触发 GitHub 汇总发布",
       "type": "shell",
-      "hide": true,
-      "command": "python scripts/release/publish_github_release.py --repo \"${input:githubPublicRepo}\"",
+      "command": "python scripts/release/dispatch_github_release_workflow.py --public-repo \"${input:githubPublicRepo}\"",
       "options": {
         "cwd": "${workspaceFolder}"
       },
@@ -466,13 +459,18 @@
       }
     },
     {
-      "label": "公开发布：构建并自动发布客户端 Release",
-      "dependsOn": [
-        "内部：公开发布：构建并生成客户端 Release 素材",
-        "内部：公开发布：自动发布客户端 Release"
-      ],
-      "dependsOrder": "sequence",
-      "problemMatcher": []
+      "label": "公开发布：手工直发最终 Release（兜底）",
+      "type": "shell",
+      "command": "python scripts/release/publish_github_release.py --repo \"${input:githubPublicRepo}\"",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": true
+      }
     }
   ]
 }

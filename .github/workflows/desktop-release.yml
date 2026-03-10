@@ -1,0 +1,103 @@
+name: Desktop Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version without leading v
+        required: true
+        type: string
+      public_repo:
+        description: Public release repository (owner/name)
+        required: true
+        default: water-ray/wateray-release
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  aggregate_release:
+    name: Aggregate Desktop Release
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+      PUBLIC_REPO: ${{ inputs.public_repo }}
+      STATUS_FILE: Bin/github-release/aggregate-status-v${{ inputs.version }}.md
+      GH_TOKEN: ${{ secrets.WATERAY_RELEASE_TOKEN != '' && secrets.WATERAY_RELEASE_TOKEN || github.token }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Validate GitHub access
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh auth status
+          gh repo view "$PUBLIC_REPO" >/dev/null
+
+      - name: Download staging assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p staging
+          gh release download "staging-v${RELEASE_VERSION}" \
+            --repo "$PUBLIC_REPO" \
+            --dir staging \
+            --pattern "Wateray-*-v${RELEASE_VERSION}.zip" \
+            --pattern "platform-build-*-v${RELEASE_VERSION}.json" || true
+          ls -la staging
+
+      - name: Aggregate staging assets
+        id: aggregate
+        shell: bash
+        run: |
+          set +e
+          python scripts/release/aggregate_staging_release.py \
+            --repo "$PUBLIC_REPO" \
+            --version "$RELEASE_VERSION" \
+            --source-archives-dir staging
+          status=$?
+          set -e
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          if [ "$status" -eq 0 ] || [ "$status" -eq 2 ]; then
+            exit 0
+          fi
+          exit "$status"
+
+      - name: Update draft release status
+        if: steps.aggregate.outputs.status == '2'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="v${RELEASE_VERSION}"
+          title="Wateray ${tag} (draft)"
+          if gh release view "$tag" --repo "$PUBLIC_REPO" >/dev/null 2>&1; then
+            gh release edit "$tag" \
+              --repo "$PUBLIC_REPO" \
+              --title "$title" \
+              --notes-file "$STATUS_FILE" \
+              --draft=true \
+              --prerelease=true
+          else
+            gh release create "$tag" \
+              --repo "$PUBLIC_REPO" \
+              --title "$title" \
+              --notes-file "$STATUS_FILE" \
+              --draft \
+              --prerelease
+          fi
+
+      - name: Publish final release
+        if: steps.aggregate.outputs.status == '0'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/release/publish_github_release.py \
+            --repo "$PUBLIC_REPO" \
+            --version "$RELEASE_VERSION"

@@ -10,7 +10,7 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parents[2]
 VERSION_PATH = ROOT_DIR / "VERSION"
 RELEASE_ROOT_DIR = ROOT_DIR / "Bin" / "github-release"
-DEFAULT_PUBLIC_REPO = "water-ray/wateray"
+DEFAULT_PUBLIC_REPO = "water-ray/wateray-release"
 
 
 class ReleasePublishError(RuntimeError):
@@ -28,12 +28,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--repo",
         default=DEFAULT_PUBLIC_REPO,
-        help="公开发布仓库 owner/name，例如 water-ray/wateray",
+        help="公开发布仓库 owner/name，例如 water-ray/wateray-release",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
         help="仅打印将要执行的动作，不真正创建或更新 GitHub Release",
+    )
+    parser.add_argument(
+        "--version",
+        default="",
+        help="要发布的版本号，默认读取 VERSION",
+    )
+    parser.add_argument(
+        "--release-root-dir",
+        default="",
+        help="发布素材根目录，默认 Bin/github-release",
     )
     return parser.parse_args()
 
@@ -43,6 +53,15 @@ def read_version() -> str:
     if not version:
         raise ReleasePublishError("VERSION 为空，无法发布 GitHub Release")
     return version
+
+
+def resolve_release_root_dir(raw_value: str) -> Path:
+    if not raw_value.strip():
+        return RELEASE_ROOT_DIR
+    candidate = Path(raw_value)
+    if not candidate.is_absolute():
+        candidate = ROOT_DIR / candidate
+    return candidate
 
 
 def run_command(command: list[str], *, capture_output: bool = False, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -70,8 +89,8 @@ def ensure_gh_ready() -> None:
     run_command(["gh", "auth", "status"], check=True)
 
 
-def resolve_release_files(version: str) -> tuple[Path, Path, list[Path]]:
-    release_dir = RELEASE_ROOT_DIR / f"v{version}"
+def resolve_release_files(version: str, release_root_dir: Path) -> tuple[Path, Path, list[Path]]:
+    release_dir = release_root_dir / f"v{version}"
     notes_path = release_dir / f"release-notes-v{version}.md"
     if not release_dir.exists():
         raise ReleasePublishError(f"未找到发布素材目录：{release_dir}")
@@ -144,6 +163,9 @@ def publish_release(repo: str, tag: str, title: str, notes_path: Path, assets: l
                 title,
                 "--notes-file",
                 str(notes_path),
+                "--draft=false",
+                "--prerelease=false",
+                "--latest=true",
             ],
             check=True,
         )
@@ -173,11 +195,12 @@ def publish_release(repo: str, tag: str, title: str, notes_path: Path, assets: l
 def main() -> int:
     try:
         args = parse_args()
-        version = read_version()
+        version = args.version.strip() or read_version()
         repo = args.repo.strip() or DEFAULT_PUBLIC_REPO
+        release_root_dir = resolve_release_root_dir(args.release_root_dir)
         tag = f"v{version}"
         title = f"Wateray {tag}"
-        _release_dir, notes_path, assets = resolve_release_files(version)
+        _release_dir, notes_path, assets = resolve_release_files(version, release_root_dir)
         ensure_gh_ready()
         publish_release(repo, tag, title, notes_path, assets, dry_run=args.dry_run)
         return 0

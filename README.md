@@ -100,10 +100,13 @@ docs/            # 架构、测试与设计文档
   - `cd adsroot/web && npm install && npm run dev`
 - 或使用 VSCode 任务一键启动：
   - `客户端：开发：运行桌面整套`
+- 构建当前宿主机平台客户端：
+  - `客户端：构建：当前平台客户端`
 - 广告端本地发布到 `Bin/adsroot`：
   - `广告端：本地发布：前后端整套到 Bin/adsroot`
 - GitHub 公开发布只面向 VPN 客户端：
-  - `公开发布：构建并自动发布客户端 Release`
+  - 先在三台机器分别执行：`公开发布：上传当前平台产物到 GitHub`
+  - 三端产物都上传后，再执行：`公开发布：触发 GitHub 汇总发布`
 - 新设备完整拉取与部署说明：
   - `docs/qa/NEW_DEVICE_SETUP.md`
 
@@ -153,7 +156,7 @@ cd adsroot/web && npm install && cd ../..
 ### 4. Linux 构建客户端
 
 ```bash
-python scripts/build/targets/desktop.py --platform linux
+python scripts/build/targets/desktop.py
 ```
 
 构建结果目录：
@@ -170,3 +173,27 @@ python scripts/build/targets/desktop.py --platform linux
   - 系统代理真实实现
   - TUN / 提权
   - AppImage 或其他 Linux 发布格式
+
+## 多平台 GitHub 发布
+
+说明：
+
+- 三端客户端仍需分别在对应宿主机构建：
+  - Windows 在 Windows 构建
+  - Linux 在 Linux 构建
+  - macOS 在 macOS 构建
+- 但本地任务入口保持一致，统一使用同一个构建与上传任务。
+- 正式 GitHub Release 不再由某一台机器本地直接上传，而是由 GitHub Actions 汇总 staging 产物后统一发布。
+
+推荐流程：
+
+1. 三台机器分别拉取同一版本源码，并确认 `VERSION` 一致。
+2. 每台机器执行 `公开发布：上传当前平台产物到 GitHub`。
+3. 任意一台机器执行 `公开发布：触发 GitHub 汇总发布`。
+4. GitHub Actions 从 `staging-v<version>` 收集三端 zip：
+   - 若缺少平台产物，则更新 `v<version>` 草稿状态，不发布正式版。
+   - 若三端产物齐备，则自动生成校验文件、发布说明，并更新正式 Release。
+
+注意：
+
+- 如果 GitHub Actions 需要跨仓库向公开仓库发布，请在承载 workflow 的仓库中配置 `WATERAY_RELEASE_TOKEN`，令其具备目标公开仓库的 Release 写入权限。
