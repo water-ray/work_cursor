@@ -1,0 +1,17 @@
+[Unit]
+Description=Wateray Core Daemon (dev)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=__WATERAY_BINARY__
+WorkingDirectory=__WATERAY_WORKING_DIR__
+Environment=WATERAY_APP_INSTALL_DIR=__WATERAY_INSTALL_DIR__
+Environment=WATERAY_DATA_ROOT=__WATERAY_DATA_ROOT__
+Environment=WATERAY_SYSTEM_SERVICE=1
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

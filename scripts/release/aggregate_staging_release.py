@@ -2,36 +2,37 @@
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
-
-ROOT_DIR = Path(__file__).resolve().parents[2]
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
-
-from scripts.release.prepare_github_release import (
-    DEFAULT_PUBLIC_REPO,
-    build_assets,
-    read_version,
-    resolve_release_root_dir,
-    write_latest_json,
-    write_latest_json_for_github,
-    write_release_notes,
-    write_sha256_sums,
-)
-
-EXPECTED_PLATFORMS = ("windows", "linux", "macos")
-
-
-class AggregateReleaseError(RuntimeError):
-    pass
 
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
+
+
+ROOT_DIR = Path(__file__).resolve().parents[2]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from scripts.release.release_framework import (
+    DEFAULT_PUBLIC_REPO,
+    PLATFORM_ORDER,
+    ReleaseAsset,
+    ReleaseFrameworkError,
+    copy_release_assets_to_dir,
+    load_platform_build_manifest,
+    manifest_to_release_assets,
+    read_version,
+    resolve_expected_release_assets,
+    resolve_release_root_dir,
+    sha256_file,
+    write_latest_json,
+    write_latest_json_for_github,
+    write_release_notes,
+    write_sha256_sums,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,7 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--source-archives-dir",
         required=True,
-        help="已下载的 staging zip 目录",
+        help="已下载的 staging 资产目录",
     )
     parser.add_argument(
         "--release-root-dir",
@@ -80,53 +81,70 @@ def resolve_status_file(raw_value: str, release_root_dir: Path, version: str) ->
     return release_root_dir / f"aggregate-status-v{version}.md"
 
 
-def load_manifest(path: Path) -> dict[str, str]:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as err:
-        raise AggregateReleaseError(f"平台清单解析失败：{path}") from err
-    return {
-        "platform": str(payload.get("platform", "")).strip(),
-        "version": str(payload.get("version", "")).strip(),
-        "assetName": str(payload.get("assetName", "")).strip(),
-        "sourceCommit": str(payload.get("sourceCommit", "")).strip(),
-        "sourceBranch": str(payload.get("sourceBranch", "")).strip(),
-    }
+def validate_manifest_assets(version: str, platform: str, source_archives_dir: Path, assets: list[ReleaseAsset], manifest: dict[str, object]) -> None:
+    expected_names = {item.asset_name for item in resolve_expected_release_assets(version, platform)}
+    actual_names = {item.asset_name for item in assets}
+    if actual_names != expected_names:
+        raise ReleaseFrameworkError(
+            f"{platform} staging 资产不完整：expected={sorted(expected_names)} actual={sorted(actual_names)}"
+        )
+    assets_payload = manifest.get("assets", [])
+    if not isinstance(assets_payload, list):
+        raise ReleaseFrameworkError(f"{platform} 平台清单 assets 字段非法")
+    by_name = {asset.asset_name: asset for asset in assets}
+    for item in assets_payload:
+        if not isinstance(item, dict):
+            raise ReleaseFrameworkError(f"{platform} 平台清单资产条目非法")
+        name = str(item.get("name", "")).strip()
+        if not name:
+            raise ReleaseFrameworkError(f"{platform} 平台清单缺少资产名称")
+        asset = by_name.get(name)
+        if asset is None:
+            raise ReleaseFrameworkError(f"{platform} staging 目录缺少资产：{name}")
+        expected_size = int(item.get("sizeBytes", 0) or 0)
+        if expected_size and asset.path.stat().st_size != expected_size:
+            raise ReleaseFrameworkError(f"{platform} 资产大小不匹配：{name}")
+        expected_sha = str(item.get("sha256", "")).strip().lower()
+        if expected_sha and sha256_file(asset.path).lower() != expected_sha:
+            raise ReleaseFrameworkError(f"{platform} 资产校验值不匹配：{name}")
 
 
-def validate_staging_assets(version: str, source_archives_dir: Path) -> tuple[set[str], dict[str, dict[str, str]]]:
+def validate_staging_assets(
+    version: str,
+    source_archives_dir: Path,
+) -> tuple[set[str], dict[str, dict[str, object]], dict[str, list[ReleaseAsset]]]:
     if not source_archives_dir.exists():
-        raise AggregateReleaseError(f"staging 产物目录不存在：{source_archives_dir}")
-    manifests: dict[str, dict[str, str]] = {}
+        raise ReleaseFrameworkError(f"staging 产物目录不存在：{source_archives_dir}")
+    manifests: dict[str, dict[str, object]] = {}
+    platform_assets: dict[str, list[ReleaseAsset]] = {}
     available_platforms: set[str] = set()
-    for platform in EXPECTED_PLATFORMS:
-        archive_path = source_archives_dir / f"Wateray-{platform}-v{version}.zip"
+    for platform in PLATFORM_ORDER:
         manifest_path = source_archives_dir / f"platform-build-{platform}-v{version}.json"
-        if archive_path.exists():
-            available_platforms.add(platform)
         if not manifest_path.exists():
             continue
-        manifest = load_manifest(manifest_path)
-        if manifest["platform"] != platform:
-            raise AggregateReleaseError(f"平台清单与文件名不一致：{manifest_path}")
-        if manifest["version"] != version:
-            raise AggregateReleaseError(f"平台清单版本不一致：{manifest_path}")
-        if manifest["assetName"] and manifest["assetName"] != archive_path.name:
-            raise AggregateReleaseError(f"平台清单记录的压缩包名不匹配：{manifest_path}")
+        manifest = load_platform_build_manifest(manifest_path)
+        if str(manifest.get("platform", "")).strip() != platform:
+            raise ReleaseFrameworkError(f"平台清单与文件名不一致：{manifest_path}")
+        if str(manifest.get("version", "")).strip() != version:
+            raise ReleaseFrameworkError(f"平台清单版本不一致：{manifest_path}")
+        assets = manifest_to_release_assets(manifest, source_archives_dir)
+        validate_manifest_assets(version, platform, source_archives_dir, assets, manifest)
         manifests[platform] = manifest
-    commits = {item["sourceCommit"] for item in manifests.values() if item["sourceCommit"]}
+        platform_assets[platform] = assets
+        available_platforms.add(platform)
+    commits = {str(item.get("sourceCommit", "")).strip() for item in manifests.values() if str(item.get("sourceCommit", "")).strip()}
     if len(commits) > 1:
-        raise AggregateReleaseError("三端构建来源提交不一致，请确认三台机器使用同一源码版本")
-    return available_platforms, manifests
+        raise ReleaseFrameworkError("Windows 与 Linux 构建来源提交不一致，请确认两台机器使用同一源码版本")
+    return available_platforms, manifests, platform_assets
 
 
 def write_status_file(
     status_file: Path,
     version: str,
     available_platforms: set[str],
-    manifests: dict[str, dict[str, str]],
+    manifests: dict[str, dict[str, object]],
 ) -> None:
-    expected = set(EXPECTED_PLATFORMS)
+    expected = set(PLATFORM_ORDER)
     missing = sorted(expected - available_platforms)
     lines = [
         f"# Wateray v{version} 汇总状态",
@@ -136,25 +154,27 @@ def write_status_file(
         f"- 已收到平台：{', '.join(sorted(available_platforms)) if available_platforms else '无'}",
         f"- 缺少平台：{', '.join(missing) if missing else '无'}",
     ]
-    commits = sorted({item['sourceCommit'] for item in manifests.values() if item.get('sourceCommit')})
+    commits = sorted({str(item.get('sourceCommit', '')).strip() for item in manifests.values() if str(item.get('sourceCommit', '')).strip()})
     if commits:
         lines.append(f"- 当前提交：{', '.join(commits)}")
     status_file.parent.mkdir(parents=True, exist_ok=True)
     status_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def build_release_assets(version: str, repo: str, source_archives_dir: Path, release_root_dir: Path) -> tuple[Path, Path]:
-    requested_platforms = set(EXPECTED_PLATFORMS)
-    release_dir, archives = build_assets(
-        version=version,
-        release_root_dir=release_root_dir,
-        requested_platforms=requested_platforms,
-        source_archives_dir=source_archives_dir,
-    )
-    write_sha256_sums(release_dir, archives)
-    write_latest_json(version, release_dir, archives)
-    write_latest_json_for_github(version, repo, release_dir, archives)
-    notes_path = write_release_notes(version, repo, release_dir, archives)
+def build_release_assets(
+    version: str,
+    repo: str,
+    platform_assets: dict[str, list[ReleaseAsset]],
+    release_root_dir: Path,
+) -> tuple[Path, Path]:
+    assets: list[ReleaseAsset] = []
+    for platform in PLATFORM_ORDER:
+        assets.extend(platform_assets.get(platform, []))
+    release_dir, copied_assets = copy_release_assets_to_dir(release_root_dir, version, assets)
+    write_sha256_sums(release_dir, copied_assets)
+    write_latest_json(version, release_dir, copied_assets)
+    write_latest_json_for_github(version, repo, release_dir, copied_assets)
+    notes_path = write_release_notes(version, repo, release_dir, copied_assets)
     return release_dir, notes_path
 
 
@@ -165,8 +185,8 @@ def main() -> int:
         release_root_dir = resolve_release_root_dir(args.release_root_dir)
         status_file = resolve_status_file(args.status_file, release_root_dir, version)
         source_archives_dir = resolve_source_archives_dir(args.source_archives_dir)
-        available_platforms, manifests = validate_staging_assets(version, source_archives_dir)
-        missing = sorted(set(EXPECTED_PLATFORMS) - available_platforms)
+        available_platforms, manifests, platform_assets = validate_staging_assets(version, source_archives_dir)
+        missing = sorted(set(PLATFORM_ORDER) - available_platforms)
         if missing:
             write_status_file(status_file, version, available_platforms, manifests)
             print(f"等待更多平台产物：{', '.join(missing)}")
@@ -175,13 +195,13 @@ def main() -> int:
         release_dir, notes_path = build_release_assets(
             version=version,
             repo=args.repo.strip() or DEFAULT_PUBLIC_REPO,
-            source_archives_dir=source_archives_dir,
+            platform_assets=platform_assets,
             release_root_dir=release_root_dir,
         )
         print(f"已汇总正式发布素材：{release_dir}")
         print(f"发布说明：{notes_path}")
         return 0
-    except AggregateReleaseError as err:
+    except ReleaseFrameworkError as err:
         print(f"汇总 staging release 失败：{err}", file=sys.stderr)
         return 1
     except Exception as err:  # pragma: no cover

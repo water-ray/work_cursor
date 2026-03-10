@@ -1,5 +1,6 @@
 import { app, BrowserWindow } from "electron";
 
+import { platformServices } from "../platform/common/platformServices";
 import { getDaemonBaseURL } from "./daemonClient";
 
 const daemonShutdownTimeoutMs = 1200;
@@ -43,7 +44,10 @@ export function closePanelKeepCore(window: BrowserWindow | null): void {
 
 export function quitAll(window: BrowserWindow | null): void {
   hideWindow(window);
-  void shutdownDaemonBestEffort().finally(() => {
+  const shutdownPromise = platformServices.daemon.shouldShutdownDaemonOnAppQuit()
+    ? shutdownDaemonBestEffort()
+    : Promise.resolve();
+  void shutdownPromise.finally(() => {
     setTimeout(() => {
       app.quit();
     }, 0);

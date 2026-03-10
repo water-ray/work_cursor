@@ -13,6 +13,7 @@ export type PlatformTrayServices = {
 
 export type PlatformDaemonServices = {
   ensurePackagedDaemonRunning(): Promise<void>;
+  shouldShutdownDaemonOnAppQuit(): boolean;
 };
 
 export type PlatformWindowServices = {

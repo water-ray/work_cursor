@@ -2,13 +2,14 @@
   "name": "wateray-electron-app",
   "version": "1.0.17",
   "private": true,
+  "desktopName": "wateray.desktop",
   "description": "Wateray desktop frontend powered by Electron + React + Ant Design",
   "main": "out/main/index.js",
   "scripts": {
-    "dev": "electron-vite dev",
+    "dev": "node ./scripts/run-electron-vite.mjs dev",
     "build": "electron-vite build",
     "package:desktop": "electron-packager . WaterayApp --out=out-package --overwrite --asar",
-    "preview": "electron-vite preview",
+    "preview": "node ./scripts/run-electron-vite.mjs preview",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

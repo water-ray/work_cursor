@@ -29,6 +29,7 @@ ELECTRON_PACKAGE_OUT_ROOT = BIN_DIR / ".tmp" / "desktop-package-out"
 ELECTRON_PACKAGE_TMP_ROOT = BIN_DIR / ".tmp" / "electron-packager"
 ELECTRON_RULE_SET_DIR = ELECTRON_DIR / "rule-set"
 ELECTRON_DEFAULT_CONFIG_DIR = ELECTRON_DIR / "default-config"
+LINUX_BUILD_ASSET_DIR = ROOT_DIR / "scripts" / "build" / "assets" / "linux"
 VERSION_PATH = ROOT_DIR / "VERSION"
 SEMVER_PATTERN = re.compile(r"^\d+\.\d+\.\d+$")
 
@@ -128,6 +129,10 @@ def ensure_required_files(target: DesktopBuildTarget) -> None:
         ELECTRON_DIR / "package.json",
         ELECTRON_RULE_SET_DIR,
     ]
+    if target.icon_path:
+        required_paths.append((ELECTRON_DIR / target.icon_path).resolve())
+    if target.platform_id == "linux":
+        required_paths.append(LINUX_BUILD_ASSET_DIR)
     if target.needs_windows_manifest:
         required_paths.extend(
             [
@@ -366,6 +371,12 @@ def build_frontend_unpacked(target: DesktopBuildTarget, release_version: str) ->
         print(f"跳过默认配置拷贝（目录不存在）：{ELECTRON_DEFAULT_CONFIG_DIR}")
     print(f"同步 VERSION -> {release_version}")
     shutil.copy2(VERSION_PATH, target.bin_dir / "VERSION")
+    if target.platform_id == "linux" and LINUX_BUILD_ASSET_DIR.exists():
+        shutil.copytree(
+            LINUX_BUILD_ASSET_DIR,
+            target.bin_dir / "linux",
+            dirs_exist_ok=True,
+        )
 
     frontend_path = target.bin_dir / target.frontend_entry_name
     if not frontend_path.exists():

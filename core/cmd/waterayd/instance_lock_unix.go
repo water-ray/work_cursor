@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 )
 
@@ -15,8 +16,18 @@ type fileInstanceLock struct {
 	file *os.File
 }
 
+func resolveDaemonInstanceLockPath() string {
+	if dataRoot := strings.TrimSpace(os.Getenv("WATERAY_DATA_ROOT")); dataRoot != "" {
+		return filepath.Join(filepath.Clean(dataRoot), "waterayd-instance.lock")
+	}
+	return filepath.Join(os.TempDir(), "waterayd-instance.lock")
+}
+
 func acquireDaemonInstanceLock() (daemonInstanceLock, error) {
-	lockPath := filepath.Join(os.TempDir(), "waterayd-instance.lock")
+	lockPath := resolveDaemonInstanceLockPath()
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
+		return nil, fmt.Errorf("prepare lock dir failed: %w", err)
+	}
 	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open lock file failed: %w", err)

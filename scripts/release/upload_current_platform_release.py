@@ -5,28 +5,30 @@ import argparse
 import json
 import subprocess
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
-
-ROOT_DIR = Path(__file__).resolve().parents[2]
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
-
-from scripts.build.targets.desktop import resolve_current_platform_id
-
-VERSION_PATH = ROOT_DIR / "VERSION"
-DEFAULT_PUBLIC_REPO = "water-ray/wateray-release"
-DEFAULT_RELEASE_ROOT_DIR = ROOT_DIR / "Bin" / "github-staging-release"
-
-
-class UploadReleaseError(RuntimeError):
-    pass
 
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
+
+
+ROOT_DIR = Path(__file__).resolve().parents[2]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from scripts.build.targets.desktop import resolve_current_platform_id
+from scripts.release.release_framework import (
+    DEFAULT_PUBLIC_REPO,
+    ReleaseFrameworkError,
+    read_version,
+    resolve_release_assets_in_dir,
+    resolve_release_root_dir,
+    write_platform_build_manifest,
+)
+
+DEFAULT_RELEASE_ROOT_DIR = ROOT_DIR / "Bin" / "github-staging-release"
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,22 +51,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def read_version() -> str:
-    version = VERSION_PATH.read_text(encoding="utf-8").strip()
-    if not version:
-        raise UploadReleaseError("VERSION 为空，无法上传当前平台产物")
-    return version
-
-
-def resolve_release_root_dir(raw_value: str) -> Path:
-    if not raw_value.strip():
-        return DEFAULT_RELEASE_ROOT_DIR
-    candidate = Path(raw_value)
-    if not candidate.is_absolute():
-        candidate = ROOT_DIR / candidate
-    return candidate
-
-
 def run_command(command: list[str], *, capture_output: bool = False, check: bool = True) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(
         command,
@@ -78,8 +64,7 @@ def run_command(command: list[str], *, capture_output: bool = False, check: bool
     if check and result.returncode != 0:
         stderr = (result.stderr or "").strip()
         stdout = (result.stdout or "").strip()
-        detail = stderr or stdout or f"命令失败（exit_code={result.returncode}）"
-        raise UploadReleaseError(detail)
+        raise ReleaseFrameworkError(stderr or stdout or f"命令失败（exit_code={result.returncode}）")
     return result
 
 
@@ -87,66 +72,14 @@ def ensure_gh_ready() -> None:
     try:
         run_command(["gh", "--version"], check=True)
     except FileNotFoundError as err:
-        raise UploadReleaseError("未安装 gh CLI，请先安装 GitHub CLI") from err
+        raise ReleaseFrameworkError("未安装 gh CLI，请先安装 GitHub CLI") from err
     run_command(["gh", "auth", "status"], check=True)
 
 
-def run_git(args: list[str], allow_failure: bool = False) -> str:
-    result = subprocess.run(
-        ["git", *args],
-        cwd=str(ROOT_DIR),
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        capture_output=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        if allow_failure:
-            return ""
-        stderr = (result.stderr or "").strip()
-        stdout = (result.stdout or "").strip()
-        raise UploadReleaseError(stderr or stdout or "git 命令失败")
-    return (result.stdout or "").strip()
-
-
-def resolve_current_platform_asset(version: str, release_root_dir: Path, platform_id: str) -> Path:
-    release_dir = release_root_dir / f"v{version}"
-    asset_path = release_dir / f"Wateray-{platform_id}-v{version}.zip"
-    if not asset_path.exists():
-        raise UploadReleaseError(f"未找到当前平台发布压缩包：{asset_path}")
-    return asset_path
-
-
-def write_platform_build_manifest(
-    version: str,
-    repo: str,
-    release_root_dir: Path,
-    asset_path: Path,
-    platform_id: str,
-) -> Path:
-    release_dir = release_root_dir / f"v{version}"
-    manifest_path = release_dir / f"platform-build-{platform_id}-v{version}.json"
-    payload = {
-        "version": version,
-        "platform": platform_id,
-        "assetName": asset_path.name,
-        "publicRepo": repo,
-        "sourceCommit": run_git(["rev-parse", "HEAD"]),
-        "sourceBranch": run_git(["rev-parse", "--abbrev-ref", "HEAD"], allow_failure=True) or "unknown",
-        "generatedAt": datetime.now(timezone.utc).isoformat(),
-    }
-    manifest_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    return manifest_path
-
-
-def release_exists(repo: str, tag: str) -> bool:
-    result = run_command(
-        ["gh", "release", "view", tag, "--repo", repo],
-        capture_output=True,
-        check=False,
-    )
-    return result.returncode == 0
+def resolve_staging_root_dir(raw_value: str) -> Path:
+    if not raw_value.strip():
+        return DEFAULT_RELEASE_ROOT_DIR
+    return resolve_release_root_dir(raw_value)
 
 
 def collect_uploaded_platforms(repo: str, tag: str) -> list[str]:
@@ -165,28 +98,37 @@ def collect_uploaded_platforms(repo: str, tag: str) -> list[str]:
         check=True,
     )
     payload = json.loads(result.stdout or "{}")
-    names = [item.get("name", "") for item in payload.get("assets", [])]
+    names = [str(item.get("name", "")).strip() for item in payload.get("assets", [])]
     platforms = []
     for name in names:
-        if not name.startswith("Wateray-") or "-v" not in name:
+        if not name.startswith("platform-build-") or "-v" not in name:
             continue
-        platforms.append(name.removeprefix("Wateray-").split("-v", 1)[0])
+        platforms.append(name.removeprefix("platform-build-").split("-v", 1)[0])
     return sorted(set(platforms))
 
 
 def build_staging_notes(version: str, uploaded_platforms: list[str]) -> str:
-    expected = {"windows", "linux", "macos"}
+    expected = {"windows", "linux"}
     uploaded = set(uploaded_platforms)
     missing = sorted(expected - uploaded)
     lines = [
         f"# Wateray staging v{version}",
         "",
-        "当前 release 仅用于汇总三端构建产物，正式发布将由 GitHub Actions 统一执行。",
+        "当前 release 仅用于汇总 Windows + Linux 构建产物，正式发布将由 GitHub Actions 统一执行。",
         "",
         f"- 已上传平台：{', '.join(sorted(uploaded)) if uploaded else '无'}",
         f"- 缺少平台：{', '.join(missing) if missing else '无'}",
     ]
     return "\n".join(lines)
+
+
+def release_exists(repo: str, tag: str) -> bool:
+    result = run_command(
+        ["gh", "release", "view", tag, "--repo", repo],
+        capture_output=True,
+        check=False,
+    )
+    return result.returncode == 0
 
 
 def ensure_staging_release(repo: str, tag: str, title: str, *, dry_run: bool) -> None:
@@ -206,7 +148,7 @@ def ensure_staging_release(repo: str, tag: str, title: str, *, dry_run: bool) ->
             "--title",
             title,
             "--notes",
-            "等待三端客户端产物上传完成后，由 GitHub Actions 统一汇总正式发布。",
+            "等待 Windows 与 Linux 客户端产物上传完成后，由 GitHub Actions 统一汇总正式发布。",
             "--draft",
             "--prerelease",
         ]
@@ -264,18 +206,19 @@ def main() -> int:
         version = read_version()
         repo = args.repo.strip() or DEFAULT_PUBLIC_REPO
         platform_id = resolve_current_platform_id()
-        release_root_dir = resolve_release_root_dir(args.release_root_dir)
-        asset_path = resolve_current_platform_asset(version, release_root_dir, platform_id)
-        manifest_path = write_platform_build_manifest(version, repo, release_root_dir, asset_path, platform_id)
+        release_root_dir = resolve_staging_root_dir(args.release_root_dir)
+        release_dir = release_root_dir / f"v{version}"
+        assets = resolve_release_assets_in_dir(version, release_dir, {platform_id})
+        manifest_path = write_platform_build_manifest(version, repo, release_dir, platform_id, assets)
         ensure_gh_ready()
         staging_tag = f"staging-v{version}"
         ensure_staging_release(repo, staging_tag, f"Wateray staging v{version}", dry_run=args.dry_run)
-        upload_platform_assets(repo, staging_tag, [asset_path, manifest_path], dry_run=args.dry_run)
+        upload_platform_assets(repo, staging_tag, [*([item.path for item in assets]), manifest_path], dry_run=args.dry_run)
         update_staging_release_notes(repo, staging_tag, version, dry_run=args.dry_run)
         if not args.dry_run:
             print(f"已上传当前平台产物：{platform_id} -> {repo} {staging_tag}")
         return 0
-    except UploadReleaseError as err:
+    except ReleaseFrameworkError as err:
         print(f"上传当前平台产物失败：{err}", file=sys.stderr)
         return 1
     except Exception as err:  # pragma: no cover

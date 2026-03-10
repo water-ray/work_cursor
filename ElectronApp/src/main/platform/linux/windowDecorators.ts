@@ -1,3 +1,7 @@
 import type { BrowserWindow } from "electron";
 
-export function decorateMainWindow(_window: BrowserWindow): void {}
+import { applyWindowProcessIcon } from "../../services/appIcon";
+
+export function decorateMainWindow(window: BrowserWindow): void {
+  void applyWindowProcessIcon(window);
+}

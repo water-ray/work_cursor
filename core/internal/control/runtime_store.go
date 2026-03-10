@@ -8580,22 +8580,6 @@ func (s *RuntimeStore) saveLocked() error {
 	return nil
 }
 
-func resolveStateFile() string {
-	configDir, err := os.UserConfigDir()
-	if err != nil || configDir == "" {
-		return filepath.Join(os.TempDir(), "wateray", "waterayd_state.json")
-	}
-	return filepath.Join(configDir, "wateray", "waterayd_state.json")
-}
-
-func resolveRuntimeLogRootDir() string {
-	configDir, err := os.UserConfigDir()
-	if err != nil || strings.TrimSpace(configDir) == "" {
-		return filepath.Join(os.TempDir(), "wateray", "Log")
-	}
-	return filepath.Join(configDir, "wateray", "Log")
-}
-
 func (s *RuntimeStore) initLogSession(now time.Time) {
 	if now.IsZero() {
 		now = time.Now()

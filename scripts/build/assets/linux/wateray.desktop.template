@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Wateray
+Comment=Wateray desktop client
+Exec=__WATERAY_EXEC__
+TryExec=__WATERAY_EXEC__
+Icon=__WATERAY_ICON__
+Terminal=false
+Categories=Network;
+StartupNotify=true
+StartupWMClass=wateray
+X-GNOME-WMClass=wateray

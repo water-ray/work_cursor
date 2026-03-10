@@ -189,3 +189,7 @@ export async function ensurePackagedDaemonRunning(): Promise<void> {
     console.error("[wateray] daemon start timeout");
   }
 }
+
+export function shouldShutdownDaemonOnAppQuit(): boolean {
+  return true;
+}

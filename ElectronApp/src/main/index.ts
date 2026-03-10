@@ -7,6 +7,12 @@ import { platformServices } from "./platform/common/platformServices";
 import { daemonTransportManager } from "./services/daemonTransportManager";
 import { createMainWindow } from "./window/createMainWindow";
 
+if (process.platform === "linux") {
+  const currentUserDataPath = app.getPath("userData");
+  app.setName("wateray");
+  app.setPath("userData", currentUserDataPath);
+}
+
 function bootstrap(): void {
   registerWindowIpc();
   registerDaemonIpc();

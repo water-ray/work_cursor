@@ -18,6 +18,19 @@ function getExecutablePathCandidates(): string[] {
   return [...new Set(candidates.filter((value) => value.trim().length > 0))];
 }
 
+function getLinuxIconCandidates(): string[] {
+  const appPath = app.getAppPath();
+  return [
+    process.env.WATERAY_LINUX_ICON_PATH?.trim() ?? "",
+    resolve(dirname(process.execPath), "linux", "wateray.png"),
+    resolve(process.cwd(), "..", "scripts", "build", "assets", "linux", "wateray.png"),
+    resolve(process.cwd(), "linux", "wateray.png"),
+    resolve(appPath, "linux", "wateray.png"),
+    resolve(appPath, "..", "linux", "wateray.png"),
+    resolve(__dirname, "../../../../scripts/build/assets/linux/wateray.png"),
+  ];
+}
+
 function getDevIconCandidates(): string[] {
   const appPath = app.getAppPath();
   return [
@@ -27,6 +40,19 @@ function getDevIconCandidates(): string[] {
     resolve(dirname(appPath), "ico.ico"),
     resolve(process.cwd(), "ico.ico"),
   ];
+}
+
+function loadImageFromCandidates(candidates: string[]): NativeImage {
+  for (const candidate of new Set(candidates.map((value) => value.trim()).filter(Boolean))) {
+    if (!existsSync(candidate)) {
+      continue;
+    }
+    const image = nativeImage.createFromPath(candidate);
+    if (!image.isEmpty()) {
+      return image;
+    }
+  }
+  return nativeImage.createEmpty();
 }
 
 async function loadExecutableIcon(): Promise<NativeImage> {
@@ -48,6 +74,12 @@ async function loadExecutableIcon(): Promise<NativeImage> {
 }
 
 async function resolveProcessIcon(): Promise<NativeImage> {
+  if (process.platform === "linux") {
+    const linuxIcon = loadImageFromCandidates(getLinuxIconCandidates());
+    if (!linuxIcon.isEmpty()) {
+      return linuxIcon;
+    }
+  }
   const executableIcon = await loadExecutableIcon();
   if (!executableIcon.isEmpty()) {
     return executableIcon;
@@ -56,16 +88,11 @@ async function resolveProcessIcon(): Promise<NativeImage> {
     // Release builds should only rely on executable embedded icon.
     return nativeImage.createEmpty();
   }
-  for (const candidate of new Set(getDevIconCandidates())) {
-    if (!existsSync(candidate)) {
-      continue;
-    }
-    const image = nativeImage.createFromPath(candidate);
-    if (!image.isEmpty()) {
-      return image;
-    }
+  const devIcon = loadImageFromCandidates(getDevIconCandidates());
+  if (!devIcon.isEmpty()) {
+    return devIcon;
   }
-  return nativeImage.createEmpty();
+  return loadImageFromCandidates(getLinuxIconCandidates());
 }
 
 export function getProcessIcon(): Promise<NativeImage> {
@@ -73,6 +100,17 @@ export function getProcessIcon(): Promise<NativeImage> {
     processIconPromise = resolveProcessIcon();
   }
   return processIconPromise;
+}
+
+export function getWindowIcon(): NativeImage {
+  if (process.platform === "linux") {
+    return loadImageFromCandidates(getLinuxIconCandidates());
+  }
+  return nativeImage.createEmpty();
+}
+
+export async function getTrayIcon(): Promise<NativeImage> {
+  return await getProcessIcon();
 }
 
 export async function applyWindowProcessIcon(window: BrowserWindow): Promise<void> {

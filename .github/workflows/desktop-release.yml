@@ -48,9 +48,7 @@ jobs:
           mkdir -p staging
           gh release download "staging-v${RELEASE_VERSION}" \
             --repo "$PUBLIC_REPO" \
-            --dir staging \
-            --pattern "Wateray-*-v${RELEASE_VERSION}.zip" \
-            --pattern "platform-build-*-v${RELEASE_VERSION}.json" || true
+            --dir staging || true
           ls -la staging
 
       - name: Aggregate staging assets

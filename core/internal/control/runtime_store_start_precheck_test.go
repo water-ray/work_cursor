@@ -1,7 +1,6 @@
 package control
 
 import (
-	"context"
 	"net"
 	"testing"
 	"time"
@@ -16,10 +15,7 @@ func TestCheckStartPreconditionsWarnsForDefaultRuleGroup(t *testing.T) {
 	)
 	applyStartPrecheckRuleConfig(&store.state, config)
 
-	_, result, err := store.CheckStartPreconditions(context.Background())
-	if err != nil {
-		t.Fatalf("check start preconditions failed: %v", err)
-	}
+	result := buildStartPrecheckResultForTest(store)
 	if !result.CanStart {
 		t.Fatalf("default rule group should only warn, got blockers=%v", result.Blockers)
 	}
@@ -34,10 +30,7 @@ func TestCheckStartPreconditionsBlocksWhenNodeNotConfigured(t *testing.T) {
 	store.state.ActiveGroupID = ""
 	store.state.SelectedNodeID = ""
 
-	_, result, err := store.CheckStartPreconditions(context.Background())
-	if err != nil {
-		t.Fatalf("check start preconditions failed: %v", err)
-	}
+	result := buildStartPrecheckResultForTest(store)
 	if result.CanStart {
 		t.Fatalf("expected canStart=false when node not configured")
 	}
@@ -63,10 +56,7 @@ func TestCheckStartPreconditionsWarnsWhenActiveNodeUnavailable(t *testing.T) {
 	store := newStartPrecheckTestStore(t)
 	store.state.Groups[0].Nodes[0].LatencyMS = -1
 
-	_, result, err := store.CheckStartPreconditions(context.Background())
-	if err != nil {
-		t.Fatalf("check start preconditions failed: %v", err)
-	}
+	result := buildStartPrecheckResultForTest(store)
 	if !result.CanStart {
 		t.Fatalf("unreachable active node should not block start")
 	}
@@ -85,10 +75,7 @@ func TestCheckStartPreconditionsBlocksWhenListenPortUnavailable(t *testing.T) {
 	store.state.LocalProxyPort = listener.Addr().(*net.TCPAddr).Port
 	store.state.AllowExternal = false
 
-	_, result, precheckErr := store.CheckStartPreconditions(context.Background())
-	if precheckErr != nil {
-		t.Fatalf("check start preconditions failed: %v", precheckErr)
-	}
+	result := buildStartPrecheckResultForTest(store)
 	if result.CanStart {
 		t.Fatalf("expected canStart=false when listen port is unavailable")
 	}
@@ -121,10 +108,7 @@ func TestCheckStartPreconditionsBlocksWhenRuleSetMissing(t *testing.T) {
 	)
 	applyStartPrecheckRuleConfig(&store.state, config)
 
-	_, result, err := store.CheckStartPreconditions(context.Background())
-	if err != nil {
-		t.Fatalf("check start preconditions failed: %v", err)
-	}
+	result := buildStartPrecheckResultForTest(store)
 	if result.CanStart {
 		t.Fatalf("expected canStart=false when built-in rule-set file is missing")
 	}
@@ -214,6 +198,11 @@ func containsIssueCode(items []StartPrecheckIssue, code StartPrecheckIssueCode) 
 		}
 	}
 	return false
+}
+
+func buildStartPrecheckResultForTest(store *RuntimeStore) StartPrecheckResult {
+	targetMode := normalizeConfiguredProxyMode(store.state.ConfiguredProxyMode)
+	return buildStartPrecheckResult(store.state, targetMode, store.runtime)
 }
 
 func findIssueMessage(items []StartPrecheckIssue, code StartPrecheckIssueCode) (string, bool) {

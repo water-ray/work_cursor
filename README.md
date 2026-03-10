@@ -88,7 +88,7 @@ docs/            # 架构、测试与设计文档
 - 下载：
   - `pwsh ./scripts/build/download-sb-windows.ps1 -Tag sb-win-v0.1.0`
 
-## 本地 Windows 开发环境初始化
+## 本地桌面开发环境初始化
 
 - 启动 core：
   - `cd core && go run -tags with_clash_api,with_gvisor,with_quic ./cmd/waterayd`
@@ -100,13 +100,18 @@ docs/            # 架构、测试与设计文档
   - `cd adsroot/web && npm install && npm run dev`
 - 或使用 VSCode 任务一键启动：
   - `客户端：开发：运行桌面整套`
+  - Linux 首次启动会通过 `polkit/pkexec` 请求管理员授权，以安装或重启 `waterayd-dev.service`
 - 构建当前宿主机平台客户端：
   - `客户端：构建：当前平台客户端`
+- Linux 安装包构建任务：
+  - `客户端：构建：Linux deb 安装包`
+  - `客户端：构建：Linux AppImage`
+  - `客户端：构建：Linux 安装包（deb + AppImage）`
 - 广告端本地发布到 `Bin/adsroot`：
   - `广告端：本地发布：前后端整套到 Bin/adsroot`
 - GitHub 公开发布只面向 VPN 客户端：
-  - 先在三台机器分别执行：`公开发布：上传当前平台产物到 GitHub`
-  - 三端产物都上传后，再执行：`公开发布：触发 GitHub 汇总发布`
+  - 先在 Windows / Linux 两台机器分别执行：`公开发布：上传当前平台产物到 GitHub`
+  - 两端产物都上传后，再执行：`公开发布：触发 GitHub 汇总发布`
 - 新设备完整拉取与部署说明：
   - `docs/qa/NEW_DEVICE_SETUP.md`
 
@@ -159,40 +164,65 @@ cd adsroot/web && npm install && cd ../..
 python scripts/build/targets/desktop.py
 ```
 
+如需生成 Linux 安装包：
+
+```bash
+python scripts/build/targets/linux_package.py --format all
+```
+
 构建结果目录：
 
 - `Bin/Wateray-linux`
+- 其中 `Bin/Wateray-linux/linux/` 包含 Linux service / polkit / 安装脚本资产
+- `Bin/Wateray-linux-packages`
+  - `wateray_<version>_amd64.deb`
+  - `Wateray-linux-v<version>-x86_64.AppImage`
 
 ### 5. 当前 Linux 状态
 
-- 当前 Linux 构建入口已接好
-- 当前阶段主要目标是“开发态跑通”
-- 以下能力仍是后续待完善项：
-  - daemon 自动拉起
-  - 托盘行为
+- Linux TUN 已切到 `systemd-first` 模型：
+  - 开发态通过 `scripts/dev/run_waterayd.py` 构建 dev bundle，并提权拉起 `waterayd-dev.service`
+  - 打包态通过 `linux/install-system-service.sh` / `wateray-service-helper.sh` 安装或修复 `waterayd.service`
+- Electron UI 保持普通用户运行；关闭 UI 不会主动停止 Linux daemon
+- Linux 发布产物已补齐：
+  - `.deb`：面向 Debian / Ubuntu `amd64`，安装时会自动安装或修复 `waterayd.service`
+  - `AppImage`：面向 `x86_64 + glibc + systemd + polkit` 桌面环境，运行时会先同步到 `~/.local/share/wateray/appimage/current`，再按需授权安装服务
+- Linux 当前推荐支持：
+  - Ubuntu `22.04+` / `24.04+`
+  - Debian `12+`
+- Linux 暂不保证支持：
+  - 非 `systemd` 发行版
+  - `musl` / Alpine
+  - `arm64`
+- Linux 仍保留以下后续项：
   - 系统代理真实实现
-  - TUN / 提权
-  - AppImage 或其他 Linux 发布格式
+  - capability-only 瘦权限硬化
+- Linux 授权、验证与排障说明见 `docs/qa/LINUX_TUN_SYSTEMD.md`
 
 ## 多平台 GitHub 发布
 
 说明：
 
-- 三端客户端仍需分别在对应宿主机构建：
+- 当前公开发布仅包含 Windows / Linux：
   - Windows 在 Windows 构建
   - Linux 在 Linux 构建
-  - macOS 在 macOS 构建
 - 但本地任务入口保持一致，统一使用同一个构建与上传任务。
 - 正式 GitHub Release 不再由某一台机器本地直接上传，而是由 GitHub Actions 汇总 staging 产物后统一发布。
 
 推荐流程：
 
-1. 三台机器分别拉取同一版本源码，并确认 `VERSION` 一致。
+1. Windows / Linux 两台机器分别拉取同一版本源码，并确认 `VERSION` 一致。
 2. 每台机器执行 `公开发布：上传当前平台产物到 GitHub`。
+   - 该流程会先在本地生成当前平台正式资产，再上传到 `staging-v<version>`
+   - 同时上传 `platform-build-<platform>-v<version>.json`，记录版本、提交和资产清单
+   - Linux 当前会上传：
+     - `Wateray-linux-v<version>.zip`
+     - `wateray_<version>_amd64.deb`
+     - `Wateray-linux-v<version>-x86_64.AppImage`
 3. 任意一台机器执行 `公开发布：触发 GitHub 汇总发布`。
-4. GitHub Actions 从 `staging-v<version>` 收集三端 zip：
+4. GitHub Actions 从 `staging-v<version>` 收集 Windows / Linux manifest 和正式资产：
    - 若缺少平台产物，则更新 `v<version>` 草稿状态，不发布正式版。
-   - 若三端产物齐备，则自动生成校验文件、发布说明，并更新正式 Release。
+   - 若两端产物齐备，则校验两端提交一致性，自动生成更新摘要、校验文件、`latest*.json` 与正式 Release。
 
 注意：
 

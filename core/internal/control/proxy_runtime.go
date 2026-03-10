@@ -2219,22 +2219,6 @@ func buildExperimentalConfig(snapshot StateSnapshot, externalController string, 
 	return experimental
 }
 
-func resolveDNSCacheFilePath() string {
-	configDir, err := os.UserConfigDir()
-	if err != nil || strings.TrimSpace(configDir) == "" {
-		return filepath.Join(os.TempDir(), "wateray", "singbox-cache.db")
-	}
-	return filepath.Join(configDir, "wateray", "singbox-cache.db")
-}
-
-func resolveRuleSetStorageDir() string {
-	configDir, err := os.UserConfigDir()
-	if err != nil || strings.TrimSpace(configDir) == "" {
-		return filepath.Join(os.TempDir(), "wateray", "rule-set")
-	}
-	return filepath.Join(configDir, "wateray", "rule-set")
-}
-
 func resolveBuiltInRuleSetPath(kind string, value string) (string, bool) {
 	normalizedKind := strings.ToLower(strings.TrimSpace(kind))
 	normalizedValue := normalizeGeoRuleSetValue(value)

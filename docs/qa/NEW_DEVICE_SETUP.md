@@ -164,7 +164,9 @@ GitHub 公开发布只面向 VPN 客户端，不包含广告前后端。
 
 其中会包含：
 
-- Windows 客户端 zip
+- 各平台正式资产
+  - Windows：客户端 zip
+  - Linux：客户端 zip、`.deb`、`AppImage`
 - `SHA256SUMS.txt`
 - `latest.json`
 - `latest-github.json`

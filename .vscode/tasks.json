@@ -49,12 +49,10 @@
       "label": "客户端：开发：运行 Electron 前端",
       "type": "shell",
       "command": "npm run dev",
-      "linux": {
-        "command": "node node_modules/electron-vite/bin/electron-vite.js dev"
-      },
       "options": {
         "cwd": "${workspaceFolder}/ElectronApp",
         "env": {
+          "ELECTRON_DISABLE_SANDBOX": "1",
           "WATERAY_APP_MODE": "dev",
           "VITE_AIRPORT_WEB_URL": "http://127.0.0.1:5179/"
         }
@@ -184,9 +182,9 @@
     {
       "label": "客户端：开发：运行 VPN 内核",
       "type": "shell",
-      "command": "go run -tags with_clash_api,with_gvisor,with_quic ./cmd/waterayd",
+      "command": "python scripts/dev/run_waterayd.py",
       "options": {
-        "cwd": "${workspaceFolder}/core"
+        "cwd": "${workspaceFolder}"
       },
       "group": "build",
       "isBackground": true,
@@ -201,6 +199,51 @@
       "label": "客户端：构建：当前平台客户端",
       "type": "shell",
       "command": "python scripts/build/targets/desktop.py",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": "build",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": false
+      }
+    },
+    {
+      "label": "客户端：构建：Linux deb 安装包",
+      "type": "shell",
+      "command": "python scripts/build/targets/linux_package.py --format deb",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": "build",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": false
+      }
+    },
+    {
+      "label": "客户端：构建：Linux AppImage",
+      "type": "shell",
+      "command": "python scripts/build/targets/linux_package.py --format appimage",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": "build",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": false
+      }
+    },
+    {
+      "label": "客户端：构建：Linux 安装包（deb + AppImage）",
+      "type": "shell",
+      "command": "python scripts/build/targets/linux_package.py --format all",
       "options": {
         "cwd": "${workspaceFolder}"
       },

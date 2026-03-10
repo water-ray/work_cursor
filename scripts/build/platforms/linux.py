@@ -14,4 +14,5 @@ TARGET = DesktopBuildTarget(
     output_dir_name="Wateray-linux",
     daemon_binary_name="waterayd",
     frontend_entry_name="WaterayApp",
+    icon_path="../scripts/build/assets/linux/wateray.png",
 )
