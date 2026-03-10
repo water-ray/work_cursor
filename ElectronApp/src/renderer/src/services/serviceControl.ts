@@ -13,6 +13,11 @@ const startupSmartOptimizeOff: ProxyStartupSmartOptimizePreference = "off";
 const startupSmartOptimizeBest: ProxyStartupSmartOptimizePreference = "best";
 const startupSmartOptimizeCountryPrefix = "country:";
 const defaultProbeIntervalMin = 180;
+const defaultProbeTimeoutSec = 5;
+const defaultSmartOptimizeProbeConcurrency = 8;
+const smartOptimizeProbePollIntervalMs = 250;
+const minimumSmartOptimizeProbeWaitMs = 5000;
+const maximumSmartOptimizeProbeWaitMs = 45000;
 
 function normalizeCountryValue(value: string | undefined): string {
   const raw = (value ?? "").trim();
@@ -51,19 +56,147 @@ function hasUsableNodeScore(node: {
   );
 }
 
-function hasFreshSmartOptimizeScore(node: VpnNode, snapshot: DaemonSnapshot): boolean {
-  if (!hasUsableNodeScore(node)) {
-    return false;
-  }
+function resolveSmartOptimizeProbeFreshnessWindowMs(snapshot: DaemonSnapshot): number {
   const probeIntervalMin = Math.max(
     1,
     Number(snapshot.probeSettings?.probeIntervalMin ?? defaultProbeIntervalMin) || defaultProbeIntervalMin,
   );
-  const freshnessWindowMs = probeIntervalMin * 60 * 1000;
+  return probeIntervalMin * 60 * 1000;
+}
+
+function hasFreshSmartOptimizeProbeCache(node: VpnNode, snapshot: DaemonSnapshot): boolean {
+  const latencyProbedAtMs = Math.max(0, Number(node.latencyProbedAtMs ?? 0));
+  const realConnectProbedAtMs = Math.max(0, Number(node.realConnectProbedAtMs ?? 0));
+  if (latencyProbedAtMs <= 0 || realConnectProbedAtMs <= 0) {
+    return false;
+  }
+  const freshnessWindowMs = resolveSmartOptimizeProbeFreshnessWindowMs(snapshot);
   const nowMs = Date.now();
-  const latencyAgeMs = nowMs - Math.max(0, Number(node.latencyProbedAtMs ?? 0));
-  const realConnectAgeMs = nowMs - Math.max(0, Number(node.realConnectProbedAtMs ?? 0));
+  const latencyAgeMs = nowMs - latencyProbedAtMs;
+  const realConnectAgeMs = nowMs - realConnectProbedAtMs;
   return latencyAgeMs <= freshnessWindowMs && realConnectAgeMs <= freshnessWindowMs;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolveDelay) => {
+    window.setTimeout(resolveDelay, ms);
+  });
+}
+
+type SmartOptimizeProbeBaseline = {
+  latencyProbedAtMs: number;
+  realConnectProbedAtMs: number;
+};
+
+function captureSmartOptimizeProbeBaselines(nodes: VpnNode[]): Map<string, SmartOptimizeProbeBaseline> {
+  return new Map(
+    nodes.map((node) => [
+      node.id,
+      {
+        latencyProbedAtMs: Math.max(0, Number(node.latencyProbedAtMs ?? 0)),
+        realConnectProbedAtMs: Math.max(0, Number(node.realConnectProbedAtMs ?? 0)),
+      },
+    ]),
+  );
+}
+
+function hasSmartOptimizeProbeSettled(
+  node: VpnNode | undefined,
+  baseline: SmartOptimizeProbeBaseline | undefined,
+  snapshot: DaemonSnapshot,
+): boolean {
+  if (!node) {
+    return false;
+  }
+  if (hasFreshSmartOptimizeProbeCache(node, snapshot)) {
+    return true;
+  }
+  const currentLatencyAtMs = Math.max(0, Number(node.latencyProbedAtMs ?? 0));
+  const currentRealConnectAtMs = Math.max(0, Number(node.realConnectProbedAtMs ?? 0));
+  return (
+    currentLatencyAtMs > Math.max(0, Number(baseline?.latencyProbedAtMs ?? 0))
+    || currentRealConnectAtMs > Math.max(0, Number(baseline?.realConnectProbedAtMs ?? 0))
+  );
+}
+
+function areSmartOptimizeProbeTargetsSettled(params: {
+  snapshot: DaemonSnapshot;
+  groupId: string;
+  baselines: Map<string, SmartOptimizeProbeBaseline>;
+}): boolean {
+  const { snapshot, groupId, baselines } = params;
+  const currentGroup = snapshot.groups.find((group) => group.id === groupId);
+  if (!currentGroup) {
+    return false;
+  }
+  const nodesById = new Map((currentGroup.nodes ?? []).map((node) => [node.id, node]));
+  for (const [nodeId, baseline] of baselines.entries()) {
+    if (!hasSmartOptimizeProbeSettled(nodesById.get(nodeId), baseline, snapshot)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function resolveSmartOptimizeProbeWaitTimeoutMs(
+  snapshot: DaemonSnapshot,
+  nodeCount: number,
+): number {
+  const timeoutSec = Math.max(
+    1,
+    Number(snapshot.probeSettings?.timeoutSec ?? defaultProbeTimeoutSec) || defaultProbeTimeoutSec,
+  );
+  const concurrency = Math.max(
+    1,
+    Number(snapshot.probeSettings?.concurrency ?? defaultSmartOptimizeProbeConcurrency)
+      || defaultSmartOptimizeProbeConcurrency,
+  );
+  const batches = Math.max(1, Math.ceil(Math.max(1, nodeCount) / concurrency));
+  const estimatedMs = batches * timeoutSec * 1000 + 2000;
+  return Math.min(
+    maximumSmartOptimizeProbeWaitMs,
+    Math.max(minimumSmartOptimizeProbeWaitMs, estimatedMs),
+  );
+}
+
+function ensureStartupNotCancelled(isCancelled?: () => boolean): void {
+  if (isCancelled?.()) {
+    throw new Error(startupCancelledErrorMessage);
+  }
+}
+
+async function waitForSmartOptimizeProbeResults(params: {
+  snapshot: DaemonSnapshot;
+  groupId: string;
+  baselines: Map<string, SmartOptimizeProbeBaseline>;
+  runAction: (action: () => Promise<DaemonSnapshot>) => Promise<DaemonSnapshot>;
+  onStageChange?: (stage: ServiceStartupStage, detail: string) => void;
+  isCancelled?: () => boolean;
+}): Promise<DaemonSnapshot> {
+  const { groupId, baselines, runAction, onStageChange, isCancelled } = params;
+  let currentSnapshot = params.snapshot;
+  if (baselines.size === 0) {
+    return currentSnapshot;
+  }
+  if (areSmartOptimizeProbeTargetsSettled({ snapshot: currentSnapshot, groupId, baselines })) {
+    return currentSnapshot;
+  }
+  const deadline = Date.now() + resolveSmartOptimizeProbeWaitTimeoutMs(currentSnapshot, baselines.size);
+  let waitingHintShown = false;
+  while (Date.now() < deadline) {
+    ensureStartupNotCancelled(isCancelled);
+    if (!waitingHintShown) {
+      onStageChange?.("probe", "评分任务已提交，正在等待结果写回...");
+      waitingHintShown = true;
+    }
+    await delay(smartOptimizeProbePollIntervalMs);
+    ensureStartupNotCancelled(isCancelled);
+    currentSnapshot = await runAction(() => daemonApi.getState(false));
+    if (areSmartOptimizeProbeTargetsSettled({ snapshot: currentSnapshot, groupId, baselines })) {
+      return currentSnapshot;
+    }
+  }
+  return currentSnapshot;
 }
 
 function compareNodesByProbeScoreDesc(
@@ -104,11 +237,12 @@ async function resolveSmartOptimizeTargetNode(params: {
   runAction: (action: () => Promise<DaemonSnapshot>) => Promise<DaemonSnapshot>;
   startupSmartOptimize: ProxyStartupSmartOptimizePreference;
   onStageChange?: (stage: ServiceStartupStage, detail: string) => void;
+  isCancelled?: () => boolean;
 }): Promise<{
   selectedNodeName: string;
   fallbackWarning: string;
 }> {
-  const { snapshot, runAction, startupSmartOptimize, onStageChange } = params;
+  const { snapshot, runAction, startupSmartOptimize, onStageChange, isCancelled } = params;
   if (startupSmartOptimize === startupSmartOptimizeOff) {
     return { selectedNodeName: "", fallbackWarning: "" };
   }
@@ -140,9 +274,10 @@ async function resolveSmartOptimizeTargetNode(params: {
     }
   }
 
-  const staleNodes = probeTargetNodes.filter((node) => !hasFreshSmartOptimizeScore(node, snapshot));
+  const staleNodes = probeTargetNodes.filter((node) => !hasFreshSmartOptimizeProbeCache(node, snapshot));
   let probeSnapshot = snapshot;
   if (staleNodes.length > 0) {
+    const probeBaselines = captureSmartOptimizeProbeBaselines(staleNodes);
     onStageChange?.(
       "probe",
       startupSmartOptimize === startupSmartOptimizeBest
@@ -150,6 +285,7 @@ async function resolveSmartOptimizeTargetNode(params: {
         : `正在为目标国家候选节点执行评分（补测 ${staleNodes.length}/${probeTargetNodes.length} 个）...`,
     );
     try {
+      ensureStartupNotCancelled(isCancelled);
       probeSnapshot = await runAction(async () => {
         const result = await daemonApi.probeNodesWithSummary({
           groupId: currentGroup.id,
@@ -158,7 +294,18 @@ async function resolveSmartOptimizeTargetNode(params: {
         });
         return result.snapshot;
       });
-    } catch {
+      probeSnapshot = await waitForSmartOptimizeProbeResults({
+        snapshot: probeSnapshot,
+        groupId: currentGroup.id,
+        baselines: probeBaselines,
+        runAction,
+        onStageChange,
+        isCancelled,
+      });
+    } catch (error) {
+      if (error instanceof Error && error.message === startupCancelledErrorMessage) {
+        throw error;
+      }
       return {
         selectedNodeName: "",
         fallbackWarning: "启动前节点评分失败，已回退当前激活节点继续启动。",
@@ -280,6 +427,7 @@ export async function startServiceWithSmartOptimize(params: {
     runAction,
     startupSmartOptimize,
     onStageChange,
+    isCancelled,
   });
   if (isCancelled?.()) {
     throw new Error(cancellationErrorMessage);
