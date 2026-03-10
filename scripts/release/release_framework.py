@@ -272,14 +272,14 @@ def parse_changelog_sections_for_version(version: str) -> dict[str, list[str]]:
     return sections
 
 
-def collect_recent_commit_sections(limit: int = 20) -> dict[str, list[str]]:
+def collect_recent_commit_sections(limit: int = 50) -> dict[str, list[str]]:
     sections = {
         "features": [],
         "fixes": [],
         "refactors": [],
         "others": [],
     }
-    output = run_git(["log", f"-{limit}", "--pretty=format:%s"], allow_failure=True)
+    output = run_git(["log", "--no-merges", f"-{limit}", "--pretty=format:%s"], allow_failure=True)
     if not output:
         return sections
     for subject in output.splitlines():

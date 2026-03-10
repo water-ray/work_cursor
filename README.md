@@ -228,3 +228,4 @@ python scripts/build/targets/linux_package.py --format all
 注意：
 
 - 如果 GitHub Actions 需要跨仓库向公开仓库发布，请在承载 workflow 的仓库中配置 `WATERAY_RELEASE_TOKEN`，令其具备目标公开仓库的 Release 写入权限。
+- 使用 `客户端：版本：发布主版本 / 次版本 / 补丁版` 后，请把 `VERSION`、`ElectronApp/package*.json` 和 `docs/build/CHANGELOG_LATEST.md` 一起提交；正式发布摘要会优先读取这份 changelog。
