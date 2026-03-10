@@ -353,7 +353,7 @@
     {
       "label": "私有源码：推送当前分支",
       "type": "shell",
-      "command": "python scripts/git/private_source_tasks.py push-current",
+      "command": "python scripts/git/private_source_tasks.py push-current --remote \"${input:githubPrivateRemoteName}\"",
       "options": {
         "cwd": "${workspaceFolder}"
       },
@@ -381,7 +381,7 @@
     {
       "label": "私有源码：推送当前内容到 main",
       "type": "shell",
-      "command": "python scripts/git/private_source_tasks.py push-main",
+      "command": "python scripts/git/private_source_tasks.py push-main --remote \"${input:githubPrivateRemoteName}\" --branch \"${input:githubPrivateBranch}\"",
       "options": {
         "cwd": "${workspaceFolder}"
       },
@@ -395,7 +395,7 @@
     {
       "label": "私有源码：提交并推送当前分支",
       "type": "shell",
-      "command": "python scripts/git/private_source_tasks.py commit-push-current",
+      "command": "python scripts/git/private_source_tasks.py commit-push-current --remote \"${input:githubPrivateRemoteName}\"",
       "options": {
         "cwd": "${workspaceFolder}",
         "env": {
@@ -412,7 +412,7 @@
     {
       "label": "私有源码：提交并推送到 main",
       "type": "shell",
-      "command": "python scripts/git/private_source_tasks.py commit-push-main",
+      "command": "python scripts/git/private_source_tasks.py commit-push-main --remote \"${input:githubPrivateRemoteName}\" --branch \"${input:githubPrivateBranch}\"",
       "options": {
         "cwd": "${workspaceFolder}",
         "env": {
