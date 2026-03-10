@@ -14,7 +14,7 @@ on:
         type: string
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   aggregate_release:
@@ -40,15 +40,29 @@ jobs:
           set -euo pipefail
           gh auth status
           gh repo view "$PUBLIC_REPO" >/dev/null
+          current_repo="${{ github.repository }}"
+          if [ "$PUBLIC_REPO" != "$current_repo" ] && [ -z "${{ secrets.WATERAY_RELEASE_TOKEN }}" ]; then
+            echo "跨仓库发布需要在 $current_repo 配置 WATERAY_RELEASE_TOKEN，并授予 $PUBLIC_REPO 的 Release 写权限" >&2
+            exit 1
+          fi
+          if [ "$(gh api "repos/$PUBLIC_REPO" --jq '.permissions.push')" != "true" ]; then
+            echo "当前 GitHub token 对 $PUBLIC_REPO 没有 push / release 写权限" >&2
+            exit 1
+          fi
 
       - name: Download staging assets
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p staging
+          gh release view "staging-v${RELEASE_VERSION}" --repo "$PUBLIC_REPO" >/dev/null
           gh release download "staging-v${RELEASE_VERSION}" \
             --repo "$PUBLIC_REPO" \
-            --dir staging || true
+            --dir staging
+          if [ -z "$(ls -A staging)" ]; then
+            echo "staging release 已存在，但未下载到任何资产" >&2
+            exit 1
+          fi
           ls -la staging
 
       - name: Aggregate staging assets
