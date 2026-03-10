@@ -294,6 +294,18 @@ def ensure_frontend_deps() -> None:
     run_command(["npm", "install"], cwd=ELECTRON_DIR, stage="frontend_install", code=30)
 
 
+def sanitize_packaging_manifest(package_src_dir: Path) -> None:
+    package_json_path = package_src_dir / "package.json"
+    package_payload = json.loads(package_json_path.read_text(encoding="utf-8"))
+    # electron-packager v19 may resolve dev-only metadata from sourcedir.
+    package_payload.pop("devDependencies", None)
+    package_payload.pop("scripts", None)
+    package_json_path.write_text(
+        json.dumps(package_payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
 def prepare_packaging_source(target: DesktopBuildTarget) -> Path:
     print_step("准备 Electron 精简发布源")
     package_src_dir = ELECTRON_PACKAGE_SRC_ROOT / target.platform_id
@@ -317,6 +329,7 @@ def prepare_packaging_source(target: DesktopBuildTarget) -> Path:
         stage="frontend_runtime_deps",
         code=31,
     )
+    sanitize_packaging_manifest(package_src_dir)
     return package_src_dir
 
 

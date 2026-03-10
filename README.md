@@ -223,6 +223,7 @@ python scripts/build/targets/linux_package.py --format all
 4. GitHub Actions 从 `staging-v<version>` 收集 Windows / Linux manifest 和正式资产：
    - 若缺少平台产物，则更新 `v<version>` 草稿状态，不发布正式版。
    - 若两端产物齐备，则校验两端提交一致性，自动生成更新摘要、校验文件、`latest*.json` 与正式 Release。
+   - 若 staging 下载失败或 token 对公开仓库无写权限，workflow 会直接失败并提示具体原因，不再伪装成“等待更多平台产物”。
 
 注意：
 
