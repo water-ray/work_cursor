@@ -336,7 +336,7 @@
     {
       "label": "私有源码：提交当前改动",
       "type": "shell",
-      "command": "$ErrorActionPreference = 'Stop'; git add -A; git diff --cached --quiet; if ($LASTEXITCODE -eq 0) { Write-Host '没有可提交的改动'; exit 0 }; git commit -m \"$env:WATERAY_GIT_COMMIT_MESSAGE\"; git status --short --branch",
+      "command": "python scripts/git/private_source_tasks.py commit",
       "options": {
         "cwd": "${workspaceFolder}",
         "env": {
@@ -353,7 +353,7 @@
     {
       "label": "私有源码：推送当前分支",
       "type": "shell",
-      "command": "$ErrorActionPreference = 'Stop'; git push source-private HEAD",
+      "command": "python scripts/git/private_source_tasks.py push-current",
       "options": {
         "cwd": "${workspaceFolder}"
       },
@@ -367,7 +367,7 @@
     {
       "label": "私有源码：切换或创建 Git 分支",
       "type": "shell",
-      "command": "$ErrorActionPreference = 'Stop'; $branch = '${input:gitTargetBranch}'; git show-ref --verify --quiet \"refs/heads/$branch\"; if ($LASTEXITCODE -eq 0) { git switch $branch } else { git switch -c $branch }; git branch --show-current",
+      "command": "python scripts/git/private_source_tasks.py switch-branch --branch \"${input:gitTargetBranch}\"",
       "options": {
         "cwd": "${workspaceFolder}"
       },
@@ -381,7 +381,7 @@
     {
       "label": "私有源码：推送当前内容到 main",
       "type": "shell",
-      "command": "$ErrorActionPreference = 'Stop'; git push -u source-private \"HEAD:main\"",
+      "command": "python scripts/git/private_source_tasks.py push-main",
       "options": {
         "cwd": "${workspaceFolder}"
       },
@@ -395,7 +395,7 @@
     {
       "label": "私有源码：提交并推送当前分支",
       "type": "shell",
-      "command": "$ErrorActionPreference = 'Stop'; git add -A; git diff --cached --quiet; if ($LASTEXITCODE -eq 0) { Write-Host '没有可提交的改动'; exit 0 }; git commit -m \"$env:WATERAY_GIT_COMMIT_MESSAGE\"; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; git push source-private HEAD; git status --short --branch",
+      "command": "python scripts/git/private_source_tasks.py commit-push-current",
       "options": {
         "cwd": "${workspaceFolder}",
         "env": {
@@ -412,7 +412,7 @@
     {
       "label": "私有源码：提交并推送到 main",
       "type": "shell",
-      "command": "$ErrorActionPreference = 'Stop'; git add -A; git diff --cached --quiet; if ($LASTEXITCODE -eq 0) { Write-Host '没有可提交的改动'; exit 0 }; git commit -m \"$env:WATERAY_GIT_COMMIT_MESSAGE\"; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; git push -u source-private \"HEAD:main\"; git status --short --branch",
+      "command": "python scripts/git/private_source_tasks.py commit-push-main",
       "options": {
         "cwd": "${workspaceFolder}",
         "env": {
@@ -429,7 +429,7 @@
     {
       "label": "私有源码：检查当前提交身份",
       "type": "shell",
-      "command": "git config --local --get user.name; git config --local --get user.email; git var GIT_AUTHOR_IDENT; git var GIT_COMMITTER_IDENT",
+      "command": "python scripts/git/private_source_tasks.py show-identity",
       "options": {
         "cwd": "${workspaceFolder}"
       },
