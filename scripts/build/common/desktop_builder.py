@@ -27,11 +27,13 @@ TEMP_SYSO_PATH = CORE_DIR / "cmd" / "waterayd" / "zz_wateray_server_windows_amd6
 ELECTRON_PACKAGE_OUT_DIR = ELECTRON_DIR / "out-package"
 ELECTRON_PACKAGE_OUT_ROOT = BIN_DIR / ".tmp" / "desktop-package-out"
 ELECTRON_PACKAGE_TMP_ROOT = BIN_DIR / ".tmp" / "electron-packager"
+ELECTRON_PACKAGE_SRC_ROOT = BIN_DIR / ".tmp" / "desktop-package-src"
 ELECTRON_RULE_SET_DIR = ELECTRON_DIR / "rule-set"
 ELECTRON_DEFAULT_CONFIG_DIR = ELECTRON_DIR / "default-config"
 LINUX_BUILD_ASSET_DIR = ROOT_DIR / "scripts" / "build" / "assets" / "linux"
 VERSION_PATH = ROOT_DIR / "VERSION"
 SEMVER_PATTERN = re.compile(r"^\d+\.\d+\.\d+$")
+SEMVER_CAPTURE_PATTERN = re.compile(r"(\d+\.\d+\.\d+)")
 
 
 @dataclass(frozen=True)
@@ -175,6 +177,15 @@ def load_release_version() -> str:
     return version
 
 
+def load_electron_version() -> str:
+    package_payload = json.loads((ELECTRON_DIR / "package.json").read_text(encoding="utf-8"))
+    raw_version = str(package_payload.get("devDependencies", {}).get("electron", "")).strip()
+    matched = SEMVER_CAPTURE_PATTERN.search(raw_version)
+    if not matched:
+        raise BuildError(12, "prepare", f"Electron 版本缺失或格式非法：{raw_version!r}")
+    return matched.group(1)
+
+
 def clean_outputs(target: DesktopBuildTarget) -> None:
     print_step("清理旧产物")
     if target.bin_dir.exists():
@@ -184,6 +195,9 @@ def clean_outputs(target: DesktopBuildTarget) -> None:
         shutil.rmtree(ELECTRON_PACKAGE_OUT_DIR)
     if target.electron_out_dir.exists():
         shutil.rmtree(target.electron_out_dir)
+    package_src_dir = ELECTRON_PACKAGE_SRC_ROOT / target.platform_id
+    if package_src_dir.exists():
+        shutil.rmtree(package_src_dir)
 
 
 def build_windows_manifest() -> None:
@@ -280,26 +294,55 @@ def ensure_frontend_deps() -> None:
     run_command(["npm", "install"], cwd=ELECTRON_DIR, stage="frontend_install", code=30)
 
 
+def prepare_packaging_source(target: DesktopBuildTarget) -> Path:
+    print_step("准备 Electron 精简发布源")
+    package_src_dir = ELECTRON_PACKAGE_SRC_ROOT / target.platform_id
+    if package_src_dir.exists():
+        shutil.rmtree(package_src_dir)
+    package_src_dir.mkdir(parents=True, exist_ok=True)
+
+    shutil.copy2(ELECTRON_DIR / "package.json", package_src_dir / "package.json")
+    package_lock_path = ELECTRON_DIR / "package-lock.json"
+    if package_lock_path.exists():
+        shutil.copy2(package_lock_path, package_src_dir / "package-lock.json")
+
+    built_out_dir = ELECTRON_DIR / "out"
+    if not built_out_dir.exists():
+        raise BuildError(31, "frontend_build", f"缺少 Electron 构建产物：{built_out_dir}")
+    shutil.copytree(built_out_dir, package_src_dir / "out", dirs_exist_ok=True)
+
+    run_command(
+        ["npm", "ci", "--omit=dev"],
+        cwd=package_src_dir,
+        stage="frontend_runtime_deps",
+        code=31,
+    )
+    return package_src_dir
+
+
 def build_frontend_unpacked(target: DesktopBuildTarget, release_version: str) -> None:
     ensure_frontend_deps()
+    electron_version = load_electron_version()
 
     print_step("构建 Electron 前端 bundle")
     run_command(["npm", "run", "build"], cwd=ELECTRON_DIR, stage="frontend_build", code=31)
+    package_src_dir = prepare_packaging_source(target)
 
     print_step(f"打包 Electron {target.display_name} unpacked 目录")
     package_command = [
         "npx",
         "electron-packager",
-        ".",
+        str(package_src_dir),
         "WaterayApp",
         f"--out={target.electron_out_dir}",
         "--overwrite",
         "--asar",
         f"--platform={target.electron_platform}",
         f"--arch={target.electron_arch}",
+        f"--electron-version={electron_version}",
     ]
     if target.icon_path:
-        package_command.append(f"--icon={target.icon_path}")
+        package_command.append(f"--icon={(ELECTRON_DIR / target.icon_path).resolve()}")
     package_env: dict[str, str] | None = None
     package_attempts = 1
     if target.platform_id == "windows":
