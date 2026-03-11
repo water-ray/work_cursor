@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import {
   readText as readClipboardText,
@@ -24,11 +25,18 @@ type MaximizedChangeListener = WaterayDesktopApi["window"]["onMaximizedChanged"]
 ) => () => void
   ? T
   : never;
+type AppUpdateStateChangeListener = WaterayDesktopApi["updates"]["onStateChanged"] extends (
+  listener: infer T,
+) => () => void
+  ? T
+  : never;
 
 type DesktopWindow = Window & {
   __waterayDesktopInstalled?: boolean;
   __waterayDesktopUnloadBound?: boolean;
 };
+
+const appUpdateStateEventName = "wateray:app-update-state";
 
 function normalizeFileName(raw: string | undefined): string {
   const text = (raw ?? "").trim();
@@ -123,6 +131,27 @@ function createMaximizedChangeListener(
       // Ignore initial maximize state fetch errors.
     });
 
+  return () => {
+    disposed = true;
+    void unlistenPromise.then((unlisten) => {
+      unlisten();
+    });
+  };
+}
+
+function createAppUpdateStateChangeListener(
+  listener: AppUpdateStateChangeListener,
+): () => void {
+  let disposed = false;
+  const unlistenPromise = listen<Awaited<ReturnType<WaterayDesktopApi["updates"]["getState"]>>>(
+    appUpdateStateEventName,
+    (event) => {
+      if (disposed || !event.payload) {
+        return;
+      }
+      listener(event.payload);
+    },
+  );
   return () => {
     disposed = true;
     void unlistenPromise.then((unlisten) => {
@@ -228,6 +257,19 @@ function createDesktopApi(): WaterayDesktopApi {
       },
       writeClipboardFile: (path: string): Promise<{ mode: string }> =>
         invoke("system_write_clipboard_file", { path }),
+    },
+    updates: {
+      getState: (): Promise<Awaited<ReturnType<WaterayDesktopApi["updates"]["getState"]>>> =>
+        invoke("app_update_get_state"),
+      check: (): Promise<Awaited<ReturnType<WaterayDesktopApi["updates"]["check"]>>> =>
+        invoke("app_update_check"),
+      download: (): Promise<Awaited<ReturnType<WaterayDesktopApi["updates"]["download"]>>> =>
+        invoke("app_update_start_download"),
+      install: (): Promise<Awaited<ReturnType<WaterayDesktopApi["updates"]["install"]>>> =>
+        invoke("app_update_install"),
+      cancel: (): Promise<Awaited<ReturnType<WaterayDesktopApi["updates"]["cancel"]>>> =>
+        invoke("app_update_cancel"),
+      onStateChanged: (listener) => createAppUpdateStateChangeListener(listener),
     },
   };
 }

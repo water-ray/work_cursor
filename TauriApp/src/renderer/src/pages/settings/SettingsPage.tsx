@@ -18,6 +18,7 @@ import { HelpLabel } from "../../components/form/HelpLabel";
 import { useAppNotice } from "../../components/notify/AppNoticeProvider";
 import { useDraftNavLock } from "../../hooks/useDraftNavLock";
 import { useDraftNotice } from "../../hooks/useDraftNotice";
+import { useAppUpdate } from "../../hooks/useAppUpdate";
 
 import type { DaemonPageProps } from "../../app/types";
 import {
@@ -29,6 +30,7 @@ import {
 } from "../../app/settings/uiPreferences";
 import { daemonApi } from "../../services/daemonApi";
 import type { DaemonSnapshot, RuleSetLocalStatus } from "../../../../shared/daemon";
+import type { AppUpdateCandidate, AppUpdateStage } from "../../updates/types";
 const geoIPRuleSetOptions = [
   { value: "cn", label: "cn（中国大陆）" },
   { value: "us", label: "us（美国）" },
@@ -76,9 +78,66 @@ function formatRuleSetUpdatedTime(timestampMs?: number): string {
   return new Date(timestampMs).toLocaleString();
 }
 
+function formatUpdateCheckedTime(timestampMs?: number): string {
+  if (!timestampMs || timestampMs <= 0) {
+    return "";
+  }
+  return new Date(timestampMs).toLocaleString();
+}
+
+function describeUpdateInstallKind(kind: string): string {
+  switch (kind) {
+    case "portable-zip":
+      return "便携整包";
+    case "deb":
+      return ".deb 安装包";
+    case "appimage":
+      return "AppImage";
+    default:
+      return "未完成";
+  }
+}
+
+function describeUpdateAssetKind(kind: string): string {
+  switch (kind) {
+    case "portable-zip":
+      return "便携整包";
+    case "deb":
+      return "Debian/Ubuntu 安装包";
+    case "appimage":
+      return "AppImage";
+    default:
+      return "未知";
+  }
+}
+
+function describeUpdateStage(stage: AppUpdateStage): string {
+  switch (stage) {
+    case "checking":
+      return "正在检查";
+    case "available":
+      return "可更新";
+    case "no_update":
+      return "已是最新";
+    case "downloading":
+      return "下载中";
+    case "downloaded":
+      return "已就绪";
+    case "installing":
+      return "安装中";
+    case "unsupported":
+      return "功能未完成";
+    case "error":
+      return "出现错误";
+    default:
+      return "待检查";
+  }
+}
+
 export function SettingsPage({ snapshot, loading, runAction }: DaemonPageProps) {
   const notice = useAppNotice();
   const draftNotice = useDraftNotice();
+  const appUpdate = useAppUpdate();
   const [appliedDragScrollEnabled, setAppliedDragScrollEnabled] = useState<boolean>(() =>
     readDragScrollEnabled(),
   );
@@ -163,6 +222,24 @@ export function SettingsPage({ snapshot, loading, runAction }: DaemonPageProps) 
   const isWindowsSystem = systemType === "windows";
   const runtimeAdmin = snapshot?.runtimeAdmin === true;
   const canExemptLoopback = isWindowsSystem && runtimeAdmin && !exemptingLoopback;
+  const updateState = appUpdate.state;
+  const updateCandidate = updateState.candidate;
+  const updateBusy =
+    updateState.stage === "checking" ||
+    updateState.stage === "downloading" ||
+    updateState.stage === "installing";
+  const canCheckAppUpdate = updateState.supported && !updateBusy;
+  const canDownloadAppUpdate =
+    updateState.supported &&
+    updateCandidate !== null &&
+    updateState.stage !== "downloading" &&
+    updateState.stage !== "installing" &&
+    updateState.stage !== "downloaded";
+  const canInstallAppUpdate =
+    updateState.supported &&
+    updateCandidate !== null &&
+    updateState.stage === "downloaded";
+  const canCancelAppUpdate = updateState.stage === "downloading";
   const allGeoIPRuleSetValues = useMemo(
     () => geoIPRuleSetOptions.map((option) => option.value),
     [],
@@ -180,6 +257,10 @@ export function SettingsPage({ snapshot, loading, runAction }: DaemonPageProps) 
       Math.round((ruleSetDownloadProgress.completed / ruleSetDownloadProgress.total) * 100),
     );
   }, [ruleSetDownloadProgress]);
+  const appUpdateProgressPercent = useMemo(
+    () => Math.min(100, Math.max(0, Math.round(updateState.downloadProgressPercent ?? 0))),
+    [updateState.downloadProgressPercent],
+  );
 
   const applySettingsDraft = async () => {
     if (!settingsDraftDirty) {
@@ -507,6 +588,75 @@ export function SettingsPage({ snapshot, loading, runAction }: DaemonPageProps) 
     }
   };
 
+  const confirmInstallAppUpdate = useCallback(
+    (candidate: AppUpdateCandidate) => {
+      Modal.confirm({
+        title: `立即更新到 ${candidate.version} 吗？`,
+        content:
+          updateState.installKind === "deb"
+            ? "将调用系统安装链更新 .deb 包，并在完成后自动重启客户端。"
+            : updateState.installKind === "appimage"
+              ? "将切换到新的 AppImage 文件，并在完成后自动重启客户端。"
+              : "将退出当前客户端并自动替换到新的便携整包版本。",
+        okText: "立即更新",
+        cancelText: "稍后",
+        onOk: async () => {
+          try {
+            await appUpdate.install();
+          } catch (error) {
+            notice.error(error instanceof Error ? error.message : "安装更新失败");
+          }
+        },
+      });
+    },
+    [appUpdate, notice, updateState.installKind],
+  );
+
+  const checkAppUpdate = useCallback(async () => {
+    try {
+      const next = await appUpdate.check();
+      if (next.stage === "no_update") {
+        notice.info(`当前已是最新版本 ${next.currentVersion}`);
+      } else if (next.stage === "available" && next.candidate) {
+        notice.success(`发现新版本 ${next.candidate.version}`);
+      } else if (next.stage === "downloaded" && next.candidate) {
+        notice.success(`新版本 ${next.candidate.version} 已下载完成，可立即安装`);
+      } else if (next.stage === "unsupported") {
+        notice.info(next.statusMessage || "当前平台更新功能未完成");
+      }
+    } catch (error) {
+      notice.error(error instanceof Error ? error.message : "检查更新失败");
+    }
+  }, [appUpdate, notice]);
+
+  const downloadAppUpdate = useCallback(async () => {
+    try {
+      const next = await appUpdate.download();
+      if (next.stage === "downloaded" && next.candidate) {
+        notice.success(`更新包 ${next.candidate.assetName} 已下载完成`);
+        confirmInstallAppUpdate(next.candidate);
+      }
+    } catch (error) {
+      notice.error(error instanceof Error ? error.message : "下载更新失败");
+    }
+  }, [appUpdate, confirmInstallAppUpdate, notice]);
+
+  const installAppUpdate = useCallback(() => {
+    if (!updateCandidate) {
+      return;
+    }
+    confirmInstallAppUpdate(updateCandidate);
+  }, [confirmInstallAppUpdate, updateCandidate]);
+
+  const cancelAppUpdate = useCallback(async () => {
+    try {
+      await appUpdate.cancel();
+      notice.info("正在取消更新下载");
+    } catch (error) {
+      notice.error(error instanceof Error ? error.message : "取消更新失败");
+    }
+  }, [appUpdate, notice]);
+
   useEffect(() => {
     void refreshRuleSetStatuses(true);
   }, [refreshRuleSetStatuses]);
@@ -618,6 +768,115 @@ export function SettingsPage({ snapshot, loading, runAction }: DaemonPageProps) 
               caution: "仅 Windows 且内核进程具备管理员权限时可执行；其他平台或权限不足时按钮会禁用。",
             }}
           />
+        </Space>
+        <Divider style={{ margin: "4px 0 2px" }} />
+        <HelpLabel
+          label={<Typography.Text strong>版本与更新</Typography.Text>}
+          helpContent={{
+            scene: "检查客户端更新并执行桌面端自动安装。",
+            effect:
+              "Windows 使用整包自替换；Linux .deb 走系统安装链；Linux AppImage 会切换到新的发布文件并自动重启客户端。",
+            caution: "开发模式、未适配的平台或未支持的运行来源只显示提示，不会执行自动更新。",
+          }}
+        />
+        <Space
+          direction="vertical"
+          size={8}
+          style={{ width: "100%" }}
+        >
+          <Typography.Text>
+            当前版本：<Typography.Text code>{updateState.currentVersion || "未知"}</Typography.Text>
+          </Typography.Text>
+          <Typography.Text type="secondary">
+            当前平台：{updateState.currentPlatform || "unknown"} / 安装方式：
+            {describeUpdateInstallKind(updateState.installKind)}
+          </Typography.Text>
+          <Typography.Text type="secondary">
+            当前状态：{describeUpdateStage(updateState.stage)}
+          </Typography.Text>
+          {updateCandidate ? (
+            <Typography.Text>
+              可用版本：<Typography.Text code>{updateCandidate.version}</Typography.Text> / 包类型：
+              {describeUpdateAssetKind(updateCandidate.assetKind)}
+            </Typography.Text>
+          ) : null}
+          <Typography.Text type={updateState.stage === "error" ? "danger" : "secondary"}>
+            {updateState.statusMessage ||
+              (updateState.supported
+                ? "点击“检查更新”获取最新版本信息。"
+                : "当前平台更新功能未完成。")}
+          </Typography.Text>
+          {updateState.lastCheckedAtMs > 0 ? (
+            <Typography.Text type="secondary">
+              上次检查：{formatUpdateCheckedTime(updateState.lastCheckedAtMs)}
+            </Typography.Text>
+          ) : null}
+          {(updateState.stage === "downloading" || updateState.stage === "downloaded") &&
+          updateState.totalBytes > 0 ? (
+            <Space
+              direction="vertical"
+              size={6}
+              style={{ width: "100%" }}
+            >
+              <Progress
+                percent={appUpdateProgressPercent}
+                size="small"
+                status={updateState.stage === "downloading" ? "active" : "success"}
+              />
+              <Typography.Text type="secondary">
+                已下载 {updateState.downloadedBytes}/{updateState.totalBytes} 字节。
+              </Typography.Text>
+            </Space>
+          ) : null}
+          <Space
+            size={8}
+            wrap
+          >
+            {updateState.supported ? (
+              <>
+                <Button
+                  type="primary"
+                  loading={updateState.stage === "checking"}
+                  disabled={!canCheckAppUpdate}
+                  onClick={() => {
+                    void checkAppUpdate();
+                  }}
+                >
+                  检查更新
+                </Button>
+                {updateCandidate && updateState.stage !== "downloaded" ? (
+                  <Button
+                    loading={updateState.stage === "downloading"}
+                    disabled={!canDownloadAppUpdate}
+                    onClick={() => {
+                      void downloadAppUpdate();
+                    }}
+                  >
+                    下载更新
+                  </Button>
+                ) : null}
+                {canInstallAppUpdate ? (
+                  <Button
+                    type="primary"
+                    onClick={installAppUpdate}
+                  >
+                    立即安装
+                  </Button>
+                ) : null}
+                {canCancelAppUpdate ? (
+                  <Button
+                    onClick={() => {
+                      void cancelAppUpdate();
+                    }}
+                  >
+                    取消下载
+                  </Button>
+                ) : null}
+              </>
+            ) : (
+              <Button disabled>功能未完成</Button>
+            )}
+          </Space>
         </Space>
 
         <HelpLabel

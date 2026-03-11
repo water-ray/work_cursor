@@ -5,6 +5,49 @@ import type {
   TransportStatus,
 } from "../../../shared/daemon";
 
+type UpdatePlatform = "windows" | "linux" | "macos" | "android" | "ios" | "unknown";
+type UpdateAssetKind = "portable-zip" | "deb" | "appimage" | "unknown";
+type UpdateStage =
+  | "idle"
+  | "checking"
+  | "available"
+  | "no_update"
+  | "downloading"
+  | "downloaded"
+  | "installing"
+  | "unsupported"
+  | "error";
+
+interface UpdateCandidate {
+  version: string;
+  releaseTag: string;
+  releaseName: string;
+  releasePageUrl: string;
+  generatedAt: string;
+  notesFile: string;
+  assetName: string;
+  assetLabel: string;
+  assetKind: UpdateAssetKind;
+  sizeBytes: number;
+  sha256: string;
+  downloadUrl: string;
+}
+
+interface UpdateState {
+  currentVersion: string;
+  currentPlatform: UpdatePlatform;
+  installKind: UpdateAssetKind;
+  supported: boolean;
+  stage: UpdateStage;
+  statusMessage: string;
+  lastError: string;
+  lastCheckedAtMs: number;
+  downloadProgressPercent: number;
+  downloadedBytes: number;
+  totalBytes: number;
+  candidate: UpdateCandidate | null;
+}
+
 interface WaterayDesktopApi {
   window: {
     minimize: () => Promise<void>;
@@ -34,6 +77,14 @@ interface WaterayDesktopApi {
     writeClipboardText: (content: string) => Promise<void>;
     readClipboardFilePaths: () => Promise<string[]>;
     writeClipboardFile: (path: string) => Promise<{ mode: string }>;
+  };
+  updates: {
+    getState: () => Promise<UpdateState>;
+    check: () => Promise<UpdateState>;
+    download: () => Promise<UpdateState>;
+    install: () => Promise<UpdateState>;
+    cancel: () => Promise<UpdateState>;
+    onStateChanged: (listener: (state: UpdateState) => void) => () => void;
   };
 }
 

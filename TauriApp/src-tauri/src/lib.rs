@@ -1,3 +1,4 @@
+mod app_update;
 mod backend;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -8,6 +9,7 @@ pub fn run() {
 
     let app = tauri::Builder::default()
         .manage(backend::FrontendStartupState::default())
+        .manage(app_update::AppUpdateManager::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -29,6 +31,11 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             backend::ensure_packaged_daemon_running,
+            app_update::app_update_get_state,
+            app_update::app_update_check,
+            app_update::app_update_start_download,
+            app_update::app_update_install,
+            app_update::app_update_cancel,
             backend::linux_sync_system_proxy,
             backend::window_close_panel_keep_core,
             backend::window_quit_app,
