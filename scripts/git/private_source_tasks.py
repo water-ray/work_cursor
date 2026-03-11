@@ -159,6 +159,64 @@ def branch_exists(branch: str) -> bool:
     raise GitTaskError(f"检查本地分支失败：{branch}")
 
 
+def remote_branch_exists(remote: str, branch: str) -> bool:
+    result = run_git(
+        ["show-ref", "--verify", "--quiet", f"refs/remotes/{remote}/{branch}"],
+        check=False,
+    )
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    raise GitTaskError(f"检查远端分支失败：{remote}/{branch}")
+
+
+def remote_branch_exists_live(remote: str, branch: str) -> bool:
+    result = run_git(["ls-remote", "--heads", remote, branch], check=False, capture_output=True)
+    if result.returncode != 0:
+        return False
+    return any(line.strip() for line in (result.stdout or "").splitlines())
+
+
+def refresh_remote_branch(remote: str, branch: str) -> bool:
+    refspec = f"refs/heads/{branch}:refs/remotes/{remote}/{branch}"
+    result = run_git(["fetch", remote, refspec], check=False, capture_output=True)
+    return result.returncode == 0 and remote_branch_exists(remote, branch)
+
+
+def build_remote_priority(preferred_remote: str) -> list[str]:
+    remote_names = list_remote_names()
+    ordered: list[str] = []
+    for remote in [preferred_remote, DEFAULT_REMOTE, "origin", *remote_names]:
+        normalized = remote.strip()
+        if not normalized or normalized not in remote_names or normalized in ordered:
+            continue
+        ordered.append(normalized)
+    return ordered
+
+
+def resolve_tracking_remote(branch: str, preferred_remote: str) -> str:
+    ordered_remotes = build_remote_priority(preferred_remote)
+    for remote in ordered_remotes:
+        if remote_branch_exists(remote, branch):
+            return remote
+    for remote in ordered_remotes:
+        if remote_branch_exists_live(remote, branch):
+            return remote
+    return ""
+
+
+def get_current_upstream_branch() -> str:
+    result = run_git(
+        ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+        check=False,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        return ""
+    return (result.stdout or "").strip()
+
+
 def show_identity() -> None:
     queries = [
         ("local user.name", ["config", "--local", "--get", "user.name"]),
@@ -186,12 +244,33 @@ def command_push_current(args: argparse.Namespace) -> int:
 
 def command_switch_branch(args: argparse.Namespace) -> int:
     branch = ensure_non_empty(args.branch, "目标分支")
+    preferred_remote = getattr(args, "remote", "")
     if branch_exists(branch):
         run_git(["switch", branch])
+        print(f"已切换到本地分支：{branch}")
     else:
-        run_git(["switch", "-c", branch])
+        tracking_remote = resolve_tracking_remote(branch, preferred_remote)
+        if tracking_remote:
+            if not remote_branch_exists(tracking_remote, branch) and not refresh_remote_branch(
+                tracking_remote,
+                branch,
+            ):
+                raise GitTaskError(
+                    f"检测到远端分支 {tracking_remote}/{branch}，但同步失败，请先执行 git fetch {tracking_remote} 后重试"
+                )
+            refresh_remote_branch(tracking_remote, branch)
+            run_git(["switch", "-c", branch, "--track", f"{tracking_remote}/{branch}"])
+            print(f"已切换并跟踪远端分支：{tracking_remote}/{branch}")
+        else:
+            run_git(["switch", "-c", branch])
+            print(f"远端未找到同名分支，已新建本地分支：{branch}")
     current = run_git(["branch", "--show-current"], capture_output=True)
     print_stdout(current.stdout)
+    upstream = get_current_upstream_branch()
+    if upstream:
+        print(f"当前跟踪远端：{upstream}")
+    else:
+        print("当前未配置跟踪远端")
     return 0
 
 
@@ -249,8 +328,9 @@ def build_parser() -> argparse.ArgumentParser:
     push_current.add_argument("--remote", default=DEFAULT_REMOTE, help=f"远端名称，默认 {DEFAULT_REMOTE}")
     push_current.set_defaults(handler=command_push_current)
 
-    switch_branch = subparsers.add_parser("switch-branch", help="切换或创建本地分支")
+    switch_branch = subparsers.add_parser("switch-branch", help="切换、跟踪远端或创建本地分支")
     switch_branch.add_argument("--branch", required=True, help="目标分支名")
+    switch_branch.add_argument("--remote", default=DEFAULT_REMOTE, help=f"优先检查的远端名称，默认 {DEFAULT_REMOTE}")
     switch_branch.set_defaults(handler=command_switch_branch)
 
     show_branch_parser = subparsers.add_parser("show-branch", help="查看当前分支")
