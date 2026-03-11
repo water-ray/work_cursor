@@ -28,6 +28,7 @@ MANIFEST_PATH = ROOT_DIR / "scripts" / "build" / "assets" / "wateray_server.mani
 TEMP_SYSO_PATH = CORE_DIR / "cmd" / "waterayd" / "zz_wateray_server_windows_amd64.syso"
 TAURI_DEFAULT_CONFIG_DIR = TAURI_DIR / "default-config"
 TAURI_DEFAULT_RULE_SET_DIR = TAURI_DEFAULT_CONFIG_DIR / "rule-set"
+LINUX_BUILD_ASSET_DIR = ROOT_DIR / "scripts" / "build" / "assets" / "linux"
 VERSION_PATH = ROOT_DIR / "VERSION"
 SEMVER_PATTERN = re.compile(r"^\d+\.\d+\.\d+$")
 
@@ -291,6 +292,10 @@ def build_frontend_bundle() -> None:
 
 def build_tauri_shell(target: DesktopBuildTarget) -> None:
     print_step("编译 Tauri 桌面宿主")
+    env = os.environ.copy()
+    if target.platform_id == "linux" and env.get("CI", "").strip() == "1":
+        # Tauri CLI expects a boolean string for CI, while some IDEs export `1`.
+        env["CI"] = "true"
     run_command(
         [
             "npx",
@@ -301,6 +306,7 @@ def build_tauri_shell(target: DesktopBuildTarget) -> None:
         cwd=TAURI_DIR,
         stage="frontend_shell_build",
         code=32,
+        env=env,
     )
     if not target.tauri_binary_path.exists():
         raise BuildError(
@@ -322,6 +328,13 @@ def assemble_bundle(target: DesktopBuildTarget, release_version: str) -> None:
         )
     else:
         print(f"跳过默认配置拷贝（目录不存在）：{TAURI_DEFAULT_CONFIG_DIR}")
+    if target.platform_id == "linux" and LINUX_BUILD_ASSET_DIR.exists():
+        shutil.copytree(
+            LINUX_BUILD_ASSET_DIR,
+            target.bin_dir / "linux",
+            dirs_exist_ok=True,
+        )
+        shutil.copy2(VERSION_PATH, target.bin_dir / "VERSION")
     print(f"打包版本 -> {release_version}")
 
     if not frontend_target_path.exists():

@@ -46,9 +46,11 @@ import type { DaemonPageProps } from "../../app/types";
 import { daemonApi } from "../../services/daemonApi";
 import {
   buildServiceStartedMessage,
+  restartServiceWithFeedback,
   startServiceWithSmartOptimize,
   startupCancelledErrorMessage,
   stopServiceWithFeedback,
+  syncLinuxSystemProxyWithFeedback,
   type ServiceStartupStage,
 } from "../../services/serviceControl";
 
@@ -745,16 +747,26 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
   const updateConfiguredMode = async (checked: boolean) => {
     const nextMode: ProxyMode = checked ? "tun" : "system";
     const previousMode = configuredProxyMode;
+    const shouldApplyRuntime = snapshot?.connectionStage === "connected" && proxyMode !== "off";
     setConfiguredProxyMode(nextMode);
     setUpdatingConfiguredProxyMode(true);
     try {
-      await runAction(() =>
+      const nextSnapshot = await runAction(() =>
         daemonApi.setSettings({
           proxyMode: nextMode,
-          applyRuntime: false,
+          applyRuntime: shouldApplyRuntime,
         }),
       );
-      notice.success(checked ? "默认启动模式已切换为虚拟网卡" : "默认启动模式已切换为系统代理");
+      await syncLinuxSystemProxyWithFeedback({
+        snapshot: nextSnapshot,
+        notice,
+        actionLabel: "切换启动模式",
+      });
+      notice.success(
+        shouldApplyRuntime
+          ? (checked ? "已切换为虚拟网卡模式，并自动刷新当前服务" : "已切换为系统代理模式，并自动刷新当前服务")
+          : (checked ? "默认启动模式已切换为虚拟网卡" : "默认启动模式已切换为系统代理"),
+      );
     } catch (error) {
       setConfiguredProxyMode(previousMode);
       notice.error(error instanceof Error ? error.message : "更新启动模式失败");
@@ -975,14 +987,10 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
   const restartService = async () => {
     setRestartingService(true);
     try {
-      await runAction(() => daemonApi.restartConnection());
-      if (proxyMode === "off") {
-        notice.success("服务已重启（最小实例）");
-      } else if (proxyMode === "system") {
-        notice.success("服务已重启（系统代理模式）");
-      } else {
-        notice.success("服务已重启（虚拟网卡模式）");
-      }
+      await restartServiceWithFeedback({
+        runAction,
+        notice,
+      });
     } catch (error) {
       notice.error(error instanceof Error ? error.message : "重启服务失败");
     } finally {
@@ -1296,13 +1304,16 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
       return;
     }
 
-    if (settingsChanged) {
-      settingsInput.applyRuntime = false;
-    }
+    settingsInput.applyRuntime = snapshot.connectionStage === "connected" && snapshot.proxyMode !== "off";
 
     setApplyingProxyDraft(true);
     try {
       const nextSnapshot = await runAction(() => daemonApi.setSettings(settingsInput));
+      await syncLinuxSystemProxyWithFeedback({
+        snapshot: nextSnapshot,
+        notice,
+        actionLabel: "保存代理配置",
+      });
       setProxyDraftDirty(false);
       draftNotice.notifySaveSuccess("代理配置", nextSnapshot);
     } catch (error) {
@@ -1420,7 +1431,7 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
           helpContent={{
             scene: "需要在 TUN 模式下优化吞吐、兼容性或稳定性。",
             effect: "控制 tun 入站的 mtu 与 stack 参数。",
-            caution: "仅在虚拟网卡模式运行时生效；修改后若当前正在 TUN 模式，通常需重启服务生效。",
+            caution: "仅在虚拟网卡模式运行时生效；保存草稿后若当前代理正在运行，会自动刷新服务强制生效。",
           }}
         />
         <Space size={8} align="center">
@@ -1676,7 +1687,7 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
                 label="网卡模式"
                 helpContent={{
                   effect: "控制默认启动模式：开启为虚拟网卡模式，关闭为系统代理模式。",
-                  recommendation: "需全局接管流量时优先开启；仅浏览器等显式代理场景可关闭。",
+                  recommendation: "需全局接管流量时优先开启；仅浏览器等显式代理场景可关闭。若当前代理正在运行，切换后会自动刷新服务。",
                 }}
               />
               <SwitchWithLabel

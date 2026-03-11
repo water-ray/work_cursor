@@ -2,6 +2,10 @@ import type { DaemonSnapshot, ProxyMode, StartPrecheckResult, VpnNode } from "..
 
 import { normalizeCountryCode } from "../app/data/countryMetadata";
 import type { ProxyStartupSmartOptimizePreference } from "../app/settings/uiPreferences";
+import {
+  describeLinuxSystemProxySyncError,
+  syncLinuxSystemProxyFromSnapshot,
+} from "../desktop/linuxSystemProxySync";
 import { daemonApi } from "./daemonApi";
 import { notifyStartPrecheckResult, type NoticeApiLike } from "./configChangeMessage";
 
@@ -371,16 +375,55 @@ export function buildServiceStartedMessage(
   return `服务已启动（${resolveModeLabel(targetMode)}${selectedNodeSuffix}）`;
 }
 
+export async function syncLinuxSystemProxyWithFeedback(params: {
+  snapshot: DaemonSnapshot;
+  notice: NoticeApiLike;
+  actionLabel: string;
+  force?: boolean;
+}): Promise<void> {
+  try {
+    await syncLinuxSystemProxyFromSnapshot(params.snapshot, {
+      force: params.force,
+      throwOnError: true,
+    });
+  } catch (error) {
+    params.notice.warning(
+      `Linux 系统代理同步失败（${params.actionLabel}）：${describeLinuxSystemProxySyncError(error)}`,
+    );
+  }
+}
+
 export async function stopServiceWithFeedback(params: {
   runAction: (action: () => Promise<DaemonSnapshot>) => Promise<DaemonSnapshot>;
   notice: NoticeApiLike;
 }): Promise<DaemonSnapshot> {
   const nextSnapshot = await params.runAction(() => daemonApi.stopConnection());
+  await syncLinuxSystemProxyWithFeedback({
+    snapshot: nextSnapshot,
+    notice: params.notice,
+    actionLabel: "停止服务",
+    force: true,
+  });
   if (nextSnapshot.connectionStage === "connected" && nextSnapshot.proxyMode === "off") {
     params.notice.success("服务已停止（最小实例）");
   } else {
     params.notice.info("停止请求已提交，正在关闭代理...");
   }
+  return nextSnapshot;
+}
+
+export async function restartServiceWithFeedback(params: {
+  runAction: (action: () => Promise<DaemonSnapshot>) => Promise<DaemonSnapshot>;
+  notice: NoticeApiLike;
+}): Promise<DaemonSnapshot> {
+  const nextSnapshot = await params.runAction(() => daemonApi.restartConnection());
+  await syncLinuxSystemProxyWithFeedback({
+    snapshot: nextSnapshot,
+    notice: params.notice,
+    actionLabel: "重启服务",
+    force: true,
+  });
+  params.notice.success(`服务已刷新（${resolveModeLabel(nextSnapshot.proxyMode)}）`);
   return nextSnapshot;
 }
 
@@ -447,6 +490,12 @@ export async function startServiceWithSmartOptimize(params: {
   }
   onStageChange?.("start", "正在启动代理服务...");
   const nextSnapshot = await runAction(() => daemonApi.startConnection());
+  await syncLinuxSystemProxyWithFeedback({
+    snapshot: nextSnapshot,
+    notice,
+    actionLabel: "启动服务",
+    force: true,
+  });
   return {
     aborted: false,
     nextSnapshot,

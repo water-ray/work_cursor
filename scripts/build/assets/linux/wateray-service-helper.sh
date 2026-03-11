@@ -6,6 +6,10 @@ readonly SYSTEM_ASSET_DIR="/usr/local/share/wateray/linux"
 readonly POLICY_INSTALL_PATH="/usr/share/polkit-1/actions/net.wateray.daemon.policy"
 readonly SYSTEMD_UNIT_DIR="/etc/systemd/system"
 readonly SYSTEM_DESKTOP_DIR="/usr/local/share/applications"
+readonly SYSTEM_DESKTOP_FILE_NAME="com.wateray.desktop.desktop"
+readonly LEGACY_SYSTEM_DESKTOP_FILE_NAME="wateray.desktop"
+readonly SYSTEM_DESKTOP_PATH="$SYSTEM_DESKTOP_DIR/$SYSTEM_DESKTOP_FILE_NAME"
+readonly LEGACY_SYSTEM_DESKTOP_PATH="$SYSTEM_DESKTOP_DIR/$LEGACY_SYSTEM_DESKTOP_FILE_NAME"
 readonly SYSTEM_ICON_DIR="/usr/local/share/icons/hicolor/128x128/apps"
 readonly SYSTEM_ICON_PATH="$SYSTEM_ICON_DIR/wateray.png"
 readonly DEFAULT_PACKAGED_SERVICE_NAME="waterayd"
@@ -133,6 +137,93 @@ render_desktop_entry() {
   rm -f "$tmp_path"
 }
 
+is_enabled_unit_file_state() {
+  case "${1:-}" in
+    enabled|enabled-runtime|linked|linked-runtime|alias)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+print_service_status() {
+  local service_name="$1"
+  local data_root="$2"
+  local unit_name="$service_name.service"
+  local unit_path="$SYSTEMD_UNIT_DIR/$unit_name"
+  local load_state="not-found"
+  local unit_file_state="disabled"
+  local active_state="inactive"
+  local sub_state="dead"
+  local fragment_path=""
+  local result=""
+
+  if result="$(systemctl show "$unit_name" \
+    --property=LoadState \
+    --property=UnitFileState \
+    --property=ActiveState \
+    --property=SubState \
+    --property=FragmentPath 2>/dev/null)"; then
+    while IFS='=' read -r key value; do
+      case "$key" in
+        LoadState)
+          if [[ -n "$value" ]]; then
+            load_state="$value"
+          fi
+          ;;
+        UnitFileState)
+          if [[ -n "$value" ]]; then
+            unit_file_state="$value"
+          fi
+          ;;
+        ActiveState)
+          if [[ -n "$value" ]]; then
+            active_state="$value"
+          fi
+          ;;
+        SubState)
+          if [[ -n "$value" ]]; then
+            sub_state="$value"
+          fi
+          ;;
+        FragmentPath)
+          fragment_path="$value"
+          ;;
+      esac
+    done <<<"$result"
+  fi
+
+  local installed="false"
+  if [[ -f "$unit_path" || -n "$fragment_path" || "$load_state" != "not-found" ]]; then
+    installed="true"
+  fi
+
+  local enabled="false"
+  if is_enabled_unit_file_state "$unit_file_state"; then
+    enabled="true"
+  fi
+
+  local active="false"
+  if [[ "$active_state" == "active" ]]; then
+    active="true"
+  fi
+
+  printf 'service_name=%s\n' "$service_name"
+  printf 'unit_name=%s\n' "$unit_name"
+  printf 'unit_path=%s\n' "$unit_path"
+  printf 'installed=%s\n' "$installed"
+  printf 'enabled=%s\n' "$enabled"
+  printf 'active=%s\n' "$active"
+  printf 'load_state=%s\n' "$load_state"
+  printf 'unit_file_state=%s\n' "$unit_file_state"
+  printf 'active_state=%s\n' "$active_state"
+  printf 'sub_state=%s\n' "$sub_state"
+  printf 'fragment_path=%s\n' "$fragment_path"
+  printf 'data_root=%s\n' "$data_root"
+}
+
 ensure_service() {
   local template_name="$1"
   local install_dir="$2"
@@ -163,6 +254,16 @@ ensure_service() {
   systemctl restart "$service_name.service"
 }
 
+remove_service() {
+  local service_name="$1"
+  local unit_name="$service_name.service"
+  local unit_path="$SYSTEMD_UNIT_DIR/$unit_name"
+  systemctl disable --now "$unit_name" >/dev/null 2>&1 || true
+  rm -f "$unit_path"
+  systemctl daemon-reload
+  systemctl reset-failed "$unit_name" >/dev/null 2>&1 || true
+}
+
 install_packaged_launcher() {
   local install_dir="$1"
   local template_path="$asset_dir/wateray.desktop.template"
@@ -174,7 +275,8 @@ install_packaged_launcher() {
     fail "Missing desktop template: $template_path"
   fi
   install -m 0644 "$asset_dir/wateray.png" "$SYSTEM_ICON_PATH"
-  render_desktop_entry "$template_path" "$SYSTEM_DESKTOP_DIR/wateray.desktop" "$app_path" "$SYSTEM_ICON_PATH"
+  rm -f "$LEGACY_SYSTEM_DESKTOP_PATH"
+  render_desktop_entry "$template_path" "$SYSTEM_DESKTOP_PATH" "$app_path" "$SYSTEM_ICON_PATH"
 }
 
 command_name="${1:-}"
@@ -227,6 +329,24 @@ case "$command_name" in
     service_name="$(normalize_service_name "${service_name:-$DEFAULT_DEV_SERVICE_NAME}")"
     data_root="$(resolve_path "${data_root:-$DEFAULT_DEV_DATA_ROOT}")"
     ensure_service "waterayd-dev.service.template" "$install_dir" "$service_name" "$data_root" "false"
+    ;;
+  status-packaged)
+    service_name="$(normalize_service_name "${service_name:-$DEFAULT_PACKAGED_SERVICE_NAME}")"
+    data_root="$(resolve_path "${data_root:-$DEFAULT_PACKAGED_DATA_ROOT}")"
+    print_service_status "$service_name" "$data_root"
+    ;;
+  status-dev)
+    service_name="$(normalize_service_name "${service_name:-$DEFAULT_DEV_SERVICE_NAME}")"
+    data_root="$(resolve_path "${data_root:-$DEFAULT_DEV_DATA_ROOT}")"
+    print_service_status "$service_name" "$data_root"
+    ;;
+  uninstall-packaged)
+    service_name="$(normalize_service_name "${service_name:-$DEFAULT_PACKAGED_SERVICE_NAME}")"
+    remove_service "$service_name"
+    ;;
+  uninstall-dev)
+    service_name="$(normalize_service_name "${service_name:-$DEFAULT_DEV_SERVICE_NAME}")"
+    remove_service "$service_name"
     ;;
   *)
     fail "Unsupported helper command: $command_name"

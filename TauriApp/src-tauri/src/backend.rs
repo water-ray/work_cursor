@@ -1,8 +1,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+#[cfg(not(target_os = "linux"))]
+use std::process::Stdio;
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -38,6 +41,7 @@ const DAEMON_SHUTDOWN_TIMEOUT_MS: u64 = 1200;
 const FRONTEND_READY_TIMEOUT_DEV_MS: u64 = 20_000;
 const FRONTEND_READY_TIMEOUT_RELEASE_MS: u64 = 12_000;
 const MAX_TEXT_FILE_BYTES: usize = 16 * 1024 * 1024;
+#[cfg(target_os = "windows")]
 const STARTUP_ERROR_WEBVIEW2_MISSING: &str = "WEBVIEW2_RUNTIME_MISSING";
 const STARTUP_ERROR_FRONTEND_TIMEOUT: &str = "FRONTEND_READY_TIMEOUT";
 const STARTUP_ERROR_FRONTEND_BOOTSTRAP: &str = "FRONTEND_BOOTSTRAP_FAILED";
@@ -45,10 +49,43 @@ const TRAY_ID: &str = "wateray-tray";
 const TRAY_MENU_OPEN_MAIN_WINDOW: &str = "tray-open-main-window";
 const TRAY_MENU_QUIT_PANEL_ONLY: &str = "tray-quit-panel-only";
 const TRAY_MENU_QUIT_ALL: &str = "tray-quit-all";
+#[cfg(target_os = "linux")]
+const LINUX_SYSTEM_HELPER_PATH: &str = "/usr/local/libexec/wateray/wateray-service-helper";
+#[cfg(target_os = "linux")]
+const LINUX_SYSTEM_POLICY_PATH: &str = "/usr/share/polkit-1/actions/net.wateray.daemon.policy";
+#[cfg(target_os = "linux")]
+const LINUX_PACKAGED_SERVICE_NAME: &str = "waterayd";
+#[cfg(target_os = "linux")]
+const LINUX_DEV_SERVICE_NAME: &str = "waterayd-dev";
+#[cfg(target_os = "linux")]
+const LINUX_LOCAL_HELPER_RELATIVE_PATH: &str = "linux/wateray-service-helper.sh";
+#[cfg(target_os = "linux")]
+const LINUX_LOCAL_INSTALL_SCRIPT_RELATIVE_PATH: &str = "linux/install-system-service.sh";
+#[cfg(target_os = "linux")]
+const LINUX_DEV_BOOTSTRAP_SCRIPT_RELATIVE_PATH: &str = "scripts/dev/run_waterayd.py";
+#[cfg(target_os = "linux")]
+const LINUX_DEV_HELPER_SCRIPT_RELATIVE_PATH: &str = "scripts/build/assets/linux/wateray-service-helper.sh";
 
 #[derive(Serialize)]
 pub struct ClipboardWriteResult {
     mode: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinuxServiceStatus {
+    mode: String,
+    service_name: String,
+    installed: bool,
+    enabled: bool,
+    active: bool,
+    daemon_reachable: bool,
+    helper_installed: bool,
+    policy_installed: bool,
+    manage_supported: bool,
+    unit_file_state: String,
+    active_state: String,
+    sub_state: String,
 }
 
 #[derive(Default)]
@@ -352,6 +389,396 @@ pub fn show_preinit_startup_error(title: &str, message: &str) {
     eprintln!("{title}: {message}");
 }
 
+#[cfg(target_os = "linux")]
+fn linux_service_mode() -> &'static str {
+    if is_dev_mode() {
+        "dev"
+    } else {
+        "packaged"
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_service_name() -> &'static str {
+    if is_dev_mode() {
+        LINUX_DEV_SERVICE_NAME
+    } else {
+        LINUX_PACKAGED_SERVICE_NAME
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn trim_command_text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).trim().to_string()
+}
+
+#[cfg(target_os = "linux")]
+fn format_command_failure(context: &str, output: &std::process::Output) -> String {
+    let stderr = trim_command_text(&output.stderr);
+    let stdout = trim_command_text(&output.stdout);
+    let exit_code = output
+        .status
+        .code()
+        .map_or_else(|| "signal".to_string(), |value| value.to_string());
+    let detail = if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        format!("exit_code={exit_code}")
+    };
+    format!("{context}失败：{detail}")
+}
+
+#[cfg(target_os = "linux")]
+fn run_command_capture(
+    program: &str,
+    args: &[String],
+    cwd: Option<&Path>,
+) -> Result<std::process::Output, String> {
+    let mut command = Command::new(program);
+    command.args(args);
+    if let Some(path) = cwd {
+        command.current_dir(path);
+    }
+    command
+        .output()
+        .map_err(|error| format!("执行命令失败 {program}: {error}"))
+}
+
+#[cfg(target_os = "linux")]
+fn run_gsettings_set(schema: &str, key: &str, value: &str) -> Result<(), String> {
+    let args = vec![
+        "set".to_string(),
+        schema.to_string(),
+        key.to_string(),
+        value.to_string(),
+    ];
+    let output = run_command_capture("gsettings", &args, None)?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format_command_failure(
+        &format!("同步 Linux 系统代理 {schema}.{key}"),
+        &output,
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn apply_linux_system_proxy(port: u16) -> Result<(), String> {
+    if port == 0 {
+        return Err("Linux 系统代理端口无效".to_string());
+    }
+    let port_text = port.to_string();
+    run_gsettings_set("org.gnome.system.proxy", "use-same-proxy", "true")?;
+    run_gsettings_set("org.gnome.system.proxy.http", "host", "127.0.0.1")?;
+    run_gsettings_set("org.gnome.system.proxy.http", "port", &port_text)?;
+    run_gsettings_set("org.gnome.system.proxy.https", "host", "127.0.0.1")?;
+    run_gsettings_set("org.gnome.system.proxy.https", "port", &port_text)?;
+    run_gsettings_set("org.gnome.system.proxy.socks", "host", "127.0.0.1")?;
+    run_gsettings_set("org.gnome.system.proxy.socks", "port", &port_text)?;
+    run_gsettings_set("org.gnome.system.proxy", "mode", "manual")
+}
+
+#[cfg(target_os = "linux")]
+fn clear_linux_system_proxy() -> Result<(), String> {
+    run_gsettings_set("org.gnome.system.proxy", "mode", "none")
+}
+
+#[cfg(target_os = "linux")]
+fn run_pkexec_command(
+    executable_path: &Path,
+    args: &[String],
+    cwd: &Path,
+    context: &str,
+) -> Result<(), String> {
+    let mut command = Command::new("pkexec");
+    command.arg(executable_path);
+    command.args(args);
+    command.current_dir(cwd);
+    let output = command
+        .output()
+        .map_err(|error| format!("执行 pkexec 失败：{error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format_command_failure(context, &output))
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_dev_repo_root() -> Result<PathBuf, String> {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "无法解析开发仓库根目录".to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_dev_bootstrap_script_path() -> Result<PathBuf, String> {
+    Ok(resolve_dev_repo_root()?.join(LINUX_DEV_BOOTSTRAP_SCRIPT_RELATIVE_PATH))
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_dev_helper_script_path() -> Result<PathBuf, String> {
+    Ok(resolve_dev_repo_root()?.join(LINUX_DEV_HELPER_SCRIPT_RELATIVE_PATH))
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_current_install_dir() -> Result<PathBuf, String> {
+    let current_executable =
+        std::env::current_exe().map_err(|error| format!("获取当前程序路径失败：{error}"))?;
+    current_executable
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "无法解析当前安装目录".to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_packaged_local_install_script() -> Result<PathBuf, String> {
+    Ok(resolve_current_install_dir()?.join(LINUX_LOCAL_INSTALL_SCRIPT_RELATIVE_PATH))
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_packaged_local_helper_script() -> Result<PathBuf, String> {
+    Ok(resolve_current_install_dir()?.join(LINUX_LOCAL_HELPER_RELATIVE_PATH))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_manage_supported() -> bool {
+    if is_dev_mode() {
+        return resolve_dev_bootstrap_script_path()
+            .map(|path| path.is_file())
+            .unwrap_or(false)
+            && resolve_dev_helper_script_path()
+                .map(|path| path.is_file())
+                .unwrap_or(false);
+    }
+
+    Path::new(LINUX_SYSTEM_HELPER_PATH).is_file()
+        || resolve_packaged_local_install_script()
+            .map(|path| path.is_file())
+            .unwrap_or(false)
+        || resolve_packaged_local_helper_script()
+            .map(|path| path.is_file())
+            .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn is_enabled_unit_file_state(state: &str) -> bool {
+    matches!(
+        state,
+        "enabled" | "enabled-runtime" | "linked" | "linked-runtime" | "alias"
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn query_linux_service_status() -> Result<LinuxServiceStatus, String> {
+    let service_name = linux_service_name();
+    let unit_name = format!("{service_name}.service");
+    let unit_path = PathBuf::from("/etc/systemd/system").join(&unit_name);
+
+    let output = Command::new("systemctl")
+        .arg("show")
+        .arg(&unit_name)
+        .arg("--property=LoadState")
+        .arg("--property=UnitFileState")
+        .arg("--property=ActiveState")
+        .arg("--property=SubState")
+        .arg("--property=FragmentPath")
+        .output()
+        .map_err(|error| format!("读取 systemd 服务状态失败：{error}"))?;
+
+    let mut load_state = "not-found".to_string();
+    let mut unit_file_state = "disabled".to_string();
+    let mut active_state = "inactive".to_string();
+    let mut sub_state = "dead".to_string();
+    let mut fragment_path = String::new();
+
+    if output.status.success() {
+        let stdout_text = trim_command_text(&output.stdout);
+        for line in stdout_text.lines() {
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let normalized = value.trim().to_string();
+            if normalized.is_empty() && key.trim() != "FragmentPath" {
+                continue;
+            }
+            match key.trim() {
+                "LoadState" => load_state = normalized,
+                "UnitFileState" => unit_file_state = normalized,
+                "ActiveState" => active_state = normalized,
+                "SubState" => sub_state = normalized,
+                "FragmentPath" => fragment_path = normalized,
+                _ => {}
+            }
+        }
+    }
+
+    let installed =
+        unit_path.exists() || !fragment_path.is_empty() || load_state.as_str() != "not-found";
+
+    Ok(LinuxServiceStatus {
+        mode: linux_service_mode().to_string(),
+        service_name: service_name.to_string(),
+        installed,
+        enabled: is_enabled_unit_file_state(unit_file_state.as_str()),
+        active: active_state == "active",
+        daemon_reachable: false,
+        helper_installed: Path::new(LINUX_SYSTEM_HELPER_PATH).is_file(),
+        policy_installed: Path::new(LINUX_SYSTEM_POLICY_PATH).is_file(),
+        manage_supported: linux_manage_supported(),
+        unit_file_state,
+        active_state,
+        sub_state,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn run_linux_dev_bootstrap() -> Result<(), String> {
+    let repo_root = resolve_dev_repo_root()?;
+    let bootstrap_path = resolve_dev_bootstrap_script_path()?;
+    if !bootstrap_path.is_file() {
+        return Err(format!(
+            "未找到 Linux 开发服务脚本：{}",
+            bootstrap_path.display()
+        ));
+    }
+
+    let args = vec![bootstrap_path.display().to_string()];
+    let output = match run_command_capture("python3", &args, Some(&repo_root)) {
+        Ok(result) => result,
+        Err(error) if error.contains("python3") => {
+            run_command_capture("python", &args, Some(&repo_root))?
+        }
+        Err(error) => return Err(error),
+    };
+
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format_command_failure("启动 Linux 开发服务", &output))
+}
+
+#[cfg(target_os = "linux")]
+fn install_or_repair_linux_packaged_service() -> Result<(), String> {
+    let install_dir = resolve_current_install_dir()?;
+    let system_helper = PathBuf::from(LINUX_SYSTEM_HELPER_PATH);
+    if system_helper.is_file() {
+        return run_pkexec_command(
+            &system_helper,
+            &[
+                "ensure-packaged".to_string(),
+                "--install-dir".to_string(),
+                install_dir.display().to_string(),
+            ],
+            &install_dir,
+            "安装或修复 Linux 系统服务",
+        );
+    }
+
+    let local_install_script = resolve_packaged_local_install_script()?;
+    if local_install_script.is_file() {
+        return run_pkexec_command(
+            &local_install_script,
+            &[
+                "--install-dir".to_string(),
+                install_dir.display().to_string(),
+            ],
+            &install_dir,
+            "安装或修复 Linux 系统服务",
+        );
+    }
+
+    let local_helper = resolve_packaged_local_helper_script()?;
+    if local_helper.is_file() {
+        return run_pkexec_command(
+            &local_helper,
+            &[
+                "install-packaged".to_string(),
+                "--install-dir".to_string(),
+                install_dir.display().to_string(),
+            ],
+            &install_dir,
+            "安装或修复 Linux 系统服务",
+        );
+    }
+
+    Err("未找到 Linux 服务安装脚本或 helper".to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn uninstall_linux_current_service() -> Result<(), String> {
+    if is_dev_mode() {
+        let repo_root = resolve_dev_repo_root()?;
+        let helper_path = resolve_dev_helper_script_path()?;
+        if !helper_path.is_file() {
+            return Err(format!("未找到 Linux helper：{}", helper_path.display()));
+        }
+        return run_pkexec_command(
+            &helper_path,
+            &[
+                "uninstall-dev".to_string(),
+                "--service-name".to_string(),
+                LINUX_DEV_SERVICE_NAME.to_string(),
+            ],
+            &repo_root,
+            "卸载 Linux 开发服务",
+        );
+    }
+
+    let install_dir = resolve_current_install_dir()?;
+    let system_helper = PathBuf::from(LINUX_SYSTEM_HELPER_PATH);
+    if system_helper.is_file() {
+        return run_pkexec_command(
+            &system_helper,
+            &[
+                "uninstall-packaged".to_string(),
+                "--service-name".to_string(),
+                LINUX_PACKAGED_SERVICE_NAME.to_string(),
+            ],
+            &install_dir,
+            "卸载 Linux 系统服务",
+        );
+    }
+
+    let local_helper = resolve_packaged_local_helper_script()?;
+    if local_helper.is_file() {
+        return run_pkexec_command(
+            &local_helper,
+            &[
+                "uninstall-packaged".to_string(),
+                "--service-name".to_string(),
+                LINUX_PACKAGED_SERVICE_NAME.to_string(),
+            ],
+            &install_dir,
+            "卸载 Linux 系统服务",
+        );
+    }
+
+    Err("未找到 Linux 服务卸载 helper".to_string())
+}
+
+#[cfg(target_os = "linux")]
+async fn ensure_linux_packaged_service_running() -> Result<(), String> {
+    if is_daemon_reachable().await {
+        return Ok(());
+    }
+
+    install_or_repair_linux_packaged_service()?;
+
+    if wait_daemon_ready().await {
+        return Ok(());
+    }
+
+    Err(format!(
+        "Linux 系统服务已尝试启动，但在 {} 秒内未就绪",
+        DAEMON_READY_TIMEOUT_MS / 1000
+    ))
+}
+
 fn should_manage_packaged_daemon() -> bool {
     if is_dev_mode() {
         return false;
@@ -367,6 +794,7 @@ fn should_manage_packaged_daemon() -> bool {
     true
 }
 
+#[cfg(not(target_os = "linux"))]
 fn resolve_daemon_executable_path() -> Result<PathBuf, String> {
     let current_executable =
         std::env::current_exe().map_err(|error| format!("获取当前程序路径失败：{error}"))?;
@@ -391,7 +819,7 @@ fn is_permission_denied_error(error: &std::io::Error) -> bool {
         || error.raw_os_error() == Some(ERROR_ELEVATION_REQUIRED)
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "linux")))]
 fn is_permission_denied_error(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::PermissionDenied
 }
@@ -417,7 +845,7 @@ fn spawn_daemon_detached(daemon_executable_path: &Path) -> Result<(), std::io::E
     Ok(())
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "linux")))]
 fn spawn_daemon_detached(daemon_executable_path: &Path) -> Result<(), std::io::Error> {
     let daemon_dir = daemon_executable_path
         .parent()
@@ -458,7 +886,7 @@ fn spawn_daemon_elevated_via_uac(daemon_executable_path: &Path) -> bool {
     (result.0 as isize) > 32
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "linux")))]
 fn spawn_daemon_elevated_via_uac(_daemon_executable_path: &Path) -> bool {
     false
 }
@@ -518,6 +946,13 @@ pub async fn ensure_packaged_daemon_running_impl() -> Result<(), String> {
         return Ok(());
     }
 
+    #[cfg(target_os = "linux")]
+    {
+        return ensure_linux_packaged_service_running().await;
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
     let daemon_executable_path = resolve_daemon_executable_path()?;
     if !daemon_executable_path.exists() {
         return Err(format!(
@@ -551,11 +986,92 @@ pub async fn ensure_packaged_daemon_running_impl() -> Result<(), String> {
         DAEMON_READY_TIMEOUT_MS / 1000,
         daemon_executable_path.display()
     ))
+    }
 }
 
 #[tauri::command]
 pub async fn ensure_packaged_daemon_running() -> Result<(), String> {
     ensure_packaged_daemon_running_impl().await
+}
+
+#[cfg(target_os = "linux")]
+async fn linux_service_get_status_impl() -> Result<LinuxServiceStatus, String> {
+    let mut status = query_linux_service_status()?;
+    status.daemon_reachable = is_daemon_reachable().await;
+    Ok(status)
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn linux_service_get_status_impl() -> Result<LinuxServiceStatus, String> {
+    Err("仅支持 Linux 系统服务管理".to_string())
+}
+
+#[tauri::command]
+pub async fn linux_service_get_status() -> Result<LinuxServiceStatus, String> {
+    linux_service_get_status_impl().await
+}
+
+#[cfg(target_os = "linux")]
+async fn linux_service_install_or_repair_impl() -> Result<LinuxServiceStatus, String> {
+    if is_dev_mode() {
+        run_linux_dev_bootstrap()?;
+    } else {
+        install_or_repair_linux_packaged_service()?;
+        if !wait_daemon_ready().await {
+            return Err(format!(
+                "Linux 系统服务已尝试启动，但在 {} 秒内未就绪",
+                DAEMON_READY_TIMEOUT_MS / 1000
+            ));
+        }
+    }
+    linux_service_get_status_impl().await
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn linux_service_install_or_repair_impl() -> Result<LinuxServiceStatus, String> {
+    Err("仅支持 Linux 系统服务管理".to_string())
+}
+
+#[tauri::command]
+pub async fn linux_service_install_or_repair() -> Result<LinuxServiceStatus, String> {
+    linux_service_install_or_repair_impl().await
+}
+
+#[cfg(target_os = "linux")]
+async fn linux_service_uninstall_impl() -> Result<LinuxServiceStatus, String> {
+    uninstall_linux_current_service()?;
+    let mut status = linux_service_get_status_impl().await?;
+    status.daemon_reachable = is_daemon_reachable().await;
+    Ok(status)
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn linux_service_uninstall_impl() -> Result<LinuxServiceStatus, String> {
+    Err("仅支持 Linux 系统服务管理".to_string())
+}
+
+#[tauri::command]
+pub async fn linux_service_uninstall() -> Result<LinuxServiceStatus, String> {
+    linux_service_uninstall_impl().await
+}
+
+#[cfg(target_os = "linux")]
+fn linux_sync_system_proxy_impl(enabled: bool, port: Option<u16>) -> Result<(), String> {
+    if !enabled {
+        return clear_linux_system_proxy();
+    }
+    let resolved_port = port.unwrap_or(0);
+    apply_linux_system_proxy(resolved_port)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn linux_sync_system_proxy_impl(_enabled: bool, _port: Option<u16>) -> Result<(), String> {
+    Ok(())
+}
+
+#[tauri::command]
+pub fn linux_sync_system_proxy(enabled: bool, port: Option<u16>) -> Result<(), String> {
+    linux_sync_system_proxy_impl(enabled, port)
 }
 
 #[tauri::command]

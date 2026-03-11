@@ -544,6 +544,38 @@ func TestRestartUsesMinimalRuntimeSnapshotWhenProxyModeOff(t *testing.T) {
 	}
 }
 
+func TestRestartUsesConfiguredProxyModeWhenRuntimeActive(t *testing.T) {
+	engine := &fakeRuntimeApplyEngine{}
+	store := &RuntimeStore{
+		state:        runtimeSnapshotForApplyTests(),
+		stateFile:    "",
+		applyManager: newRuntimeApplyManagerForTest(engine, singBoxRuntimeCapabilitiesV11222, nil),
+	}
+	applyProxyModeToState(&store.state, ProxyModeSystem)
+	store.state.ConfiguredProxyMode = ProxyModeTun
+
+	snapshot, err := store.Restart(context.Background())
+	if err != nil {
+		t.Fatalf("restart failed: %v", err)
+	}
+	if engine.restartCalls != 1 {
+		t.Fatalf("expected one restart call, got %d", engine.restartCalls)
+	}
+	if len(engine.preparedSnapshots) < 2 {
+		t.Fatalf("expected prepare snapshots for restart and rollback, got %d", len(engine.preparedSnapshots))
+	}
+	nextSnapshot := engine.preparedSnapshots[0]
+	if nextSnapshot.ProxyMode != ProxyModeTun {
+		t.Fatalf("expected restart snapshot proxy mode tun, got %s", nextSnapshot.ProxyMode)
+	}
+	if snapshot.ProxyMode != ProxyModeTun {
+		t.Fatalf("expected runtime proxy mode tun after restart, got %s", snapshot.ProxyMode)
+	}
+	if snapshot.ConfiguredProxyMode != ProxyModeTun {
+		t.Fatalf("expected configured proxy mode tun after restart, got %s", snapshot.ConfiguredProxyMode)
+	}
+}
+
 func TestSetSettingsUpdatesClearDNSCacheOnRestart(t *testing.T) {
 	store := &RuntimeStore{
 		state:     defaultSnapshot("test-runtime", "test-core"),

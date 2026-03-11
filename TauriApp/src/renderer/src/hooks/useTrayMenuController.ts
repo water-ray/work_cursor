@@ -8,6 +8,7 @@ import type { AppNoticeApi } from "../components/notify/AppNoticeProvider";
 import { ensureTray, restoreMainWindow } from "../desktop/tray";
 import {
   buildServiceStartedMessage,
+  restartServiceWithFeedback,
   resolveModeLabel,
   startServiceWithSmartOptimize,
   stopServiceWithFeedback,
@@ -375,12 +376,10 @@ export function useTrayMenuController({
         enabled: canTriggerSnapshotAction,
         action: () => {
           void runBusyTrayAction(trayActionRestartService, async () => {
-            const nextSnapshot = await runActionRef.current(() =>
-              daemonApi.restartConnection(),
-            );
-            noticeRef.current.success(
-              `服务已刷新（${resolveModeLabel(nextSnapshot.proxyMode)}）`,
-            );
+            await restartServiceWithFeedback({
+              runAction: runActionRef.current,
+              notice: noticeRef.current,
+            });
           });
         },
       },

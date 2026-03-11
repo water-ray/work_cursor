@@ -63,6 +63,10 @@ const geoSiteRuleSetOptions = [
 type RuleSetDownloadMode = "direct" | "proxy";
 type RuleSetKind = "geoip" | "geosite";
 type RuleSetTransientStatus = "idle" | "queued" | "downloading" | "failed";
+type LinuxServiceBusyAction = "refresh" | "install" | "uninstall";
+type LinuxServiceStatusValue = Awaited<
+  ReturnType<Window["waterayDesktop"]["system"]["linuxService"]["getStatus"]>
+>;
 const maxRuleSetBatchSize = 5;
 
 function ruleSetStatusKey(kind: RuleSetKind, value: string): string {
@@ -110,6 +114,12 @@ export function SettingsPage({ snapshot, loading, runAction }: DaemonPageProps) 
   const [loadingRuleSetStatuses, setLoadingRuleSetStatuses] = useState(false);
   const [updatingRuleSets, setUpdatingRuleSets] = useState(false);
   const [exemptingLoopback, setExemptingLoopback] = useState(false);
+  const [linuxServiceStatus, setLinuxServiceStatus] = useState<LinuxServiceStatusValue | null>(
+    null,
+  );
+  const [loadingLinuxServiceStatus, setLoadingLinuxServiceStatus] = useState(false);
+  const [linuxServiceBusyAction, setLinuxServiceBusyAction] =
+    useState<LinuxServiceBusyAction | null>(null);
 
   const settingsDraftDirty =
     dragScrollEnabled !== appliedDragScrollEnabled ||
@@ -160,9 +170,11 @@ export function SettingsPage({ snapshot, loading, runAction }: DaemonPageProps) 
     [selectedGeoIPRuleSets, selectedGeoSiteRuleSets],
   );
   const systemType = (snapshot?.systemType ?? "").toLowerCase();
+  const isLinuxSystem = systemType === "linux";
   const isWindowsSystem = systemType === "windows";
   const runtimeAdmin = snapshot?.runtimeAdmin === true;
   const canExemptLoopback = isWindowsSystem && runtimeAdmin && !exemptingLoopback;
+  const linuxServiceBusy = linuxServiceBusyAction !== null;
   const allGeoIPRuleSetValues = useMemo(
     () => geoIPRuleSetOptions.map((option) => option.value),
     [],
@@ -507,9 +519,85 @@ export function SettingsPage({ snapshot, loading, runAction }: DaemonPageProps) 
     }
   };
 
+  const refreshLinuxServiceStatus = useCallback(
+    async (silent = false) => {
+      if (!isLinuxSystem) {
+        setLinuxServiceStatus(null);
+        return;
+      }
+      setLoadingLinuxServiceStatus(true);
+      if (!silent) {
+        setLinuxServiceBusyAction("refresh");
+      }
+      try {
+        const status = await window.waterayDesktop.system.linuxService.getStatus();
+        setLinuxServiceStatus(status);
+      } catch (error) {
+        if (!silent) {
+          notice.error(error instanceof Error ? error.message : "读取 Linux 服务状态失败");
+        }
+      } finally {
+        setLoadingLinuxServiceStatus(false);
+        if (!silent) {
+          setLinuxServiceBusyAction(null);
+        }
+      }
+    },
+    [isLinuxSystem, notice],
+  );
+
+  const installOrRepairLinuxService = async () => {
+    if (!isLinuxSystem) {
+      return;
+    }
+    setLinuxServiceBusyAction("install");
+    try {
+      const status = await window.waterayDesktop.system.linuxService.installOrRepair();
+      setLinuxServiceStatus(status);
+      if (status.daemonReachable) {
+        await runAction(() => daemonApi.getState());
+      }
+      notice.success(
+        status.mode === "dev" ? "Linux 开发服务已安装/修复" : "Linux 系统服务已安装/修复",
+      );
+    } catch (error) {
+      notice.error(error instanceof Error ? error.message : "安装或修复 Linux 服务失败");
+    } finally {
+      setLinuxServiceBusyAction(null);
+      void refreshLinuxServiceStatus(true);
+    }
+  };
+
+  const uninstallLinuxService = async () => {
+    if (!isLinuxSystem) {
+      return;
+    }
+    setLinuxServiceBusyAction("uninstall");
+    try {
+      const status = await window.waterayDesktop.system.linuxService.uninstall();
+      setLinuxServiceStatus(status);
+      notice.success(
+        status.mode === "dev" ? "Linux 开发服务已卸载" : "Linux 系统服务已卸载",
+      );
+    } catch (error) {
+      notice.error(error instanceof Error ? error.message : "卸载 Linux 服务失败");
+    } finally {
+      setLinuxServiceBusyAction(null);
+      void refreshLinuxServiceStatus(true);
+    }
+  };
+
   useEffect(() => {
     void refreshRuleSetStatuses(true);
   }, [refreshRuleSetStatuses]);
+
+  useEffect(() => {
+    if (!isLinuxSystem) {
+      setLinuxServiceStatus(null);
+      return;
+    }
+    void refreshLinuxServiceStatus(true);
+  }, [isLinuxSystem, refreshLinuxServiceStatus]);
 
   useEffect(() => {
     if (!ruleSetModalOpen) {
@@ -594,6 +682,108 @@ export function SettingsPage({ snapshot, loading, runAction }: DaemonPageProps) 
               <Radio value="exit_all">完全退出（关闭面板程序 + 内核程序）</Radio>
             </Space>
           </Radio.Group>
+          {isLinuxSystem ? (
+            <>
+              <Divider style={{ margin: "4px 0 2px" }} />
+              <HelpLabel
+                label="Linux 系统服务"
+                helpContent={{
+                  scene: "Linux 下需要由 systemd 承载 waterayd 服务。",
+                  effect: "可查看当前服务状态，并执行安装/修复、卸载与刷新操作。",
+                  caution:
+                    "安装、修复、卸载都可能触发管理员授权；卸载后仅会暂停本次会话内的自动修复，后续重新启动客户端时，如需继续使用 VPN，仍可能提示重新安装服务。",
+                }}
+              />
+              <Space
+                direction="vertical"
+                size={6}
+                style={{ width: "100%" }}
+              >
+                <Typography.Text type="secondary">
+                  当前模式：
+                  {linuxServiceStatus?.mode === "dev"
+                    ? " 开发态服务（waterayd-dev.service）"
+                    : " 正式服务（waterayd.service）"}
+                </Typography.Text>
+                <Space
+                  wrap
+                  size={12}
+                >
+                  <Typography.Text type={linuxServiceStatus?.installed ? undefined : "secondary"}>
+                    <BiIcon
+                      name={loadingLinuxServiceStatus ? "arrow-repeat" : (linuxServiceStatus?.installed ? "check-circle-fill" : "x-circle-fill")}
+                      spin={loadingLinuxServiceStatus}
+                    />{" "}
+                    服务{loadingLinuxServiceStatus ? "检查中" : (linuxServiceStatus?.installed ? "已安装" : "未安装")}
+                  </Typography.Text>
+                  <Typography.Text type={linuxServiceStatus?.enabled ? undefined : "secondary"}>
+                    <BiIcon name={linuxServiceStatus?.enabled ? "check-circle-fill" : "x-circle-fill"} />{" "}
+                    开机启动{linuxServiceStatus?.enabled ? "已启用" : "未启用"}
+                  </Typography.Text>
+                  <Typography.Text type={linuxServiceStatus?.active ? undefined : "secondary"}>
+                    <BiIcon name={linuxServiceStatus?.active ? "check-circle-fill" : "x-circle-fill"} />{" "}
+                    服务进程{linuxServiceStatus?.active ? "运行中" : "未运行"}
+                  </Typography.Text>
+                  <Typography.Text type={linuxServiceStatus?.daemonReachable ? undefined : "secondary"}>
+                    <BiIcon
+                      name={linuxServiceStatus?.daemonReachable ? "check-circle-fill" : "x-circle-fill"}
+                    />{" "}
+                    控制面{linuxServiceStatus?.daemonReachable ? "已就绪" : "未就绪"}
+                  </Typography.Text>
+                </Space>
+                {linuxServiceStatus ? (
+                  <Typography.Text type="secondary">
+                    systemd：{linuxServiceStatus.unitFileState || "unknown"} /{" "}
+                    {linuxServiceStatus.activeState || "unknown"} /{" "}
+                    {linuxServiceStatus.subState || "unknown"}
+                  </Typography.Text>
+                ) : null}
+                {!linuxServiceStatus?.manageSupported ? (
+                  <Typography.Text type="secondary">
+                    当前环境未找到可用的 Linux 服务脚本，暂时无法从前端管理服务。
+                  </Typography.Text>
+                ) : null}
+                <Space
+                  wrap
+                  size={8}
+                >
+                  <Button
+                    type="primary"
+                    loading={linuxServiceBusyAction === "install"}
+                    disabled={linuxServiceBusy || !linuxServiceStatus?.manageSupported}
+                    onClick={() => {
+                      void installOrRepairLinuxService();
+                    }}
+                  >
+                    {linuxServiceStatus?.installed ? "安装/修复服务" : "安装并启动服务"}
+                  </Button>
+                  <Button
+                    danger
+                    loading={linuxServiceBusyAction === "uninstall"}
+                    disabled={
+                      linuxServiceBusy ||
+                      !linuxServiceStatus?.manageSupported ||
+                      !linuxServiceStatus?.installed
+                    }
+                    onClick={() => {
+                      void uninstallLinuxService();
+                    }}
+                  >
+                    卸载服务
+                  </Button>
+                  <Button
+                    loading={linuxServiceBusyAction === "refresh" || loadingLinuxServiceStatus}
+                    disabled={linuxServiceBusyAction === "install" || linuxServiceBusyAction === "uninstall"}
+                    onClick={() => {
+                      void refreshLinuxServiceStatus(false);
+                    }}
+                  >
+                    刷新状态
+                  </Button>
+                </Space>
+              </Space>
+            </>
+          ) : null}
         </Space>
         <Space
           size={10}

@@ -14,4 +14,5 @@ TARGET = DesktopBuildTarget(
     frontend_entry_name="WaterayApp",
     tauri_binary_name="wateray_tauri",
     icon_path="../scripts/build/assets/linux/wateray.png",
+    desktop_bundle_supported=True,
 )

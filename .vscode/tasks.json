@@ -41,6 +41,13 @@
         "run",
         "dev"
       ],
+      "linux": {
+        "command": "/bin/bash",
+        "args": [
+          "-lc",
+          "source \"$HOME/.cargo/env\" && exec npm run dev"
+        ]
+      },
       "windows": {
         "command": "python",
         "args": [
@@ -142,6 +149,13 @@
       "label": "客户端：开发：运行 VPN 内核",
       "type": "shell",
       "command": "python scripts/dev/run_waterayd.py",
+      "linux": {
+        "command": "/bin/bash",
+        "args": [
+          "-lc",
+          "exec python3 scripts/dev/run_waterayd.py"
+        ]
+      },
       "options": {
         "cwd": "${workspaceFolder}"
       },
@@ -158,6 +172,13 @@
       "label": "客户端：构建：当前平台客户端",
       "type": "shell",
       "command": "python scripts/build/targets/build_current_platform_client.py",
+      "linux": {
+        "command": "/bin/bash",
+        "args": [
+          "-lc",
+          "source \"$HOME/.cargo/env\" && exec python3 scripts/build/targets/build_current_platform_client.py"
+        ]
+      },
       "options": {
         "cwd": "${workspaceFolder}"
       },
@@ -311,14 +332,11 @@
       }
     },
     {
-      "label": "私有源码：提交并推送指定分支",
+      "label": "私有源码：推送到指定分支",
       "type": "shell",
-      "command": "python scripts/git/private_source_tasks.py commit-push-main --remote \"${input:githubPrivateRemoteName}\" --branch \"${input:githubPrivateTargetBranch}\"",
+      "command": "python scripts/git/private_source_tasks.py push-main --remote \"${input:githubPrivateRemoteName}\" --branch \"${input:githubPrivateTargetBranch}\"",
       "options": {
-        "cwd": "${workspaceFolder}",
-        "env": {
-          "WATERAY_GIT_COMMIT_MESSAGE": "${input:gitCommitMessage}"
-        }
+        "cwd": "${workspaceFolder}"
       },
       "problemMatcher": [],
       "presentation": {
@@ -331,6 +349,13 @@
       "label": "公开发布：上传当前平台产物到 GitHub",
       "type": "shell",
       "command": "python scripts/release/build_and_upload_current_platform_release.py --repo \"${input:githubPublicRepo}\" --release-root-dir \"Bin/github-staging-release\"",
+      "linux": {
+        "command": "/bin/bash",
+        "args": [
+          "-lc",
+          "source \"$HOME/.cargo/env\" && exec python3 scripts/release/build_and_upload_current_platform_release.py --repo \"${input:githubPublicRepo}\" --release-root-dir \"Bin/github-staging-release\""
+        ]
+      },
       "options": {
         "cwd": "${workspaceFolder}"
       },
@@ -345,6 +370,13 @@
       "label": "公开发布：触发 GitHub 汇总发布",
       "type": "shell",
       "command": "python scripts/release/dispatch_github_release_workflow.py --public-repo \"${input:githubPublicRepo}\"",
+      "linux": {
+        "command": "/bin/bash",
+        "args": [
+          "-lc",
+          "exec python3 scripts/release/dispatch_github_release_workflow.py --public-repo \"${input:githubPublicRepo}\""
+        ]
+      },
       "options": {
         "cwd": "${workspaceFolder}"
       },

@@ -40,13 +40,15 @@ DEB_INSTALL_DIR = "/opt/wateray"
 DEB_DATA_ROOT = "/var/lib/wateray"
 HELPER_INSTALL_PATH = "/usr/local/libexec/wateray/wateray-service-helper"
 HELPER_ASSET_DIR = "/usr/local/share/wateray/linux"
-HELPER_DESKTOP_PATH = "/usr/local/share/applications/wateray.desktop"
+LINUX_DESKTOP_FILE_NAME = "com.wateray.desktop.desktop"
+LEGACY_HELPER_DESKTOP_PATH = "/usr/local/share/applications/wateray.desktop"
+HELPER_DESKTOP_PATH = f"/usr/local/share/applications/{LINUX_DESKTOP_FILE_NAME}"
 HELPER_ICON_PATH = "/usr/local/share/icons/hicolor/128x128/apps/wateray.png"
 POLKIT_POLICY_PATH = "/usr/share/polkit-1/actions/net.wateray.daemon.policy"
 SERVICE_UNIT_PATH = "/etc/systemd/system/waterayd.service"
 APPIMAGE_OUTPUT_NAME_TEMPLATE = "Wateray-linux-v{version}-x86_64.AppImage"
 DEB_OUTPUT_NAME_TEMPLATE = "wateray_{version}_amd64.deb"
-APPIMAGE_DESKTOP_NAME = "wateray.desktop"
+APPIMAGE_DESKTOP_NAME = LINUX_DESKTOP_FILE_NAME
 APPIMAGE_ICON_NAME = "wateray.png"
 APPIMAGE_DIRICON_NAME = ".DirIcon"
 APPIMAGE_APPDIR_NAME = "Wateray.AppDir"
@@ -100,10 +102,80 @@ def read_version() -> str:
     return version
 
 
-def ensure_linux_bundle(skip_build: bool) -> Path:
-    raise LinuxPackageError(
-        "Linux 安装包构建尚未迁移到 Tauri；当前阶段仅正式支持 Windows 桌面构建。"
+def ensure_file_exists(path: Path, label: str) -> None:
+    if path.exists() and path.is_file():
+        return
+    raise LinuxPackageError(f"{label} 不存在：{path}")
+
+
+def ensure_dir_exists(path: Path, label: str) -> None:
+    if path.exists() and path.is_dir():
+        return
+    raise LinuxPackageError(f"{label} 不存在：{path}")
+
+
+def ensure_executable_file(path: Path, label: str) -> None:
+    ensure_file_exists(path, label)
+    if os.access(path, os.X_OK):
+        return
+    make_executable(path)
+
+
+def validate_linux_bundle(source_dir: Path, version: str) -> None:
+    ensure_dir_exists(source_dir, "Linux 客户端目录产物")
+    bundle_version_path = source_dir / "VERSION"
+    ensure_file_exists(bundle_version_path, "Linux 客户端版本文件")
+    bundle_version = bundle_version_path.read_text(encoding="utf-8").strip()
+    if bundle_version != version:
+        raise LinuxPackageError(
+            f"Linux 客户端目录产物版本不一致：{bundle_version!r} != {version!r}"
+        )
+
+    ensure_executable_file(source_dir / "WaterayApp", "Linux 前端可执行文件")
+    ensure_executable_file(source_dir / "core" / "waterayd", "Linux 内核可执行文件")
+    ensure_dir_exists(source_dir / "default-config", "Linux 默认配置目录")
+    ensure_dir_exists(source_dir / "linux", "Linux 集成资源目录")
+
+    ensure_executable_file(
+        source_dir / "linux" / "install-system-service.sh",
+        "Linux 服务安装脚本",
     )
+    ensure_executable_file(
+        source_dir / "linux" / "wateray-service-helper.sh",
+        "Linux root helper 脚本",
+    )
+    ensure_file_exists(
+        source_dir / "linux" / "wateray.desktop.template",
+        "Linux desktop 模板",
+    )
+    ensure_file_exists(
+        source_dir / "linux" / "waterayd.service.template",
+        "Linux packaged service 模板",
+    )
+    ensure_file_exists(
+        source_dir / "linux" / "waterayd-dev.service.template",
+        "Linux dev service 模板",
+    )
+    ensure_file_exists(
+        source_dir / "linux" / "net.wateray.daemon.policy",
+        "Linux polkit policy",
+    )
+    ensure_file_exists(source_dir / "linux" / "wateray.png", "Linux 图标资源")
+
+
+def ensure_linux_bundle(skip_build: bool, version: str) -> Path:
+    source_dir = LINUX_TARGET.bin_dir
+    if skip_build:
+        print_step("复用现有 Linux 目录产物")
+    else:
+        print_step("构建 Linux 目录产物")
+        build_exit_code = build_desktop_target(LINUX_TARGET)
+        if build_exit_code != 0:
+            raise LinuxPackageError(
+                f"Linux 目录产物构建失败，请先修复构建问题（exit_code={build_exit_code}）"
+            )
+    validate_linux_bundle(source_dir, version)
+    return source_dir
 
 
 def reset_directory(path: Path) -> None:
@@ -220,6 +292,7 @@ def build_deb_postrm() -> str:
           rm -f "{SERVICE_UNIT_PATH}"
           rm -f "{HELPER_INSTALL_PATH}"
           rm -f "{HELPER_DESKTOP_PATH}"
+          rm -f "{LEGACY_HELPER_DESKTOP_PATH}"
           rm -f "{HELPER_ICON_PATH}"
           rm -f "{POLKIT_POLICY_PATH}"
           rm -rf "{HELPER_ASSET_DIR}"
@@ -411,7 +484,7 @@ def main() -> int:
     try:
         ensure_linux_host()
         version = read_version()
-        source_dir = ensure_linux_bundle(skip_build=args.skip_build)
+        source_dir = ensure_linux_bundle(skip_build=args.skip_build, version=version)
 
         reset_directory(PACKAGE_OUTPUT_DIR)
         artifacts: list[Path] = []

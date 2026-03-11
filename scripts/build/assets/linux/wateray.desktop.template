@@ -9,5 +9,5 @@ Icon=__WATERAY_ICON__
 Terminal=false
 Categories=Network;
 StartupNotify=true
-StartupWMClass=wateray
-X-GNOME-WMClass=wateray
+StartupWMClass=com.wateray.desktop
+X-GNOME-WMClass=com.wateray.desktop

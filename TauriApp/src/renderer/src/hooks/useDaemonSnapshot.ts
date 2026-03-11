@@ -46,6 +46,7 @@ export function useDaemonSnapshot(options: UseDaemonSnapshotOptions = {}) {
   const lastRuntimeApplyEventTsRef = useRef<number>(0);
   const lastTaskQueueEventTsRef = useRef<number>(0);
   const lastOperationEventTsRef = useRef<number>(0);
+  const lastTransportRecoveryRefreshTsRef = useRef<number>(0);
   const sessionIDRef = useRef<string>(createClientSessionID());
   const sessionDisconnectedRef = useRef(false);
 
@@ -320,6 +321,30 @@ export function useDaemonSnapshot(options: UseDaemonSnapshotOptions = {}) {
       );
     };
   }, [applyPushEvent, refresh]);
+
+  useEffect(() => {
+    if (!transport.daemonReachable) {
+      return;
+    }
+    if (snapshot && error.trim() === "") {
+      return;
+    }
+    const transportTimestamp = Math.max(0, Number(transport.timestampMs ?? 0));
+    if (transportTimestamp <= 0) {
+      return;
+    }
+    if (transportTimestamp <= lastTransportRecoveryRefreshTsRef.current) {
+      return;
+    }
+    lastTransportRecoveryRefreshTsRef.current = transportTimestamp;
+    void refresh();
+  }, [
+    error,
+    refresh,
+    snapshot,
+    transport.daemonReachable,
+    transport.timestampMs,
+  ]);
 
   useEffect(() => {
     void daemonApi.setLogStreamEnabled(includeLogs).catch(() => {

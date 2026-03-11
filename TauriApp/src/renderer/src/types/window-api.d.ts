@@ -5,6 +5,23 @@ import type {
   TransportStatus,
 } from "../../../shared/daemon";
 
+type LinuxServiceMode = "dev" | "packaged";
+
+interface LinuxServiceStatus {
+  mode: LinuxServiceMode;
+  serviceName: string;
+  installed: boolean;
+  enabled: boolean;
+  active: boolean;
+  daemonReachable: boolean;
+  helperInstalled: boolean;
+  policyInstalled: boolean;
+  manageSupported: boolean;
+  unitFileState: string;
+  activeState: string;
+  subState: string;
+}
+
 interface WaterayDesktopApi {
   window: {
     minimize: () => Promise<void>;
@@ -34,6 +51,11 @@ interface WaterayDesktopApi {
     writeClipboardText: (content: string) => Promise<void>;
     readClipboardFilePaths: () => Promise<string[]>;
     writeClipboardFile: (path: string) => Promise<{ mode: string }>;
+    linuxService: {
+      getStatus: () => Promise<LinuxServiceStatus>;
+      installOrRepair: () => Promise<LinuxServiceStatus>;
+      uninstall: () => Promise<LinuxServiceStatus>;
+    };
   };
 }
 

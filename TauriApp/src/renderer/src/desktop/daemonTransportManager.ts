@@ -8,6 +8,7 @@ import type {
 } from "@shared/daemon";
 
 import { getDaemonWebSocketURL, requestDaemon } from "./daemonClient";
+import { syncLinuxSystemProxyFromSnapshot } from "./linuxSystemProxySync";
 
 type PushListener = (event: DaemonPushEvent) => void;
 
@@ -66,6 +67,8 @@ class DaemonTransportManager {
 
   private recoveryInFlight = false;
 
+  private recoverySuppressed = false;
+
   private listeners = new Set<PushListener>();
 
   private status: TransportStatus = {
@@ -108,8 +111,19 @@ class DaemonTransportManager {
     return { ...this.status };
   }
 
+  suspendRecovery(): void {
+    this.recoverySuppressed = true;
+  }
+
+  resumeRecovery(): void {
+    this.recoverySuppressed = false;
+  }
+
   async request(payload: DaemonRequestPayload): Promise<DaemonResponsePayload> {
     const response = await requestDaemon(payload);
+    if (response.snapshot) {
+      void syncLinuxSystemProxyFromSnapshot(response.snapshot);
+    }
     if (response.ok) {
       this.markRequestSuccess();
       return {
@@ -202,6 +216,9 @@ class DaemonTransportManager {
       this.lastRevision = pushEvent.revision;
     }
     this.markPushSuccess();
+    if (pushEvent.payload.snapshot) {
+      void syncLinuxSystemProxyFromSnapshot(pushEvent.payload.snapshot);
+    }
     this.broadcast(pushEvent);
   }
 
@@ -244,6 +261,9 @@ class DaemonTransportManager {
   }
 
   private async maybeRecoverDaemon(): Promise<void> {
+    if (this.recoverySuppressed) {
+      return;
+    }
     if (this.recoveryInFlight) {
       return;
     }

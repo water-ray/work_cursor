@@ -5,7 +5,6 @@ import type { DaemonSnapshot, ProxyMode, VpnConnectionStage } from "../../../../
 import { CountryFlag } from "../flag/CountryFlag";
 import { BiIcon } from "../icons/BiIcon";
 import { useAppNotice, useAppNoticeHistory } from "../notify/AppNoticeProvider";
-import { daemonApi } from "../../services/daemonApi";
 import { resolveCountryMetadata } from "../../app/data/countryMetadata";
 import {
   type CloseBehavior,
@@ -15,7 +14,7 @@ import {
 } from "../../app/settings/uiPreferences";
 import {
   buildServiceStartedMessage,
-  resolveModeLabel,
+  restartServiceWithFeedback,
   startServiceWithSmartOptimize,
   stopServiceWithFeedback,
 } from "../../services/serviceControl";
@@ -361,8 +360,10 @@ export function WindowTitleBar({
     setRestartingService(true);
     setOptimisticConnectionStage("connecting");
     try {
-      const nextSnapshot = await runAction(() => daemonApi.restartConnection());
-      notice.success(`服务已刷新（${resolveModeLabel(nextSnapshot.proxyMode)}）`);
+      await restartServiceWithFeedback({
+        runAction,
+        notice,
+      });
     } catch (error) {
       setOptimisticConnectionStage(null);
       notice.error(error instanceof Error ? error.message : "刷新服务失败");

@@ -1,8 +1,8 @@
 # CHANGELOG_LATEST
 
-## v1.1.2
-- 生成时间：2026-03-11 12:12:35
-- 版本升级：patch
+## v1.2.0
+- 生成时间：2026-03-12 01:12:37
+- 版本升级：minor
 - 基线标签：无（首次生成）
 
 ### Features
@@ -15,7 +15,12 @@
 - 无
 
 ### Others
+- chore: 增加推送自定义分支任务 (3b19cc2)
+- Merge pull request #3 from water-ray/Tauri-1.0.0 (78f780b)
+- chore: 修复Windows启动内核问题 (4fcb114)
+- Merge pull request #2 from water-ray/Tauri-1.0.0 (119a62c)
 - chore: 优化任务菜单 (60fbb4f)
+- Merge pull request #1 from water-ray/Tauri-1.0.0 (044abb5)
 - chore: 修改客户端引擎为Truri,优化windows托盘图标 (51a62fb)
 - chore: 修改客户端引擎,优化windows托盘图标 (7e3f090)
 - chore:自动发布摘要修复 (85d9bc1)

@@ -105,7 +105,8 @@ docs/            # 架构、测试与设计文档
 - 构建当前宿主机平台客户端：
   - `客户端：构建：当前平台客户端`
   - Windows 会生成 `Bin/Wateray-windows`
-  - Linux / macOS 的 Tauri 打包链在后续阶段补齐，当前优先完成 Windows 正式产物
+  - Linux 会生成 `Bin/Wateray-linux`
+  - macOS 的 Tauri 打包链仍在后续阶段补齐；正式公开发布当前仍优先支持 Windows
 - 广告端本地发布到 `Bin/adsroot`：
   - `广告端：本地发布：前后端整套到 Bin/adsroot`
 - GitHub 公开发布只面向 VPN 客户端：

@@ -4953,14 +4953,27 @@ func (s *RuntimeStore) restartNow(ctx context.Context) (StateSnapshot, error) {
 	s.ensureValidLocked()
 	previous := cloneSnapshot(s.state)
 	currentMode := s.state.ProxyMode
+	targetMode := currentMode
+	if currentMode != ProxyModeOff {
+		targetMode = normalizeConfiguredProxyMode(s.state.ConfiguredProxyMode)
+		applyProxyModeToState(&s.state, targetMode)
+	}
 	s.state.ConnectionStage = ConnectionConnecting
 	if err := s.ensureTaskProxyPortLocked(s.state.LocalProxyPort); err == nil {
 		s.runtime.ConfigureInternalProxyPort(s.taskProxyPort)
 	}
-	if currentMode == ProxyModeOff {
+	if targetMode == ProxyModeOff {
 		s.appendCoreLogLocked(LogLevelInfo, "restart service requested: minimal runtime mode")
 	} else {
-		s.appendCoreLogLocked(LogLevelInfo, fmt.Sprintf("restart service requested: proxy mode=%s", currentMode))
+		s.appendCoreLogLocked(
+			LogLevelInfo,
+			fmt.Sprintf(
+				"restart service requested: currentProxyMode=%s targetProxyMode=%s configuredProxyMode=%s",
+				currentMode,
+				targetMode,
+				s.state.ConfiguredProxyMode,
+			),
+		)
 	}
 	_ = s.saveLocked()
 	snapshot := cloneSnapshot(s.state)
@@ -4968,7 +4981,7 @@ func (s *RuntimeStore) restartNow(ctx context.Context) (StateSnapshot, error) {
 
 	restartSnapshot := snapshot
 	rollbackSnapshot := previous
-	if currentMode == ProxyModeOff {
+	if targetMode == ProxyModeOff {
 		restartSnapshot = buildMinimalProbeRuntimeSnapshot(snapshot)
 		rollbackSnapshot = buildMinimalProbeRuntimeSnapshot(previous)
 	}
@@ -5036,7 +5049,7 @@ func (s *RuntimeStore) restartNow(ctx context.Context) (StateSnapshot, error) {
 		return result, err
 	}
 	s.state.ConnectionStage = ConnectionConnected
-	if currentMode == ProxyModeOff {
+	if targetMode == ProxyModeOff {
 		s.state.ProxyStartedAtMS = 0
 	} else {
 		s.state.ProxyStartedAtMS = time.Now().UnixMilli()
@@ -5060,10 +5073,13 @@ func (s *RuntimeStore) restartNow(ctx context.Context) (StateSnapshot, error) {
 		false,
 		nil,
 	)
-	if currentMode == ProxyModeOff {
+	if targetMode == ProxyModeOff {
 		s.appendCoreLogLocked(LogLevelInfo, "restart service success: minimal runtime mode")
 	} else {
-		s.appendCoreLogLocked(LogLevelInfo, fmt.Sprintf("restart service success: proxy mode=%s", currentMode))
+		s.appendCoreLogLocked(
+			LogLevelInfo,
+			fmt.Sprintf("restart service success: proxy mode=%s", targetMode),
+		)
 	}
 	_ = s.saveLocked()
 	result := cloneSnapshot(s.state)
