@@ -8427,10 +8427,61 @@ func (s *RuntimeStore) loadWithExecutablePath(executablePath string) (stateBoots
 			continue
 		}
 		s.applyLoadedSnapshot(bundledSnapshot)
+		seedBundledRuleSetStorageIfNeeded(executablePath)
 		_ = persistSnapshotToFile(s.stateFile, s.state)
 		return stateBootstrapSourceBundledDefault, nil
 	}
 	return stateBootstrapSourceKernelDefault, nil
+}
+
+func seedBundledRuleSetStorageIfNeeded(executablePath string) {
+	localDir := strings.TrimSpace(resolveRuleSetStorageDir())
+	if localDir == "" {
+		return
+	}
+	if entries, err := os.ReadDir(localDir); err == nil {
+		if len(entries) > 0 {
+			return
+		}
+	} else if !os.IsNotExist(err) {
+		return
+	}
+	for _, bundledDir := range resolveBundledRuleSetStorageDirCandidatesWithExecutablePath(executablePath) {
+		bundledInfo, err := os.Stat(bundledDir)
+		if err != nil || !bundledInfo.IsDir() {
+			continue
+		}
+		if copyErr := copyDirectoryContents(bundledDir, localDir); copyErr == nil {
+			return
+		}
+	}
+}
+
+func copyDirectoryContents(sourceDir string, targetDir string) error {
+	return filepath.Walk(sourceDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		relativePath, err := filepath.Rel(sourceDir, path)
+		if err != nil {
+			return err
+		}
+		if relativePath == "." {
+			return os.MkdirAll(targetDir, 0o755)
+		}
+		targetPath := filepath.Join(targetDir, relativePath)
+		if info.IsDir() {
+			return os.MkdirAll(targetPath, 0o755)
+		}
+		if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+			return err
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(targetPath, content, 0o644)
+	})
 }
 
 func isSupportedBundledSnapshotSchemaVersion(schemaVersion int) bool {
@@ -8536,7 +8587,7 @@ func resolveBundledInstallDirCandidates(executablePath string) []string {
 			current := filepath.Clean(cwd)
 			for depth := 0; depth < 4; depth++ {
 				appendDir(current)
-				appendDir(filepath.Join(current, "ElectronApp"))
+				appendDir(filepath.Join(current, "TauriApp"))
 				parent := filepath.Dir(current)
 				if parent == current {
 					break

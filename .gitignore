@@ -18,11 +18,10 @@ core/*.test
 core/coverage.out
 core/cmd/waterayd/zz_wateray_server_windows_amd64.syso
 
-# Electron / Node
-ElectronApp/node_modules/
-ElectronApp/out/
-ElectronApp/.electron-vite/
-ElectronApp/out-package/
+# Tauri / Node
+TauriApp/node_modules/
+TauriApp/dist/
+TauriApp/src-tauri/target/
 ads-server/
 adsroot/server/node_modules/
 adsroot/server/dist/

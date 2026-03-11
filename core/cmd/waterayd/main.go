@@ -25,8 +25,16 @@ import (
 
 const defaultUnifiedVersion = "0.1.0"
 const daemonListenAddr = "127.0.0.1:39080"
-const daemonDefaultOrigin = "http://127.0.0.1:39080"
-const daemonLocalhostOrigin = "http://localhost:39080"
+
+var trustedDesktopOrigins = map[string]struct{}{
+	"http://127.0.0.1:39080":  {},
+	"http://localhost:39080":  {},
+	"http://127.0.0.1:1420":   {},
+	"http://localhost:1420":   {},
+	"tauri://localhost":       {},
+	"http://tauri.localhost":  {},
+	"https://tauri.localhost": {},
+}
 
 var (
 	appVersion          string
@@ -901,8 +909,7 @@ func allowTrustedLocalRequest(w http.ResponseWriter, r *http.Request) bool {
 	}
 	originRaw := strings.TrimSpace(r.Header.Get("Origin"))
 	if originRaw != "" {
-		origin, ok := normalizeOrigin(originRaw)
-		if !ok || (origin != daemonDefaultOrigin && origin != daemonLocalhostOrigin) {
+		if !isTrustedDesktopOrigin(originRaw) {
 			writeError(w, http.StatusForbidden, "forbidden origin")
 			return false
 		}
@@ -915,6 +922,15 @@ func allowTrustedLocalRequest(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
+func isTrustedDesktopOrigin(raw string) bool {
+	origin, ok := normalizeOrigin(raw)
+	if !ok {
+		return false
+	}
+	_, trusted := trustedDesktopOrigins[origin]
+	return trusted
+}
+
 func normalizeOrigin(raw string) (string, bool) {
 	parsed, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {
@@ -924,7 +940,7 @@ func normalizeOrigin(raw string) (string, bool) {
 		return "", false
 	}
 	scheme := strings.ToLower(strings.TrimSpace(parsed.Scheme))
-	if scheme != "http" && scheme != "https" {
+	if scheme != "http" && scheme != "https" && scheme != "tauri" {
 		return "", false
 	}
 	host := strings.ToLower(strings.TrimSpace(parsed.Host))
@@ -1233,7 +1249,12 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 }
 
 func serveEventStreamWS(w http.ResponseWriter, r *http.Request, store *control.RuntimeStore) {
-	conn, err := websocket.Accept(w, r, nil)
+	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+		// Requests already passed allowTrustedLocalRequest, which validates the
+		// full Wateray desktop origin allowlist for both Tauri dev and packaged
+		// runtimes. Skip the library's secondary host-only origin check here.
+		InsecureSkipVerify: true,
+	})
 	if err != nil {
 		return
 	}

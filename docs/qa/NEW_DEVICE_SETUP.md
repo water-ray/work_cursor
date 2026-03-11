@@ -7,7 +7,7 @@
 - 仓库：`water-ray/wateray-src`
 - 平台：优先 Windows 开发环境
 - 代码结构：
-  - `ElectronApp/`
+  - `TauriApp/`
   - `core/`
   - `adsroot/server/`
   - `adsroot/web/`
@@ -20,6 +20,7 @@
 - `go`（建议 `1.24+`）
 - `node`（建议 `20+`）
 - `npm`
+- `cargo` / `rustc`
 - `Python 3`
 - 可选：`GitHub CLI (gh)`
 
@@ -61,10 +62,10 @@ cd wateray-src
 
 ## 3. 安装依赖
 
-### Electron 客户端
+### Tauri 客户端
 
 ```powershell
-cd ElectronApp
+cd TauriApp
 npm install
 cd ..
 ```
@@ -96,10 +97,10 @@ cd core
 go run -tags with_clash_api,with_gvisor,with_quic ./cmd/waterayd
 ```
 
-启动 Electron 前端：
+启动 Tauri 前端：
 
 ```powershell
-cd ElectronApp
+cd TauriApp
 npm run dev
 ```
 
@@ -121,10 +122,11 @@ npm run dev
 
 常用任务入口：
 
-- `客户端：开发：运行桌面整套`
+- `客户端：开发：运行 VPN 内核`
+- `客户端：开发：运行 Tauri 前端`
 - `广告端：开发：运行服务端`
 - `广告端：开发：运行前端`
-- `客户端：检查：Electron 类型检查`
+- `客户端：检查：Tauri 类型检查`
 
 ## 5. 生产构建
 
@@ -136,7 +138,7 @@ python scripts/build/targets/desktop.py --platform windows
 
 或使用 VS Code 任务：
 
-- `客户端：构建：Windows 客户端整包`
+- `客户端：构建：当前平台客户端`
 
 ### 构建广告发布包
 
@@ -156,17 +158,17 @@ GitHub 公开发布只面向 VPN 客户端，不包含广告前后端。
 
 如果已经完成客户端构建，可直接生成 GitHub Release 素材：
 
-- `GitHub：公开发布：构建并生成客户端 Release 素材`
+- `公开发布：上传当前平台产物到 GitHub`
 
 生成目录：
 
-- `Bin/github-release/vX.Y.Z`
+- `Bin/github-staging-release/vX.Y.Z`
 
 其中会包含：
 
-- 各平台正式资产
+- 当前阶段正式资产
   - Windows：客户端 zip
-  - Linux：客户端 zip、`.deb`、`AppImage`
+  - Linux / macOS：Tauri 打包链待补齐
 - `SHA256SUMS.txt`
 - `latest.json`
 - `latest-github.json`

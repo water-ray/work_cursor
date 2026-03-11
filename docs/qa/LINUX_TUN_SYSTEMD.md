@@ -5,25 +5,26 @@
 ## 目标模型
 
 - `waterayd` 以高权限 `systemd` 服务运行
-- Electron UI 保持普通用户运行
+- Tauri UI 保持普通用户运行
 - 首次安装或修复时，通过 `polkit/pkexec` 进行一次管理员授权
 - UI 关闭后，Linux daemon 不会被主动停止
 
 ## 开发态
 
-推荐直接使用 VS Code 任务：
+推荐依次使用 VS Code 任务：
 
-- `客户端：开发：运行桌面整套`
+- `客户端：开发：运行 VPN 内核`
+- `客户端：开发：运行 Tauri 前端`
 
-Linux 下该任务会：
+Linux 下这套开发流程会：
 
 1. 调用 `scripts/dev/run_waterayd.py`
 2. 构建开发用 bundle 到 `Bin/.tmp/wateray-linux-dev`
 3. 通过 `pkexec` 调用 `scripts/build/assets/linux/wateray-service-helper.sh`
 4. 安装或重启 `waterayd-dev.service`
-5. 启动 Electron 前端
+5. 启动 Tauri 前端
 
-首次授权成功后，Electron 会连接 `http://127.0.0.1:39080`。
+首次授权成功后，Tauri 客户端会连接 `http://127.0.0.1:39080`。
 
 ## 打包态
 
@@ -87,7 +88,7 @@ chmod +x ./Bin/Wateray-linux-packages/Wateray-linux-v<version>-x86_64.AppImage
 
 - `waterayd.service`
 
-之后普通用户直接启动 Electron UI 即可；若服务缺失或配置漂移，UI 会尝试再次通过 helper 修复。
+之后普通用户直接启动 Tauri UI 即可；若服务缺失或配置漂移，UI 会尝试再次通过 helper 修复。
 
 ## 支持范围
 

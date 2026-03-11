@@ -13,8 +13,8 @@ from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 VERSION_FILE = ROOT_DIR / "VERSION"
-ELECTRON_PACKAGE_JSON = ROOT_DIR / "ElectronApp" / "package.json"
-ELECTRON_PACKAGE_LOCK = ROOT_DIR / "ElectronApp" / "package-lock.json"
+TAURI_PACKAGE_JSON = ROOT_DIR / "TauriApp" / "package.json"
+TAURI_PACKAGE_LOCK = ROOT_DIR / "TauriApp" / "package-lock.json"
 CHANGELOG_LATEST_FILE = ROOT_DIR / "docs" / "build" / "CHANGELOG_LATEST.md"
 
 SEMVER_PATTERN = re.compile(r"^\d+\.\d+\.\d+$")
@@ -56,25 +56,25 @@ def write_text(path: Path, content: str) -> None:
 
 
 def update_package_json(version: str) -> None:
-    payload = json.loads(ELECTRON_PACKAGE_JSON.read_text(encoding="utf-8"))
+    payload = json.loads(TAURI_PACKAGE_JSON.read_text(encoding="utf-8"))
     payload["version"] = version
-    ELECTRON_PACKAGE_JSON.write_text(
+    TAURI_PACKAGE_JSON.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
 
 
 def update_package_lock(version: str) -> None:
-    if not ELECTRON_PACKAGE_LOCK.exists():
+    if not TAURI_PACKAGE_LOCK.exists():
         return
-    payload = json.loads(ELECTRON_PACKAGE_LOCK.read_text(encoding="utf-8"))
+    payload = json.loads(TAURI_PACKAGE_LOCK.read_text(encoding="utf-8"))
     payload["version"] = version
     packages = payload.get("packages")
     if isinstance(packages, dict):
         root_package = packages.get("")
         if isinstance(root_package, dict):
             root_package["version"] = version
-    ELECTRON_PACKAGE_LOCK.write_text(
+    TAURI_PACKAGE_LOCK.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
@@ -186,7 +186,7 @@ def render_latest_changelog(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Bump VERSION + sync Electron version + generate latest changelog.",
+        description="Bump VERSION + sync Tauri desktop version + generate latest changelog.",
     )
     parser.add_argument(
         "bump",
@@ -218,9 +218,9 @@ def main() -> int:
         print(f"[dry-run] VERSION: {current_version} -> {next_version}")
         print("[dry-run] 将更新：")
         print(f"- {VERSION_FILE}")
-        print(f"- {ELECTRON_PACKAGE_JSON}")
-        if ELECTRON_PACKAGE_LOCK.exists():
-            print(f"- {ELECTRON_PACKAGE_LOCK}")
+        print(f"- {TAURI_PACKAGE_JSON}")
+        if TAURI_PACKAGE_LOCK.exists():
+            print(f"- {TAURI_PACKAGE_LOCK}")
         print(f"- {CHANGELOG_LATEST_FILE}")
         return 0
 

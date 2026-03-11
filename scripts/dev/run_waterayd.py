@@ -14,7 +14,7 @@ from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 CORE_DIR = ROOT_DIR / "core"
-ELECTRON_DIR = ROOT_DIR / "ElectronApp"
+TAURI_DIR = ROOT_DIR / "TauriApp"
 VERSION_PATH = ROOT_DIR / "VERSION"
 LINUX_HELPER_PATH = (
     ROOT_DIR / "scripts" / "build" / "assets" / "linux" / "wateray-service-helper.sh"
@@ -67,8 +67,7 @@ def prepare_linux_dev_bundle() -> Path:
     exit_code = run_command(go_command, cwd=CORE_DIR)
     if exit_code != 0:
         raise SystemExit(exit_code)
-    sync_tree(ELECTRON_DIR / "rule-set", LINUX_DEV_INSTALL_DIR / "rule-set")
-    default_config_dir = ELECTRON_DIR / "default-config"
+    default_config_dir = TAURI_DIR / "default-config"
     if default_config_dir.exists():
         sync_tree(default_config_dir, LINUX_DEV_INSTALL_DIR / "default-config")
     shutil.copy2(VERSION_PATH, LINUX_DEV_INSTALL_DIR / "VERSION")

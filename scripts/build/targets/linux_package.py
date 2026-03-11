@@ -101,25 +101,9 @@ def read_version() -> str:
 
 
 def ensure_linux_bundle(skip_build: bool) -> Path:
-    source_dir = LINUX_TARGET.bin_dir
-    if not skip_build:
-        print_step("构建 Linux 原始目录产物")
-        exit_code = build_desktop_target(LINUX_TARGET)
-        if exit_code != 0:
-            raise LinuxPackageError(f"基础 Linux 构建失败，exit_code={exit_code}")
-    required_paths = [
-        source_dir,
-        source_dir / "WaterayApp",
-        source_dir / "core" / "waterayd",
-        source_dir / "linux" / "install-system-service.sh",
-        source_dir / "linux" / "wateray-service-helper.sh",
-        source_dir / "linux" / "wateray.png",
-    ]
-    missing = [path for path in required_paths if not path.exists()]
-    if missing:
-        formatted = ", ".join(str(path) for path in missing)
-        raise LinuxPackageError(f"Linux 原始目录产物不完整：{formatted}")
-    return source_dir
+    raise LinuxPackageError(
+        "Linux 安装包构建尚未迁移到 Tauri；当前阶段仅正式支持 Windows 桌面构建。"
+    )
 
 
 def reset_directory(path: Path) -> None:
@@ -170,9 +154,9 @@ def build_deb_control(version: str, installed_size_kib: int) -> str:
         Installed-Size: {installed_size_kib}
         Depends: {DEB_DEPENDS}
         Description: Wateray desktop client
-         Wateray is an Electron + Go VPN desktop client.
+         Wateray is a Tauri + Go VPN desktop client.
          On Linux it keeps the core daemon in a privileged systemd service
-         so the Electron UI can keep running as a normal desktop user.
+         so the Tauri UI can keep running as a normal desktop user.
         """
     )
 

@@ -31,7 +31,7 @@ publicRouter.get("/public/home", (_request, response) => {
       description:
         "Wateray 是面向多平台的 VPN 桌面客户端，聚焦稳定连接、快速切换与清晰可控的代理体验。登录后可云端保存个人客户端配置，随时随地使用",
       techStacks: [
-        "桌面端 UI：Electron + React + TypeScript",
+        "桌面端 UI：Tauri v2 + React + TypeScript",
         "核心运行时：Go（waterayd 守护进程）",
         "核心代理：sing-box",
        

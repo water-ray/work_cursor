@@ -30,9 +30,19 @@ if (-not (Test-Command -Name "npm")) {
   throw "npm is required. Install npm first."
 }
 
+if (-not (Test-Command -Name "cargo")) {
+  throw "cargo is required. Install Rust stable first."
+}
+
+if (-not (Test-Command -Name "rustc")) {
+  throw "rustc is required. Install Rust stable first."
+}
+
 go version
 node --version
 npm --version
+cargo --version
+rustc --version
 
 if (-not [string]::IsNullOrWhiteSpace($WindowsLibTag)) {
   $downloadScript = Join-Path $PSScriptRoot "..\build\download-sb-windows.ps1"
@@ -41,21 +51,21 @@ if (-not [string]::IsNullOrWhiteSpace($WindowsLibTag)) {
 }
 
 $projectRoot = Resolve-Path (Join-Path $PSScriptRoot "..\..")
-$electronDir = Join-Path $projectRoot "ElectronApp"
+$tauriDir = Join-Path $projectRoot "TauriApp"
 
-if (Test-Path $electronDir) {
-  Push-Location $electronDir
+if (Test-Path $tauriDir) {
+  Push-Location $tauriDir
   try {
     npm install
   } finally {
     Pop-Location
   }
 } else {
-  Write-Warning "ElectronApp directory not found. Skip npm install."
+  Write-Warning "TauriApp directory not found. Skip npm install."
 }
 
 Write-Host "=== Setup done ==="
 Write-Host "Next:"
 Write-Host "1) Verify DLL and header under core/prebuilt/windows"
 Write-Host "2) Start core daemon: cd core && go run -tags with_clash_api,with_gvisor,with_quic ./cmd/waterayd"
-Write-Host "3) Start Electron frontend: cd ElectronApp && npm run dev"
+Write-Host "3) Start Tauri frontend: cd TauriApp && npm run dev"

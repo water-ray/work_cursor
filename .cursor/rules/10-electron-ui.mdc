@@ -1,13 +1,13 @@
 ---
 description: Renderer UI conventions (framework, draft, notice, icons, tokens)
-globs: ElectronApp/src/renderer/src/**/*.{ts,tsx,css}
+globs: TauriApp/src/renderer/src/**/*.{ts,tsx,css}
 alwaysApply: false
 ---
 
 # Renderer UI Conventions
 
 - Use `React + Ant Design` as the default renderer stack, and prefer framework components before custom widgets.
-- Route runtime operations through typed services (`services/daemonApi.ts`) and preload IPC APIs; do not call core internals directly.
+- Route runtime operations through typed services (`services/daemonApi.ts`) and the Tauri host bridge (`window.waterayDesktop`); do not call core internals directly.
 - Keep interactions asynchronous and resilient; surface daemon errors with clear, user-facing feedback.
 - Keep page logic split by concern (`pages/`, `components/`, `hooks/`, `services/`); avoid oversized multi-flow files.
 - Use shared draft/notice patterns:
@@ -25,7 +25,7 @@ alwaysApply: false
   - Use component-managed line breaks (`\n` or structured sections), and keep help icon on the label's right side.
 - Renderer icon source is `bootstrap-icons` via shared `BiIcon`; do not import `@ant-design/icons`.
 - Keep style values tokenized/centralized; avoid repeated hard-coded spacing/radius/colors in JSX/CSS.
-- Keep window chrome behavior (title bar/minimize/maximize/close) in dedicated components + IPC utilities.
+- Keep window chrome behavior (title bar/minimize/maximize/close) in dedicated components + host bridge utilities.
 
 ## Example
 

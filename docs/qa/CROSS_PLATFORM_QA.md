@@ -2,8 +2,8 @@
 
 ## Automated checks executed in current environment
 
-- `npm run typecheck` on `ElectronApp/`: pass
-- `npm run build` on `ElectronApp/`: pass
+- `npm run typecheck` on `TauriApp/`: pass
+- `npm run build` on `TauriApp/`: pass
 - `go test ./...` on `core/`: pass
 
 ## Runtime checks (manual)
@@ -17,7 +17,7 @@
 
 ### macOS / Linux
 
-- [ ] Run Electron desktop build
+- [ ] Run Tauri desktop build (pending while Windows-first migration is in progress)
 - [ ] Verify navigation, context menu, and table interactions
 - [ ] Verify daemon reconnect after UI restart
 - [ ] Verify core runtime label and version visibility

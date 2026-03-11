@@ -1,16 +1,16 @@
 # wateray
 
-高性能 VPN 客户端（Electron + Go + sing-box）。
+高性能 VPN 客户端（Tauri v2 + Go + sing-box）。
 
 ## 项目目标
 
 - 提供类似 v2rayN 的易用体验与完整配置能力。
 - 桌面端优先支持 Windows/macOS/Linux。
-- 使用前后端分离架构：Electron 前端控制台 + Go 核心守护进程。
+- 使用前后端分离架构：Tauri 前端控制台 + Go 核心守护进程。
 
 ## 技术栈
 
-- `ElectronApp/`：Electron UI 层（React + TypeScript + Ant Design）
+- `TauriApp/`：Tauri UI 层（React + TypeScript + Ant Design）
 - `core/`：Go 内核层（封装 sing-box 能力）
 - `adsroot/server/`：广告后端（Express + SQLite + JWT）
 - `adsroot/web/`：广告前端（React + TypeScript）
@@ -19,7 +19,7 @@
 ## 目录结构
 
 ```text
-ElectronApp/  # Electron 前端控制台
+TauriApp/      # Tauri 前端控制台
 core/            # Go 内核守护进程与控制面 API
 adsroot/server/  # 广告后端服务
 adsroot/web/     # 广告前端单页应用
@@ -92,19 +92,20 @@ docs/            # 架构、测试与设计文档
 
 - 启动 core：
   - `cd core && go run -tags with_clash_api,with_gvisor,with_quic ./cmd/waterayd`
-- 启动 Electron 前端：
-  - `cd ElectronApp && npm install && npm run dev`
+- 启动 Tauri 前端：
+  - `cd TauriApp && npm install && npm run dev`
 - 启动广告后端：
   - `cd adsroot/server && npm install && npm run dev`
 - 启动广告前端：
   - `cd adsroot/web && npm install && npm run dev`
-- 或使用 VSCode 任务一键启动：
-  - `客户端：开发：运行桌面整套`
+- 或分别使用 VSCode 任务启动：
+  - `客户端：开发：运行 VPN 内核`
+  - `客户端：开发：运行 Tauri 前端`
   - Linux 首次启动会通过 `polkit/pkexec` 请求管理员授权，以安装或重启 `waterayd-dev.service`
 - 构建当前宿主机平台客户端：
   - `客户端：构建：当前平台客户端`
   - Windows 会生成 `Bin/Wateray-windows`
-  - Linux 会同时生成 `Bin/Wateray-linux`、`.deb`、`AppImage`
+  - Linux / macOS 的 Tauri 打包链在后续阶段补齐，当前优先完成 Windows 正式产物
 - 广告端本地发布到 `Bin/adsroot`：
   - `广告端：本地发布：前后端整套到 Bin/adsroot`
 - GitHub 公开发布只面向 VPN 客户端：
@@ -153,40 +154,24 @@ cd wateray-src
 ### 3. 安装依赖
 
 ```bash
-cd ElectronApp && npm install && cd ..
+cd TauriApp && npm install && cd ..
 cd adsroot/server && npm install && cd ../..
 cd adsroot/web && npm install && cd ../..
 ```
 
-### 4. Linux 构建客户端
+### 4. Linux 构建客户端（待后续恢复）
 
-```bash
-python scripts/build/targets/desktop.py
-```
-
-如需生成 Linux 安装包：
-
-```bash
-python scripts/build/targets/linux_package.py --format all
-```
-
-构建结果目录：
-
-- `Bin/Wateray-linux`
-- 其中 `Bin/Wateray-linux/linux/` 包含 Linux service / polkit / 安装脚本资产
-- `Bin/Wateray-linux-packages`
-  - `wateray_<version>_amd64.deb`
-  - `Wateray-linux-v<version>-x86_64.AppImage`
+当前 Tauri 迁移按既定范围优先完成 Windows。Linux / macOS 的桌面打包、安装包与签名链会在后续阶段补齐，因此此处暂不再提供旧版桌面壳的 Linux 客户端构建命令。
 
 ### 5. 当前 Linux 状态
 
 - Linux TUN 已切到 `systemd-first` 模型：
   - 开发态通过 `scripts/dev/run_waterayd.py` 构建 dev bundle，并提权拉起 `waterayd-dev.service`
   - 打包态通过 `linux/install-system-service.sh` / `wateray-service-helper.sh` 安装或修复 `waterayd.service`
-- Electron UI 保持普通用户运行；关闭 UI 不会主动停止 Linux daemon
-- Linux 发布产物已补齐：
-  - `.deb`：面向 Debian / Ubuntu `amd64`，安装时会自动安装或修复 `waterayd.service`
-  - `AppImage`：面向 `x86_64 + glibc + systemd + polkit` 桌面环境，运行时会先同步到 `~/.local/share/wateray/appimage/current`，再按需授权安装服务
+- Tauri UI 保持普通用户运行；关闭 UI 不会主动停止 Linux daemon
+- Linux Tauri 打包链仍待后续恢复：
+  - `.deb`
+  - `AppImage`
 - Linux 当前推荐支持：
   - Ubuntu `22.04+` / `24.04+`
   - Debian `12+`
@@ -203,29 +188,25 @@ python scripts/build/targets/linux_package.py --format all
 
 说明：
 
-- 当前公开发布仅包含 Windows / Linux：
+- 当前公开发布按 Tauri 迁移范围优先支持 Windows：
   - Windows 在 Windows 构建
-  - Linux 在 Linux 构建
+  - Linux / macOS 发布链待后续补齐
 - 但本地任务入口保持一致，统一使用同一个构建与上传任务。
 - 正式 GitHub Release 不再由某一台机器本地直接上传，而是由 GitHub Actions 汇总 staging 产物后统一发布。
 
 推荐流程：
 
-1. Windows / Linux 两台机器分别拉取同一版本源码，并确认 `VERSION` 一致。
-2. 每台机器执行 `公开发布：上传当前平台产物到 GitHub`。
+1. Windows 构建机拉取同一版本源码，并确认 `VERSION` 一致。
+2. 执行 `公开发布：上传当前平台产物到 GitHub`。
    - 该流程会先构建当前平台正式资产，再生成 staging 素材并上传到 `staging-v<version>`
    - 同时上传 `platform-build-<platform>-v<version>.json`，记录版本、提交和资产清单
-   - Linux 当前会上传：
-     - `Wateray-linux-v<version>.zip`
-     - `wateray_<version>_amd64.deb`
-     - `Wateray-linux-v<version>-x86_64.AppImage`
 3. 任意一台机器执行 `公开发布：触发 GitHub 汇总发布`。
-4. GitHub Actions 从 `staging-v<version>` 收集 Windows / Linux manifest 和正式资产：
-   - 若缺少平台产物，则更新 `v<version>` 草稿状态，不发布正式版。
-   - 若两端产物齐备，则校验两端提交一致性，自动生成更新摘要、校验文件、`latest*.json` 与正式 Release。
-   - 若 staging 下载失败或 token 对公开仓库无写权限，workflow 会直接失败并提示具体原因，不再伪装成“等待更多平台产物”。
+4. GitHub Actions 从 `staging-v<version>` 收集当前阶段已支持的平台 manifest 和正式资产：
+   - 若缺少必需平台产物，则更新 `v<version>` 草稿状态，不发布正式版。
+   - 若产物齐备，则生成更新摘要、校验文件、`latest*.json` 与正式 Release。
+   - 若 staging 下载失败或 token 对公开仓库无写权限，workflow 会直接失败并提示具体原因。
 
 注意：
 
 - 如果 GitHub Actions 需要跨仓库向公开仓库发布，请在承载 workflow 的仓库中配置 `WATERAY_RELEASE_TOKEN`，令其具备目标公开仓库的 Release 写入权限。
-- 使用 `客户端：版本：发布主版本 / 次版本 / 补丁版` 后，请把 `VERSION`、`ElectronApp/package*.json` 和 `docs/build/CHANGELOG_LATEST.md` 一起提交；正式发布摘要会优先读取这份 changelog。
+- 使用 `客户端：版本：发布主版本 / 次版本 / 补丁版` 后，请把 `VERSION`、`TauriApp/package*.json` 和 `docs/build/CHANGELOG_LATEST.md` 一起提交；正式发布摘要会优先读取这份 changelog。
