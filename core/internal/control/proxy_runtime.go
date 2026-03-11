@@ -2234,20 +2234,30 @@ func resolveBuiltInRuleSetPath(kind string, value string) (string, bool) {
 	return filepath.Join(resolveRuleSetStorageDir(), fileName), true
 }
 
-func resolveBundledRuleSetStorageDirCandidates() []string {
-	baseDirs := resolveBundledInstallDirCandidates("")
-	candidates := make([]string, 0, len(baseDirs))
+func resolveBundledRuleSetStorageDirCandidatesWithExecutablePath(executablePath string) []string {
+	baseDirs := resolveBundledInstallDirCandidates(executablePath)
+	relativeDirs := []string{
+		filepath.Join("default-config", "rule-set"),
+		"rule-set",
+	}
+	candidates := make([]string, 0, len(baseDirs)*len(relativeDirs))
 	seen := map[string]struct{}{}
 	for _, baseDir := range baseDirs {
-		candidate := filepath.Clean(filepath.Join(baseDir, "rule-set"))
-		key := strings.ToLower(candidate)
-		if _, exists := seen[key]; exists {
-			continue
+		for _, relativeDir := range relativeDirs {
+			candidate := filepath.Clean(filepath.Join(baseDir, relativeDir))
+			key := strings.ToLower(candidate)
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+			candidates = append(candidates, candidate)
 		}
-		seen[key] = struct{}{}
-		candidates = append(candidates, candidate)
 	}
 	return candidates
+}
+
+func resolveBundledRuleSetStorageDirCandidates() []string {
+	return resolveBundledRuleSetStorageDirCandidatesWithExecutablePath("")
 }
 
 func resolveBundledBuiltInRuleSetPaths(kind string, value string) []string {

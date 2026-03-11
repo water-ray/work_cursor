@@ -18,9 +18,9 @@ If two rules appear to conflict, prefer the stricter runtime-boundary rule and k
 |---|---|---:|---|
 | `00-project-baseline.mdc` | global | true | Project-level boundaries, ownership, and verification baseline |
 | `05-runtime-framework.mdc` | global | true | UI/daemon runtime split and source-of-truth boundaries |
-| `10-electron-ui.mdc` | `ElectronApp/src/renderer/src/**/*.{ts,tsx}` | false | Electron frontend implementation conventions |
-| `12-electron-ui-framework.mdc` | `ElectronApp/src/renderer/src/**/*.{ts,tsx,css}` | false | React + Ant Design component usage and UI framework standards |
-| `13-ui-token-conventions.mdc` | `ElectronApp/src/renderer/src/**/*.{ts,tsx,css}` | false | Token naming and shared style organization conventions |
+| `10-electron-ui.mdc` | `TauriApp/src/renderer/src/**/*.{ts,tsx}` | false | Tauri renderer implementation conventions |
+| `12-electron-ui-framework.mdc` | `TauriApp/src/renderer/src/**/*.{ts,tsx,css}` | false | React + Ant Design component usage and UI framework standards |
+| `13-ui-token-conventions.mdc` | `TauriApp/src/renderer/src/**/*.{ts,tsx,css}` | false | Token naming and shared style organization conventions |
 | `20-go-core.mdc` | `core/**/*.go` | false | Go daemon/control-plane and lifecycle conventions |
 | `21-singbox-latest-config.mdc` | `core/internal/control/**/*.go` | false | Enforce latest sing-box config syntax and migration-safe fields |
 | `30-remove-obsolete-code.mdc` | global | true | Remove replaced/legacy code and stale aliases |
@@ -39,7 +39,7 @@ If two rules appear to conflict, prefer the stricter runtime-boundary rule and k
 
 ## Typical Usage Map
 
-- Editing Electron renderer pages: `10` + `12` (+ `30`)
+- Editing Tauri renderer pages: `10` + `12` (+ `30`)
 - Editing token files: `12` + `13` (+ `30`)
 - Editing Go daemon/control API: `20` + `05` (+ `30`)
 - Cross-layer architecture changes: `00` + `05` (+ scoped rules + `30`)

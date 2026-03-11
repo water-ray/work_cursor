@@ -13,8 +13,8 @@
 
 ## Test plan
 
-- [ ] `npm run typecheck` in `ElectronApp/`
-- [ ] `npm run build` in `ElectronApp/`
+- [ ] `npm run typecheck` in `TauriApp/`
+- [ ] `npm run build` in `TauriApp/`
 - [ ] `go test ./...` in `core/`
 - [ ] Manual verification completed
 

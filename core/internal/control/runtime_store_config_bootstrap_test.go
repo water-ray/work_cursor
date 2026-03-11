@@ -55,11 +55,19 @@ func TestLoadWithExecutablePathUsesBundledDefaultWhenStateMissing(t *testing.T) 
 	tempDir := t.TempDir()
 	executablePath := filepath.Join(tempDir, "Wateray", "core", "WaterayServer.exe")
 	stateFile := filepath.Join(tempDir, "user", "waterayd_state.json")
+	dataRoot := filepath.Join(tempDir, "appdata", "wateray")
 	bundledStateFile := filepath.Join(
 		tempDir,
 		"Wateray",
 		"default-config",
 		"waterayd_state.json",
+	)
+	bundledRuleSetFile := filepath.Join(
+		tempDir,
+		"Wateray",
+		"default-config",
+		"rule-set",
+		"geosite-google.srs",
 	)
 
 	bundledSnapshot := defaultSnapshot("bundled-runtime", "1.2.3")
@@ -68,6 +76,19 @@ func TestLoadWithExecutablePathUsesBundledDefaultWhenStateMissing(t *testing.T) 
 	if err := persistSnapshotToFile(bundledStateFile, bundledSnapshot); err != nil {
 		t.Fatalf("persist bundled snapshot failed: %v", err)
 	}
+	if err := os.MkdirAll(filepath.Dir(bundledRuleSetFile), 0o755); err != nil {
+		t.Fatalf("create bundled rule-set dir failed: %v", err)
+	}
+	if err := os.WriteFile(bundledRuleSetFile, []byte("bundled-rule-set"), 0o644); err != nil {
+		t.Fatalf("write bundled rule-set failed: %v", err)
+	}
+	previousDataRoot := os.Getenv(waterayDataRootEnvName)
+	if err := os.Setenv(waterayDataRootEnvName, dataRoot); err != nil {
+		t.Fatalf("set data root failed: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Setenv(waterayDataRootEnvName, previousDataRoot)
+	})
 
 	store := &RuntimeStore{
 		stateFile: stateFile,
@@ -92,6 +113,14 @@ func TestLoadWithExecutablePathUsesBundledDefaultWhenStateMissing(t *testing.T) 
 	}
 	if loadedCopy.LocalProxyPort != bundledSnapshot.LocalProxyPort {
 		t.Fatalf("expected copied state file to match bundled default, got port=%d", loadedCopy.LocalProxyPort)
+	}
+	localRuleSetFile := filepath.Join(dataRoot, "rule-set", "geosite-google.srs")
+	localRuleSet, err := os.ReadFile(localRuleSetFile)
+	if err != nil {
+		t.Fatalf("expected bundled rule-set to seed app data dir: %v", err)
+	}
+	if string(localRuleSet) != "bundled-rule-set" {
+		t.Fatalf("expected seeded rule-set content to match bundled default, got %q", string(localRuleSet))
 	}
 }
 
@@ -197,13 +226,13 @@ func TestLoadWithExecutablePathSkipsBundledFutureSchema(t *testing.T) {
 	}
 }
 
-func TestResolveBundledDefaultStateFileCandidatesIncludesElectronAppDirFromWorkspace(t *testing.T) {
+func TestResolveBundledDefaultStateFileCandidatesIncludesTauriAppDirFromWorkspace(t *testing.T) {
 	tempDir := t.TempDir()
 	repoDir := filepath.Join(tempDir, "repo")
 	coreDir := filepath.Join(repoDir, "core")
-	electronDir := filepath.Join(repoDir, "ElectronApp")
-	if err := os.MkdirAll(filepath.Join(electronDir, "default-config"), 0o755); err != nil {
-		t.Fatalf("create electron default-config dir failed: %v", err)
+	tauriDir := filepath.Join(repoDir, "TauriApp")
+	if err := os.MkdirAll(filepath.Join(tauriDir, "default-config"), 0o755); err != nil {
+		t.Fatalf("create tauri default-config dir failed: %v", err)
 	}
 	if err := os.MkdirAll(coreDir, 0o755); err != nil {
 		t.Fatalf("create core dir failed: %v", err)
@@ -220,7 +249,7 @@ func TestResolveBundledDefaultStateFileCandidatesIncludesElectronAppDirFromWorks
 	})
 
 	candidates := resolveBundledDefaultStateFileCandidates("")
-	expected := filepath.Join(electronDir, "default-config", "waterayd_state.json")
+	expected := filepath.Join(tauriDir, "default-config", "waterayd_state.json")
 	for _, candidate := range candidates {
 		if strings.EqualFold(filepath.Clean(candidate), filepath.Clean(expected)) {
 			return

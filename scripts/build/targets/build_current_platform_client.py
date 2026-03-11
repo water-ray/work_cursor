@@ -31,19 +31,8 @@ def run_command(command: list[str]) -> None:
 def main() -> int:
     try:
         platform_id = resolve_current_platform_id()
-        if platform_id == "linux":
-            print("当前平台：linux，构建目录产物并生成 .deb / AppImage")
-            run_command(
-                [
-                    sys.executable,
-                    str(ROOT_DIR / "scripts" / "build" / "targets" / "linux_package.py"),
-                    "--format",
-                    "all",
-                ]
-            )
-        else:
-            print(f"当前平台：{platform_id}，构建桌面客户端目录产物")
-            run_command([sys.executable, str(ROOT_DIR / "scripts" / "build" / "targets" / "desktop.py")])
+        print(f"当前平台：{platform_id}，构建桌面客户端目录产物")
+        run_command([sys.executable, str(ROOT_DIR / "scripts" / "build" / "targets" / "desktop.py")])
         return 0
     except CurrentPlatformBuildError as err:
         print(f"构建失败：[current_platform_client] {err}", file=sys.stderr)

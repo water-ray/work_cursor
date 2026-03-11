@@ -2,7 +2,7 @@
 
 ## 位置
 
-- 前端通用国家表：`ElectronApp/src/renderer/src/app/data/countryMetadata.ts`
+- 前端通用国家表：`TauriApp/src/renderer/src/app/data/countryMetadata.ts`
 
 ## 作用
 
@@ -88,7 +88,7 @@ const filterOption = (input: string, option?: { searchText?: string }) => {
 
 ## 目的
 
-前端统一使用 `ElectronApp/src/renderer/src/app/data/countryMetadata.ts` 作为国家/地区元数据来源，避免各页面重复维护：
+前端统一使用 `TauriApp/src/renderer/src/app/data/countryMetadata.ts` 作为国家/地区元数据来源，避免各页面重复维护：
 
 - 国家缩写
 - 英文全名
@@ -180,7 +180,7 @@ const searchText = buildCountrySearchText("United States");
 
 ## 代码位置
 
-- 共享模块：`ElectronApp/src/renderer/src/app/data/countryMetadata.ts`
+- 共享模块：`TauriApp/src/renderer/src/app/data/countryMetadata.ts`
 
 ## 导出内容
 

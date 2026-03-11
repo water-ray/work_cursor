@@ -34,13 +34,29 @@
   ],
   "tasks": [
     {
-      "label": "客户端：开发：运行 Electron 前端",
-      "type": "shell",
-      "command": "npm run dev",
+      "label": "客户端：开发：运行 Tauri 前端",
+      "type": "process",
+      "command": "npm",
+      "args": [
+        "run",
+        "dev"
+      ],
+      "windows": {
+        "command": "python",
+        "args": [
+          "${workspaceFolder}\\scripts\\dev\\run_tauri_dev_watchdog.py"
+        ],
+        "options": {
+          "cwd": "${workspaceFolder}",
+          "env": {
+            "WATERAY_APP_MODE": "dev",
+            "VITE_AIRPORT_WEB_URL": "http://127.0.0.1:5179/"
+          }
+        }
+      },
       "options": {
-        "cwd": "${workspaceFolder}/ElectronApp",
+        "cwd": "${workspaceFolder}/TauriApp",
         "env": {
-          "ELECTRON_DISABLE_SANDBOX": "1",
           "WATERAY_APP_MODE": "dev",
           "VITE_AIRPORT_WEB_URL": "http://127.0.0.1:5179/"
         }
@@ -55,14 +71,14 @@
       }
     },
     {
-      "label": "客户端：检查：Electron 类型检查",
+      "label": "客户端：检查：Tauri 类型检查",
       "type": "shell",
       "command": "npm run typecheck",
       "linux": {
         "command": "node node_modules/typescript/bin/tsc --noEmit"
       },
       "options": {
-        "cwd": "${workspaceFolder}/ElectronApp"
+        "cwd": "${workspaceFolder}/TauriApp"
       },
       "group": "build",
       "problemMatcher": [],
@@ -154,6 +170,26 @@
       }
     },
     {
+      "label": "客户端：构建：清理 Tauri 编译缓存",
+      "type": "process",
+      "command": "cargo",
+      "args": [
+        "clean",
+        "--manifest-path",
+        "${workspaceFolder}/TauriApp/src-tauri/Cargo.toml"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": "build",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": false
+      }
+    },
+    {
       "label": "客户端：版本：发布补丁版",
       "type": "shell",
       "command": "python scripts/release/release_version.py patch",
@@ -197,15 +233,6 @@
         "panel": "dedicated",
         "focus": false
       }
-    },
-    {
-      "label": "客户端：开发：运行桌面整套",
-      "dependsOn": [
-        "客户端：开发：运行 VPN 内核",
-        "客户端：开发：运行 Electron 前端"
-      ],
-      "dependsOrder": "sequence",
-      "problemMatcher": []
     },
     {
       "label": "私有源码：提交当前改动",

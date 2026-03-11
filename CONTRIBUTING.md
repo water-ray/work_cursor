@@ -26,7 +26,7 @@ Prefer conventional commits:
 
 ## Validation before opening PR
 
-From `ElectronApp/`:
+From `TauriApp/`:
 
 - `npm install`
 - `npm run typecheck`

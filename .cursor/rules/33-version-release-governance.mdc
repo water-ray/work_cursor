@@ -1,13 +1,13 @@
 ---
 description: Unified SemVer governance for version, build, and release files
-globs: "{VERSION,ElectronApp/**/*,core/**/*,scripts/**/*,docs/build/**/*}"
+globs: "{VERSION,TauriApp/**/*,core/**/*,scripts/**/*,docs/build/**/*}"
 alwaysApply: false
 ---
 
 # Version And Release Governance
 
 - Use repository root `VERSION` as the single source of truth and keep format strictly `X.Y.Z`.
-- Core daemon and Electron frontend must share the same version in every release.
+- Core daemon and Tauri frontend must share the same version in every release.
 - SemVer bump rules:
   - New feature -> bump `MINOR`
   - Bug fix or optimization/refactor -> bump `PATCH`

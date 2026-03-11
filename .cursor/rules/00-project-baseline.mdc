@@ -5,8 +5,8 @@ alwaysApply: true
 
 # Wateray Architecture (Mandatory)
 
-- Keep module boundaries explicit: UI in `ElectronApp/`, runtime engine in `core/`, automation in `scripts/`, docs in `docs/`.
-- Keep process boundaries explicit: `ElectronApp/` is frontend console; `core/cmd/waterayd` is backend daemon.
+- Keep module boundaries explicit: UI in `TauriApp/`, runtime engine in `core/`, automation in `scripts/`, docs in `docs/`.
+- Keep process boundaries explicit: `TauriApp/` is frontend console; `core/cmd/waterayd` is backend daemon.
 - Keep core daemon as the runtime authority for subscriptions, groups, routing, connection stage, stats, and runtime config.
 - Route runtime state mutations through control-plane APIs (`IPC/HTTP`) only; renderer submits commands and renders snapshots.
 - Keep frontend persistence limited to UI preferences; runtime state/config stays in core.

@@ -27,5 +27,5 @@ Automation scripts for build, CI, and packaging.
   - `python scripts/release/release_version.py patch`
 - Script side effects:
   - Update `VERSION`
-  - Sync `ElectronApp/package.json` and `ElectronApp/package-lock.json`
+  - Sync `TauriApp/package.json` and `TauriApp/package-lock.json`
   - Generate `docs/build/CHANGELOG_LATEST.md`
