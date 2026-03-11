@@ -1,7 +1,7 @@
 # CHANGELOG_LATEST
 
-## v1.1.1
-- 生成时间：2026-03-11 03:19:56
+## v1.1.2
+- 生成时间：2026-03-11 12:12:35
 - 版本升级：patch
 - 基线标签：无（首次生成）
 
@@ -15,6 +15,13 @@
 - 无
 
 ### Others
+- chore: 优化任务菜单 (60fbb4f)
+- chore: 修改客户端引擎为Truri,优化windows托盘图标 (51a62fb)
+- chore: 修改客户端引擎,优化windows托盘图标 (7e3f090)
+- chore:自动发布摘要修复 (85d9bc1)
+- Merge branch 'main' of https://github.com/water-ray/wateray-src into mian (5ebb9d9)
+- chore:自动化发布权限配置 (f898d47)
+- chore: 补丁增加 (a0ed847)
 - chore:版本修改任务 (da2d49f)
 - chore: 优化打包 (6cdd943)
 - chore:任务整理 (06bcb9b)

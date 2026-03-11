@@ -241,7 +241,15 @@ def build_backend_release(target: DesktopBuildTarget, release_version: str) -> N
         env = os.environ.copy()
         env["GOOS"] = target.go_os
         env["GOARCH"] = target.go_arch
-        ldflags_value = f"-s -w -X main.appVersion={release_version}"
+        ldflags_parts = [
+            "-s",
+            "-w",
+            f"-X main.appVersion={release_version}",
+        ]
+        if target.go_os == "windows":
+            # 发布态由桌面宿主托管，不需要额外的控制台窗口。
+            ldflags_parts.append("-H=windowsgui")
+        ldflags_value = " ".join(ldflags_parts)
         run_command(
             [
                 "go",
