@@ -8,6 +8,12 @@
       "default": "source-private"
     },
     {
+      "id": "githubPrivateTargetBranch",
+      "type": "promptString",
+      "description": "输入要推送到私有源码仓库的目标分支名",
+      "default": "main"
+    },
+    {
       "id": "githubPublicRepo",
       "type": "promptString",
       "description": "输入公开发布仓库 owner/name",
@@ -291,6 +297,23 @@
       "label": "私有源码：提交并推送当前分支",
       "type": "shell",
       "command": "python scripts/git/private_source_tasks.py commit-push-current --remote \"${input:githubPrivateRemoteName}\"",
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "WATERAY_GIT_COMMIT_MESSAGE": "${input:gitCommitMessage}"
+        }
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": true
+      }
+    },
+    {
+      "label": "私有源码：提交并推送指定分支",
+      "type": "shell",
+      "command": "python scripts/git/private_source_tasks.py commit-push-main --remote \"${input:githubPrivateRemoteName}\" --branch \"${input:githubPrivateTargetBranch}\"",
       "options": {
         "cwd": "${workspaceFolder}",
         "env": {
