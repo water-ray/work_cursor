@@ -569,11 +569,6 @@ def write_release_notes(version: str, public_repo: str, release_dir: Path, asset
             "- `latest.json`：机器可读版本摘要。",
             "- `latest-github.json`：带 GitHub 下载地址的版本摘要。",
             "",
-            "## 发布步骤建议",
-            "1. 先上传各平台正式资产与校验文件到 GitHub Release。",
-            "2. 再把本文件内容整理后粘贴到 Release 正文。",
-            "3. 上传完成后，检查下载链接、文件大小和 SHA256 是否一致。",
-            "",
         ]
     )
     output = release_dir / f"release-notes-{release_tag}.md"
