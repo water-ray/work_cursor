@@ -89,6 +89,50 @@ def print_short_status() -> None:
     print_stdout(result.stdout)
 
 
+def list_remote_names() -> list[str]:
+    result = run_git(["remote"], capture_output=True)
+    return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+
+
+def get_remote_url(remote: str, *, push: bool = False) -> str:
+    command = ["remote", "get-url"]
+    if push:
+        command.append("--push")
+    command.append(remote)
+    result = run_git(command, check=False, capture_output=True)
+    if result.returncode != 0:
+        return ""
+    return (result.stdout or "").strip()
+
+
+def print_remote_verbose() -> None:
+    result = run_git(["remote", "-v"], capture_output=True)
+    print("git remote -v:")
+    output = (result.stdout or "").strip()
+    if output:
+        print_stdout(output)
+    else:
+        print("(未配置任何 remote)")
+
+
+def print_missing_remote_hint(remote: str) -> None:
+    remote_names = set(list_remote_names())
+    if remote in remote_names:
+        return
+    print()
+    print(f"提示：当前仓库未配置 {remote}。")
+    print(f"{remote} 是这个任务约定使用的 Git 远端名称（remote name / 远程别名）。")
+    origin_url = get_remote_url("origin", push=True) or get_remote_url("origin")
+    if origin_url:
+        print("如果你希望它先和 origin 指向同一个仓库，可以手动执行：")
+        print(f"git remote add {remote} {origin_url}")
+    else:
+        print("当前未检测到可复用的 origin 地址，请改成你的仓库地址后手动执行：")
+        print(f"git remote add {remote} <你的私有仓库URL>")
+    print("如果后续需要改地址，可执行：")
+    print(f"git remote set-url {remote} <新的仓库URL>")
+
+
 def stage_and_commit(message: str) -> bool:
     run_git(["add", "-A"])
     if not has_staged_changes():
@@ -151,8 +195,11 @@ def command_switch_branch(args: argparse.Namespace) -> int:
     return 0
 
 
-def command_show_branch(_args: argparse.Namespace) -> int:
+def command_show_branch(args: argparse.Namespace) -> int:
     print_short_status()
+    print()
+    print_remote_verbose()
+    print_missing_remote_hint(ensure_non_empty(args.remote, "remote"))
     return 0
 
 
@@ -205,6 +252,7 @@ def build_parser() -> argparse.ArgumentParser:
     switch_branch.set_defaults(handler=command_switch_branch)
 
     show_branch_parser = subparsers.add_parser("show-branch", help="查看当前分支")
+    show_branch_parser.add_argument("--remote", default=DEFAULT_REMOTE, help=f"提示检查的远端名称，默认 {DEFAULT_REMOTE}")
     show_branch_parser.set_defaults(handler=command_show_branch)
 
     push_main = subparsers.add_parser("push-main", help="推送当前内容到主分支")
