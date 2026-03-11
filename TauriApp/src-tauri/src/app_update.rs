@@ -1380,11 +1380,6 @@ exit 1
 "#
 }
 
-#[cfg(not(target_os = "linux"))]
-fn linux_deb_installer_script() -> &'static str {
-    ""
-}
-
 #[cfg(target_os = "linux")]
 fn linux_relaunch_script() -> &'static str {
     r#"#!/usr/bin/env sh
@@ -1405,11 +1400,6 @@ launch_dir="$(dirname "$launch_path")"
 cd "$launch_dir"
 nohup "$launch_path" >/dev/null 2>&1 &
 "#
-}
-
-#[cfg(not(target_os = "linux"))]
-fn linux_relaunch_script() -> &'static str {
-    ""
 }
 
 #[tauri::command]
