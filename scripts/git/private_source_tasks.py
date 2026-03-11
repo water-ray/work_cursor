@@ -198,6 +198,8 @@ def command_switch_branch(args: argparse.Namespace) -> int:
 def command_show_branch(args: argparse.Namespace) -> int:
     print_short_status()
     print()
+    show_identity()
+    print()
     print_remote_verbose()
     print_missing_remote_hint(ensure_non_empty(args.remote, "remote"))
     return 0

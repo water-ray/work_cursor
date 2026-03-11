@@ -8,12 +8,6 @@
       "default": "source-private"
     },
     {
-      "id": "githubPrivateBranch",
-      "type": "promptString",
-      "description": "输入要推送到私有源码仓库的分支名",
-      "default": "main"
-    },
-    {
       "id": "githubPublicRepo",
       "type": "promptString",
       "description": "输入公开发布仓库 owner/name",
@@ -294,20 +288,6 @@
       }
     },
     {
-      "label": "私有源码：推送当前内容到 main",
-      "type": "shell",
-      "command": "python scripts/git/private_source_tasks.py push-main --remote \"${input:githubPrivateRemoteName}\" --branch \"${input:githubPrivateBranch}\"",
-      "options": {
-        "cwd": "${workspaceFolder}"
-      },
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "focus": true
-      }
-    },
-    {
       "label": "私有源码：提交并推送当前分支",
       "type": "shell",
       "command": "python scripts/git/private_source_tasks.py commit-push-current --remote \"${input:githubPrivateRemoteName}\"",
@@ -322,37 +302,6 @@
         "reveal": "always",
         "panel": "dedicated",
         "focus": true
-      }
-    },
-    {
-      "label": "私有源码：提交并推送到 main",
-      "type": "shell",
-      "command": "python scripts/git/private_source_tasks.py commit-push-main --remote \"${input:githubPrivateRemoteName}\" --branch \"${input:githubPrivateBranch}\"",
-      "options": {
-        "cwd": "${workspaceFolder}",
-        "env": {
-          "WATERAY_GIT_COMMIT_MESSAGE": "${input:gitCommitMessage}"
-        }
-      },
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "focus": true
-      }
-    },
-    {
-      "label": "私有源码：检查当前提交身份",
-      "type": "shell",
-      "command": "python scripts/git/private_source_tasks.py show-identity",
-      "options": {
-        "cwd": "${workspaceFolder}"
-      },
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "focus": false
       }
     },
     {
