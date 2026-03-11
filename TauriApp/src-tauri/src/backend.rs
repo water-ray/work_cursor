@@ -23,8 +23,10 @@ use windows::core::{PCWSTR, PWSTR};
 #[cfg(target_os = "windows")]
 use windows::Win32::System::Com::CoTaskMemFree;
 #[cfg(target_os = "windows")]
+use windows::Win32::UI::Shell::ShellExecuteW;
+#[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::{
-    MessageBoxW, MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
+    MessageBoxW, SW_HIDE, MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
 };
 
 const DEFAULT_DAEMON_BASE_URL: &str = "http://127.0.0.1:39080";
@@ -382,7 +384,11 @@ fn resolve_daemon_executable_path() -> Result<PathBuf, String> {
 
 #[cfg(target_os = "windows")]
 fn is_permission_denied_error(error: &std::io::Error) -> bool {
-    error.kind() == std::io::ErrorKind::PermissionDenied || error.raw_os_error() == Some(5)
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    const ERROR_ELEVATION_REQUIRED: i32 = 740;
+    error.kind() == std::io::ErrorKind::PermissionDenied
+        || error.raw_os_error() == Some(ERROR_ACCESS_DENIED)
+        || error.raw_os_error() == Some(ERROR_ELEVATION_REQUIRED)
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -429,38 +435,27 @@ fn spawn_daemon_detached(daemon_executable_path: &Path) -> Result<(), std::io::E
 }
 
 #[cfg(target_os = "windows")]
-fn quote_powershell_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
-#[cfg(target_os = "windows")]
 fn spawn_daemon_elevated_via_uac(daemon_executable_path: &Path) -> bool {
     let daemon_dir = match daemon_executable_path.parent() {
         Some(value) => value,
         None => return false,
     };
 
-    let command = format!(
-        "Start-Process -FilePath {} -WorkingDirectory {} -Verb RunAs -WindowStyle Hidden",
-        quote_powershell_literal(&daemon_executable_path.to_string_lossy()),
-        quote_powershell_literal(&daemon_dir.to_string_lossy())
-    );
+    let wide_verb = encode_wide_null("runas");
+    let wide_file = encode_wide_null(&daemon_executable_path.to_string_lossy());
+    let wide_dir = encode_wide_null(&daemon_dir.to_string_lossy());
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR::from_raw(wide_verb.as_ptr()),
+            PCWSTR::from_raw(wide_file.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::from_raw(wide_dir.as_ptr()),
+            SW_HIDE,
+        )
+    };
 
-    let status = Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            &command,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-
-    matches!(status, Ok(code) if code.success())
+    (result.0 as isize) > 32
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -525,7 +520,10 @@ pub async fn ensure_packaged_daemon_running_impl() -> Result<(), String> {
 
     let daemon_executable_path = resolve_daemon_executable_path()?;
     if !daemon_executable_path.exists() {
-        return Ok(());
+        return Err(format!(
+            "发布态内核文件不存在：{}",
+            daemon_executable_path.display()
+        ));
     }
 
     match spawn_daemon_detached(&daemon_executable_path) {
@@ -536,13 +534,23 @@ pub async fn ensure_packaged_daemon_running_impl() -> Result<(), String> {
             }
 
             if !spawn_daemon_elevated_via_uac(&daemon_executable_path) {
-                return Ok(());
+                return Err(format!(
+                    "启动内核需要管理员权限，请在系统弹出的授权窗口中允许 {} 运行。",
+                    daemon_executable_path.display()
+                ));
             }
         }
     }
 
-    let _ = wait_daemon_ready().await;
-    Ok(())
+    if wait_daemon_ready().await {
+        return Ok(());
+    }
+
+    Err(format!(
+        "内核进程已尝试启动，但在 {} 秒内未就绪：{}",
+        DAEMON_READY_TIMEOUT_MS / 1000,
+        daemon_executable_path.display()
+    ))
 }
 
 #[tauri::command]

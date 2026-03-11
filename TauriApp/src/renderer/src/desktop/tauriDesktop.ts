@@ -257,8 +257,11 @@ export async function installWaterayDesktop(): Promise<void> {
 
   try {
     await invoke("ensure_packaged_daemon_running");
-  } catch {
-    // Best effort: dev mode and external daemon scenarios should continue.
+  } catch (error) {
+    console.error("packaged daemon startup failed", error);
+    const detail =
+      error instanceof Error ? error.message.trim() : String(error ?? "").trim();
+    throw new Error(detail === "" ? "打包内核启动失败" : `打包内核启动失败：${detail}`);
   }
 
   daemonTransportManager.start();
