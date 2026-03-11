@@ -7,9 +7,16 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+from scripts.build.common.build_manifest import (
+    DESKTOP_BUILD_MANIFEST_NAME,
+    build_desktop_bundle_manifest,
+    write_manifest,
+)
 
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -30,6 +37,9 @@ TAURI_DEFAULT_CONFIG_DIR = TAURI_DIR / "default-config"
 TAURI_DEFAULT_RULE_SET_DIR = TAURI_DEFAULT_CONFIG_DIR / "rule-set"
 LINUX_BUILD_ASSET_DIR = ROOT_DIR / "scripts" / "build" / "assets" / "linux"
 VERSION_PATH = ROOT_DIR / "VERSION"
+CORE_EMBEDDED_ASSET_DIR = CORE_DIR / "internal" / "control" / "embedded"
+CORE_EMBEDDED_DEFAULT_CONFIG_DIR = CORE_EMBEDDED_ASSET_DIR / "default-config"
+CORE_EMBEDDED_VERSION_PATH = CORE_EMBEDDED_ASSET_DIR / "VERSION"
 SEMVER_PATTERN = re.compile(r"^\d+\.\d+\.\d+$")
 
 
@@ -187,6 +197,29 @@ def clean_outputs(target: DesktopBuildTarget) -> None:
     target.bin_core_dir.mkdir(parents=True, exist_ok=True)
 
 
+def prepare_core_embedded_release_assets() -> Path:
+    backup_root = Path(tempfile.mkdtemp(prefix="wateray-embedded-assets-"))
+    backup_dir = backup_root / "embedded"
+    if CORE_EMBEDDED_ASSET_DIR.exists():
+        shutil.copytree(CORE_EMBEDDED_ASSET_DIR, backup_dir)
+        shutil.rmtree(CORE_EMBEDDED_ASSET_DIR)
+    CORE_EMBEDDED_DEFAULT_CONFIG_DIR.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(TAURI_DEFAULT_CONFIG_DIR, CORE_EMBEDDED_DEFAULT_CONFIG_DIR, dirs_exist_ok=True)
+    shutil.copy2(VERSION_PATH, CORE_EMBEDDED_VERSION_PATH)
+    return backup_root
+
+
+def restore_core_embedded_release_assets(backup_root: Path | None) -> None:
+    if backup_root is None:
+        return
+    backup_dir = backup_root / "embedded"
+    if CORE_EMBEDDED_ASSET_DIR.exists():
+        shutil.rmtree(CORE_EMBEDDED_ASSET_DIR)
+    if backup_dir.exists():
+        shutil.copytree(backup_dir, CORE_EMBEDDED_ASSET_DIR)
+    shutil.rmtree(backup_root, ignore_errors=True)
+
+
 def build_windows_manifest() -> None:
     if TEMP_SYSO_PATH.exists():
         TEMP_SYSO_PATH.unlink()
@@ -236,7 +269,9 @@ def build_windows_manifest() -> None:
 
 def build_backend_release(target: DesktopBuildTarget, release_version: str) -> None:
     print_step(f"编译后端 {target.daemon_binary_name}")
+    embedded_assets_backup: Path | None = None
     try:
+        embedded_assets_backup = prepare_core_embedded_release_assets()
         if target.needs_windows_manifest:
             build_windows_manifest()
         env = os.environ.copy()
@@ -246,6 +281,7 @@ def build_backend_release(target: DesktopBuildTarget, release_version: str) -> N
             "-s",
             "-w",
             f"-X main.appVersion={release_version}",
+            "-X wateray/core/internal/control.bundledReleaseAssetsEnabled=1",
         ]
         if target.go_os == "windows":
             # 发布态由桌面宿主托管，不需要额外的控制台窗口。
@@ -270,6 +306,7 @@ def build_backend_release(target: DesktopBuildTarget, release_version: str) -> N
             env=env,
         )
     finally:
+        restore_core_embedded_release_assets(embedded_assets_backup)
         if TEMP_SYSO_PATH.exists():
             TEMP_SYSO_PATH.unlink()
 
@@ -320,21 +357,10 @@ def assemble_bundle(target: DesktopBuildTarget, release_version: str) -> None:
     print_step(f"整理前端产物到 {target.bin_dir}")
     frontend_target_path = target.bin_dir / target.frontend_entry_name
     shutil.copy2(target.tauri_binary_path, frontend_target_path)
-    if TAURI_DEFAULT_CONFIG_DIR.exists():
-        shutil.copytree(
-            TAURI_DEFAULT_CONFIG_DIR,
-            target.bin_dir / "default-config",
-            dirs_exist_ok=True,
-        )
-    else:
-        print(f"跳过默认配置拷贝（目录不存在）：{TAURI_DEFAULT_CONFIG_DIR}")
-    if target.platform_id == "linux" and LINUX_BUILD_ASSET_DIR.exists():
-        shutil.copytree(
-            LINUX_BUILD_ASSET_DIR,
-            target.bin_dir / "linux",
-            dirs_exist_ok=True,
-        )
-        shutil.copy2(VERSION_PATH, target.bin_dir / "VERSION")
+    write_manifest(
+        target.bin_dir / DESKTOP_BUILD_MANIFEST_NAME,
+        build_desktop_bundle_manifest(target.platform_id, release_version, target.output_dir_name),
+    )
     print(f"打包版本 -> {release_version}")
 
     if not frontend_target_path.exists():

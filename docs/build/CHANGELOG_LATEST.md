@@ -1,8 +1,8 @@
 # CHANGELOG_LATEST
 
-## v1.2.0
-- 生成时间：2026-03-12 01:12:37
-- 版本升级：minor
+## v1.2.2
+- 生成时间：2026-03-12 05:38:32
+- 版本升级：patch
 - 基线标签：无（首次生成）
 
 ### Features
@@ -15,6 +15,9 @@
 - 无
 
 ### Others
+- 移除公开发布说明中的发布者提示 (227baed)
+- 分支切换任务优化 (cfb5038)
+- linux支持 (9ad6f62)
 - chore: 增加推送自定义分支任务 (3b19cc2)
 - Merge pull request #3 from water-ray/Tauri-1.0.0 (78f780b)
 - chore: 修复Windows启动内核问题 (4fcb114)

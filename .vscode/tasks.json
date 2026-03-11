@@ -176,7 +176,7 @@
         "command": "/bin/bash",
         "args": [
           "-lc",
-          "source \"$HOME/.cargo/env\" && exec python3 scripts/build/targets/build_current_platform_client.py"
+          "source \"$HOME/.cargo/env\" && exec python3 scripts/build/targets/linux_package.py --format all"
         ]
       },
       "options": {

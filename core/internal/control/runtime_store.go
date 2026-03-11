@@ -8447,6 +8447,16 @@ func (s *RuntimeStore) loadWithExecutablePath(executablePath string) (stateBoots
 		_ = persistSnapshotToFile(s.stateFile, s.state)
 		return stateBootstrapSourceBundledDefault, nil
 	}
+	if bundledSnapshot, ok, bundledErr := loadEmbeddedBundledDefaultSnapshot(s.state); bundledErr == nil && ok {
+		if isSupportedBundledSnapshotSchemaVersion(bundledSnapshot.SchemaVersion) {
+			s.applyLoadedSnapshot(bundledSnapshot)
+			seedBundledRuleSetStorageIfNeeded(executablePath)
+			_ = persistSnapshotToFile(s.stateFile, s.state)
+			return stateBootstrapSourceBundledDefault, nil
+		}
+	} else if bundledErr != nil {
+		return stateBootstrapSourceKernelDefault, bundledErr
+	}
 	return stateBootstrapSourceKernelDefault, nil
 }
 
@@ -8471,6 +8481,7 @@ func seedBundledRuleSetStorageIfNeeded(executablePath string) {
 			return
 		}
 	}
+	_ = copyEmbeddedBundledRuleSetStorageToLocal(localDir)
 }
 
 func copyDirectoryContents(sourceDir string, targetDir string) error {
@@ -8521,6 +8532,22 @@ func loadSnapshotFromFile(stateFile string, fallback StateSnapshot) (StateSnapsh
 	if err != nil {
 		return StateSnapshot{}, err
 	}
+	return loadSnapshotFromBytes(data, fallback)
+}
+
+func loadEmbeddedBundledDefaultSnapshot(fallback StateSnapshot) (StateSnapshot, bool, error) {
+	data, ok, err := readEmbeddedBundledDefaultState()
+	if err != nil || !ok {
+		return StateSnapshot{}, ok, err
+	}
+	loaded, loadErr := loadSnapshotFromBytes(data, fallback)
+	if loadErr != nil {
+		return StateSnapshot{}, false, loadErr
+	}
+	return loaded, true, nil
+}
+
+func loadSnapshotFromBytes(data []byte, fallback StateSnapshot) (StateSnapshot, error) {
 	var loaded StateSnapshot
 	if err := json.Unmarshal(data, &loaded); err != nil {
 		return StateSnapshot{}, err

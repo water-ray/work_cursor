@@ -82,6 +82,7 @@ escape_sed_replacement() {
 }
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+script_path="$script_dir/$(basename "${BASH_SOURCE[0]}")"
 asset_dir="$script_dir"
 if [[ "$script_dir" == "/usr/local/libexec/wateray" ]] && [[ -d "$SYSTEM_ASSET_DIR" ]]; then
   asset_dir="$SYSTEM_ASSET_DIR"
@@ -94,7 +95,9 @@ install_common_assets() {
     "$(dirname "$POLICY_INSTALL_PATH")" \
     "$SYSTEM_DESKTOP_DIR" \
     "$SYSTEM_ICON_DIR"
-  install -m 0755 "$script_dir/wateray-service-helper.sh" "$SYSTEM_HELPER_PATH"
+  # Reinstall the currently running helper, regardless of whether it was invoked
+  # from the bundled ".sh" asset or the already installed no-suffix helper path.
+  install -m 0755 "$script_path" "$SYSTEM_HELPER_PATH"
   install -m 0644 "$asset_dir/waterayd.service.template" "$SYSTEM_ASSET_DIR/waterayd.service.template"
   install -m 0644 "$asset_dir/waterayd-dev.service.template" "$SYSTEM_ASSET_DIR/waterayd-dev.service.template"
   install -m 0644 "$asset_dir/wateray.desktop.template" "$SYSTEM_ASSET_DIR/wateray.desktop.template"

@@ -23,6 +23,14 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from scripts.build.common.desktop_builder import build_desktop_target
+from scripts.build.common.build_manifest import (
+    DESKTOP_BUILD_MANIFEST_NAME,
+    LINUX_PACKAGE_MANIFEST_NAME,
+    build_desktop_bundle_manifest,
+    build_linux_package_manifest,
+    manifest_matches,
+    write_manifest,
+)
 from scripts.build.platforms.linux import TARGET as LINUX_TARGET
 
 
@@ -31,6 +39,7 @@ BIN_DIR = ROOT_DIR / "Bin"
 PACKAGE_OUTPUT_DIR = BIN_DIR / "Wateray-linux-packages"
 TEMP_ROOT_DIR = BIN_DIR / ".tmp" / "linux-packages"
 APPIMAGETOOL_CACHE_DIR = TEMP_ROOT_DIR / "appimagetool"
+LINUX_ASSET_DIR = ROOT_DIR / "scripts" / "build" / "assets" / "linux"
 APPIMAGETOOL_DOWNLOAD_URL = (
     "https://github.com/AppImage/appimagetool/releases/download/continuous/"
     "appimagetool-x86_64.AppImage"
@@ -53,7 +62,7 @@ APPIMAGE_ICON_NAME = "wateray.png"
 APPIMAGE_DIRICON_NAME = ".DirIcon"
 APPIMAGE_APPDIR_NAME = "Wateray.AppDir"
 DEB_DEPENDS = (
-    "systemd, policykit-1, libasound2 | libasound2t64, "
+    "systemd, pkexec | policykit-1, libasound2 | libasound2t64, "
     "libatk-bridge2.0-0, libatk1.0-0, libc6, libcairo2, libcups2, "
     "libdbus-1-3, libdrm2, libgbm1, libglib2.0-0, libgtk-3-0, libnspr4, "
     "libnss3, libpango-1.0-0, libx11-6, libx11-xcb1, libxcb-dri3-0, "
@@ -61,6 +70,12 @@ DEB_DEPENDS = (
     "libxkbcommon0, libxrandr2, libxshmfence1, libxss1, libxtst6, "
     "xdg-utils, zlib1g"
 )
+LINUX_HELPER_SOURCE_PATH = LINUX_ASSET_DIR / "wateray-service-helper.sh"
+LINUX_DESKTOP_TEMPLATE_PATH = LINUX_ASSET_DIR / "wateray.desktop.template"
+LINUX_SERVICE_TEMPLATE_PATH = LINUX_ASSET_DIR / "waterayd.service.template"
+LINUX_DEV_SERVICE_TEMPLATE_PATH = LINUX_ASSET_DIR / "waterayd-dev.service.template"
+LINUX_POLICY_SOURCE_PATH = LINUX_ASSET_DIR / "net.wateray.daemon.policy"
+LINUX_ICON_SOURCE_PATH = LINUX_ASSET_DIR / "wateray.png"
 
 
 class LinuxPackageError(RuntimeError):
@@ -121,52 +136,67 @@ def ensure_executable_file(path: Path, label: str) -> None:
     make_executable(path)
 
 
+def expected_linux_package_paths(version: str) -> list[Path]:
+    return [
+        PACKAGE_OUTPUT_DIR / DEB_OUTPUT_NAME_TEMPLATE.format(version=version),
+        PACKAGE_OUTPUT_DIR / APPIMAGE_OUTPUT_NAME_TEMPLATE.format(version=version),
+    ]
+
+
+def linux_bundle_is_current(source_dir: Path, version: str) -> bool:
+    required_paths = [
+        source_dir / "WaterayApp",
+        source_dir / "core" / "waterayd",
+    ]
+    if not all(path.exists() for path in required_paths):
+        return False
+    expected_manifest = build_desktop_bundle_manifest(
+        LINUX_TARGET.platform_id,
+        version,
+        LINUX_TARGET.output_dir_name,
+    )
+    return manifest_matches(source_dir / DESKTOP_BUILD_MANIFEST_NAME, expected_manifest)
+
+
+def linux_packages_are_current(version: str) -> bool:
+    if not linux_bundle_is_current(LINUX_TARGET.bin_dir, version):
+        return False
+    expected_assets = expected_linux_package_paths(version)
+    if not all(path.exists() for path in expected_assets):
+        return False
+    bundle_manifest = build_desktop_bundle_manifest(
+        LINUX_TARGET.platform_id,
+        version,
+        LINUX_TARGET.output_dir_name,
+    )
+    expected_manifest = build_linux_package_manifest(
+        version,
+        str(bundle_manifest.get("sourceHash", "")).strip(),
+        [path.name for path in expected_assets],
+    )
+    return manifest_matches(PACKAGE_OUTPUT_DIR / LINUX_PACKAGE_MANIFEST_NAME, expected_manifest)
+
+
 def validate_linux_bundle(source_dir: Path, version: str) -> None:
     ensure_dir_exists(source_dir, "Linux 客户端目录产物")
-    bundle_version_path = source_dir / "VERSION"
-    ensure_file_exists(bundle_version_path, "Linux 客户端版本文件")
-    bundle_version = bundle_version_path.read_text(encoding="utf-8").strip()
-    if bundle_version != version:
-        raise LinuxPackageError(
-            f"Linux 客户端目录产物版本不一致：{bundle_version!r} != {version!r}"
-        )
-
     ensure_executable_file(source_dir / "WaterayApp", "Linux 前端可执行文件")
     ensure_executable_file(source_dir / "core" / "waterayd", "Linux 内核可执行文件")
-    ensure_dir_exists(source_dir / "default-config", "Linux 默认配置目录")
-    ensure_dir_exists(source_dir / "linux", "Linux 集成资源目录")
-
-    ensure_executable_file(
-        source_dir / "linux" / "install-system-service.sh",
-        "Linux 服务安装脚本",
-    )
-    ensure_executable_file(
-        source_dir / "linux" / "wateray-service-helper.sh",
-        "Linux root helper 脚本",
-    )
-    ensure_file_exists(
-        source_dir / "linux" / "wateray.desktop.template",
-        "Linux desktop 模板",
-    )
-    ensure_file_exists(
-        source_dir / "linux" / "waterayd.service.template",
-        "Linux packaged service 模板",
-    )
-    ensure_file_exists(
-        source_dir / "linux" / "waterayd-dev.service.template",
-        "Linux dev service 模板",
-    )
-    ensure_file_exists(
-        source_dir / "linux" / "net.wateray.daemon.policy",
-        "Linux polkit policy",
-    )
-    ensure_file_exists(source_dir / "linux" / "wateray.png", "Linux 图标资源")
+    ensure_executable_file(LINUX_HELPER_SOURCE_PATH, "Linux root helper 脚本")
+    ensure_file_exists(LINUX_DESKTOP_TEMPLATE_PATH, "Linux desktop 模板")
+    ensure_file_exists(LINUX_SERVICE_TEMPLATE_PATH, "Linux packaged service 模板")
+    ensure_file_exists(LINUX_DEV_SERVICE_TEMPLATE_PATH, "Linux dev service 模板")
+    ensure_file_exists(LINUX_POLICY_SOURCE_PATH, "Linux polkit policy")
+    ensure_file_exists(LINUX_ICON_SOURCE_PATH, "Linux 图标资源")
 
 
 def ensure_linux_bundle(skip_build: bool, version: str) -> Path:
     source_dir = LINUX_TARGET.bin_dir
     if skip_build:
         print_step("复用现有 Linux 目录产物")
+        if not linux_bundle_is_current(source_dir, version):
+            raise LinuxPackageError(
+                "现有 Linux 目录产物不是当前 VERSION/源码对应的最新构建，请先重新构建或取消 --skip-build"
+            )
     else:
         print_step("构建 Linux 目录产物")
         build_exit_code = build_desktop_target(LINUX_TARGET)
@@ -197,10 +227,21 @@ def write_text_file(path: Path, content: str, executable: bool = False) -> None:
 
 
 def render_linux_desktop_entry(exec_value: str, icon_value: str) -> str:
-    template_path = ROOT_DIR / "scripts" / "build" / "assets" / "linux" / "wateray.desktop.template"
-    template = template_path.read_text(encoding="utf-8")
+    template = LINUX_DESKTOP_TEMPLATE_PATH.read_text(encoding="utf-8")
     return (
         template.replace("__WATERAY_EXEC__", exec_value).replace("__WATERAY_ICON__", icon_value).strip()
+        + "\n"
+    )
+
+
+def render_linux_service_unit(binary_path: str, working_dir: str, install_dir: str, data_root: str) -> str:
+    template = LINUX_SERVICE_TEMPLATE_PATH.read_text(encoding="utf-8")
+    return (
+        template.replace("__WATERAY_BINARY__", binary_path)
+        .replace("__WATERAY_WORKING_DIR__", working_dir)
+        .replace("__WATERAY_INSTALL_DIR__", install_dir)
+        .replace("__WATERAY_DATA_ROOT__", data_root)
+        .strip()
         + "\n"
     )
 
@@ -222,7 +263,7 @@ def build_deb_control(version: str, installed_size_kib: int) -> str:
         Priority: optional
         Architecture: amd64
         Maintainer: Wateray Team <noreply@wateray.invalid>
-        Homepage: https://github.com/water-ray/wateray-src
+        Homepage: https://wateray.net
         Installed-Size: {installed_size_kib}
         Depends: {DEB_DEPENDS}
         Description: Wateray desktop client
@@ -250,9 +291,16 @@ def build_deb_postinst() -> str:
 
         case "$1" in
           configure)
-            if [ -x "{DEB_INSTALL_DIR}/linux/install-system-service.sh" ]; then
-              "{DEB_INSTALL_DIR}/linux/install-system-service.sh" --install-dir "{DEB_INSTALL_DIR}"
+            if command -v systemctl >/dev/null 2>&1; then
+              systemctl daemon-reload >/dev/null 2>&1 || true
+              systemctl enable waterayd.service >/dev/null 2>&1 || true
+              if systemctl is-active --quiet waterayd.service; then
+                systemctl restart waterayd.service
+              else
+                systemctl start waterayd.service
+              fi
             fi
+            rm -f "{LEGACY_HELPER_DESKTOP_PATH}"
             refresh_desktop_cache
             ;;
         esac
@@ -288,14 +336,8 @@ def build_deb_postrm() -> str:
         #!/bin/sh
         set -e
 
-        cleanup_system_assets() {{
-          rm -f "{SERVICE_UNIT_PATH}"
-          rm -f "{HELPER_INSTALL_PATH}"
-          rm -f "{HELPER_DESKTOP_PATH}"
-          rm -f "{LEGACY_HELPER_DESKTOP_PATH}"
-          rm -f "{HELPER_ICON_PATH}"
-          rm -f "{POLKIT_POLICY_PATH}"
-          rm -rf "{HELPER_ASSET_DIR}"
+        cleanup_empty_dirs() {{
+          rmdir "{HELPER_ASSET_DIR}" >/dev/null 2>&1 || true
           rmdir /usr/local/libexec/wateray >/dev/null 2>&1 || true
           rmdir /usr/local/share/wateray >/dev/null 2>&1 || true
         }}
@@ -311,11 +353,12 @@ def build_deb_postrm() -> str:
 
         case "$1" in
           remove|purge)
-            cleanup_system_assets
+            rm -f "{LEGACY_HELPER_DESKTOP_PATH}"
             if command -v systemctl >/dev/null 2>&1; then
               systemctl daemon-reload >/dev/null 2>&1 || true
             fi
             refresh_desktop_cache
+            cleanup_empty_dirs
             ;;
         esac
 
@@ -328,6 +371,41 @@ def build_deb_postrm() -> str:
     )
 
 
+def stage_deb_system_assets(package_root: Path) -> None:
+    helper_target = package_root / Path(HELPER_INSTALL_PATH).relative_to("/")
+    helper_asset_dir = package_root / Path(HELPER_ASSET_DIR).relative_to("/")
+    desktop_target = package_root / Path(HELPER_DESKTOP_PATH).relative_to("/")
+    icon_target = package_root / Path(HELPER_ICON_PATH).relative_to("/")
+    policy_target = package_root / Path(POLKIT_POLICY_PATH).relative_to("/")
+    service_target = package_root / Path(SERVICE_UNIT_PATH).relative_to("/")
+
+    helper_target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(LINUX_HELPER_SOURCE_PATH, helper_target)
+    make_executable(helper_target)
+
+    helper_asset_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(LINUX_SERVICE_TEMPLATE_PATH, helper_asset_dir / LINUX_SERVICE_TEMPLATE_PATH.name)
+    shutil.copy2(LINUX_DEV_SERVICE_TEMPLATE_PATH, helper_asset_dir / LINUX_DEV_SERVICE_TEMPLATE_PATH.name)
+    shutil.copy2(LINUX_DESKTOP_TEMPLATE_PATH, helper_asset_dir / LINUX_DESKTOP_TEMPLATE_PATH.name)
+    shutil.copy2(LINUX_POLICY_SOURCE_PATH, helper_asset_dir / LINUX_POLICY_SOURCE_PATH.name)
+    shutil.copy2(LINUX_ICON_SOURCE_PATH, helper_asset_dir / LINUX_ICON_SOURCE_PATH.name)
+
+    write_text_file(
+        service_target,
+        render_linux_service_unit(
+            binary_path=f"{DEB_INSTALL_DIR}/core/waterayd",
+            working_dir=f"{DEB_INSTALL_DIR}/core",
+            install_dir=DEB_INSTALL_DIR,
+            data_root=DEB_DATA_ROOT,
+        ),
+    )
+    write_text_file(desktop_target, render_linux_desktop_entry(f"{DEB_INSTALL_DIR}/WaterayApp", "wateray"))
+    icon_target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(LINUX_ICON_SOURCE_PATH, icon_target)
+    policy_target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(LINUX_POLICY_SOURCE_PATH, policy_target)
+
+
 def build_deb_package(source_dir: Path, version: str, output_dir: Path) -> Path:
     if shutil.which("dpkg-deb") is None:
         raise LinuxPackageError("缺少 dpkg-deb，无法生成 .deb")
@@ -338,6 +416,7 @@ def build_deb_package(source_dir: Path, version: str, output_dir: Path) -> Path:
 
     install_root = package_root / Path(DEB_INSTALL_DIR).relative_to("/")
     shutil.copytree(source_dir, install_root, symlinks=True, dirs_exist_ok=True)
+    stage_deb_system_assets(package_root)
 
     debian_dir = package_root / "DEBIAN"
     debian_dir.mkdir(parents=True, exist_ok=True)
@@ -388,38 +467,38 @@ def resolve_appimagetool(override: str) -> Path:
     return cached_path
 
 
-def build_appimage_apprun() -> str:
-    return textwrap.dedent(
-        """\
-        #!/bin/sh
-        set -eu
-
-        appdir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
-        data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
-        install_root="$data_home/wateray/appimage"
-        current_dir="$install_root/current"
-        staging_dir="$install_root/.current.$$"
-        source_version=""
-        target_version=""
-
-        if [ -f "$appdir/VERSION" ]; then
-          source_version=$(tr -d '\n' < "$appdir/VERSION")
-        fi
-        if [ -f "$current_dir/VERSION" ]; then
-          target_version=$(tr -d '\n' < "$current_dir/VERSION")
-        fi
-
-        if [ ! -x "$current_dir/WaterayApp" ] || [ "$source_version" != "$target_version" ]; then
-          rm -rf "$staging_dir"
-          mkdir -p "$staging_dir"
-          cp -a "$appdir/." "$staging_dir/"
-          rm -rf "$current_dir"
-          mv "$staging_dir" "$current_dir"
-        fi
-
-        export WATERAY_APP_INSTALL_DIR="$current_dir"
-        exec "$current_dir/WaterayApp" "$@"
-        """
+def build_appimage_apprun(version: str) -> str:
+    return "\n".join(
+        [
+            "#!/bin/sh",
+            "set -eu",
+            "",
+            'appdir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)',
+            'data_home="${XDG_DATA_HOME:-$HOME/.local/share}"',
+            'install_root="$data_home/wateray/appimage"',
+            'current_dir="$install_root/current"',
+            'staging_dir="$install_root/.current.$$"',
+            f'source_version="{version}"',
+            'target_version=""',
+            'version_marker=".wateray-appimage-version"',
+            "",
+            'if [ -f "$current_dir/$version_marker" ]; then',
+            "  target_version=$(tr -d '\\n' < \"$current_dir/$version_marker\")",
+            "fi",
+            "",
+            'if [ ! -x "$current_dir/WaterayApp" ] || [ "$source_version" != "$target_version" ]; then',
+            '  rm -rf "$staging_dir"',
+            '  mkdir -p "$staging_dir"',
+            '  cp -a "$appdir/." "$staging_dir/"',
+            "  printf '%s\\n' \"$source_version\" > \"$staging_dir/$version_marker\"",
+            '  rm -rf "$current_dir"',
+            '  mv "$staging_dir" "$current_dir"',
+            "fi",
+            "",
+            'export WATERAY_APP_INSTALL_DIR="$current_dir"',
+            'exec "$current_dir/WaterayApp" "$@"',
+            "",
+        ]
     )
 
 
@@ -431,9 +510,9 @@ def build_appimage_package(source_dir: Path, version: str, output_dir: Path, app
 
     desktop_content = render_linux_desktop_entry("WaterayApp", "wateray")
     write_text_file(appdir_root / APPIMAGE_DESKTOP_NAME, desktop_content)
-    shutil.copy2(source_dir / "linux" / "wateray.png", appdir_root / APPIMAGE_ICON_NAME)
-    shutil.copy2(source_dir / "linux" / "wateray.png", appdir_root / APPIMAGE_DIRICON_NAME)
-    write_text_file(appdir_root / "AppRun", build_appimage_apprun(), executable=True)
+    shutil.copy2(LINUX_ICON_SOURCE_PATH, appdir_root / APPIMAGE_ICON_NAME)
+    shutil.copy2(LINUX_ICON_SOURCE_PATH, appdir_root / APPIMAGE_DIRICON_NAME)
+    write_text_file(appdir_root / "AppRun", build_appimage_apprun(version), executable=True)
 
     output_path = output_dir / APPIMAGE_OUTPUT_NAME_TEMPLATE.format(version=version)
     if output_path.exists():
@@ -494,6 +573,20 @@ def main() -> int:
         if args.format in ("all", "appimage"):
             appimagetool_path = resolve_appimagetool(args.appimagetool)
             artifacts.append(build_appimage_package(source_dir, version, PACKAGE_OUTPUT_DIR, appimagetool_path))
+
+        bundle_manifest = build_desktop_bundle_manifest(
+            LINUX_TARGET.platform_id,
+            version,
+            LINUX_TARGET.output_dir_name,
+        )
+        write_manifest(
+            PACKAGE_OUTPUT_DIR / LINUX_PACKAGE_MANIFEST_NAME,
+            build_linux_package_manifest(
+                version,
+                str(bundle_manifest.get("sourceHash", "")).strip(),
+                [artifact.name for artifact in artifacts],
+            ),
+        )
 
         print_summary(version, artifacts)
         return 0

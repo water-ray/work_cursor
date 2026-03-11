@@ -118,6 +118,9 @@ func resolveCoreVersion() string {
 	if version, ok := resolveCoreVersionFromFile(); ok {
 		return version
 	}
+	if version, ok := control.ResolveBundledReleaseVersion(); ok {
+		return version
+	}
 	return defaultUnifiedVersion
 }
 

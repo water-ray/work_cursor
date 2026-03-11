@@ -195,7 +195,22 @@ func (s *RuntimeStore) restoreConfigNowWithTaskHandle(
 			if !isCatalogEntryPathAllowed(source, path, stateFile) {
 				return errors.New("restore path is not allowed")
 			}
-			loadedSnapshot, selectedRuleConfig, err := loadBackupSnapshotDocumentFromFile(path, fallback)
+			var (
+				loadedSnapshot     StateSnapshot
+				selectedRuleConfig *RuleConfigV2
+			)
+			if source == ConfigEntrySourceSystemDefault && hasEmbeddedSystemDefaultConfigPath(path) {
+				content, ok, readErr := readEmbeddedBundledDefaultState()
+				if readErr != nil {
+					return readErr
+				}
+				if !ok {
+					return errors.New("embedded system default config is unavailable")
+				}
+				loadedSnapshot, selectedRuleConfig, err = loadBackupSnapshotDocumentFromBytes(content, fallback)
+			} else {
+				loadedSnapshot, selectedRuleConfig, err = loadBackupSnapshotDocumentFromFile(path, fallback)
+			}
 			if err != nil {
 				return err
 			}
@@ -261,9 +276,20 @@ func (s *RuntimeStore) ExportConfigContent(
 		if !isCatalogEntryPathAllowed(source, path, stateFile) {
 			return ExportConfigContentResult{}, errors.New("export path is not allowed")
 		}
-		contentBytes, resolveErr = os.ReadFile(path)
-		if resolveErr != nil {
-			return ExportConfigContentResult{}, resolveErr
+		if source == ConfigEntrySourceSystemDefault && hasEmbeddedSystemDefaultConfigPath(path) {
+			var ok bool
+			contentBytes, ok, resolveErr = readEmbeddedBundledDefaultState()
+			if resolveErr != nil {
+				return ExportConfigContentResult{}, resolveErr
+			}
+			if !ok {
+				return ExportConfigContentResult{}, errors.New("embedded system default config is unavailable")
+			}
+		} else {
+			contentBytes, resolveErr = os.ReadFile(path)
+			if resolveErr != nil {
+				return ExportConfigContentResult{}, resolveErr
+			}
 		}
 	}
 
@@ -1209,6 +1235,19 @@ func resolveSystemDefaultConfigEntry() (ConfigCatalogEntry, bool) {
 		}
 		return entry, true
 	}
+	if content, ok, err := readEmbeddedBundledDefaultState(); err == nil && ok {
+		entry := ConfigCatalogEntry{
+			ID:          makeConfigEntryID(ConfigEntrySourceSystemDefault, embeddedSystemDefaultConfigPath),
+			Source:      ConfigEntrySourceSystemDefault,
+			Name:        "默认配置",
+			FileName:    "waterayd_state.json",
+			Description: "默认配置",
+			SizeBytes:   int64(len(content)),
+			System:      true,
+			Default:     true,
+		}
+		return entry, true
+	}
 	return ConfigCatalogEntry{}, false
 }
 
@@ -1370,6 +1409,13 @@ func loadBackupSnapshotDocumentFromFile(
 	if err != nil {
 		return StateSnapshot{}, nil, err
 	}
+	return loadBackupSnapshotDocumentFromBytes(data, fallback)
+}
+
+func loadBackupSnapshotDocumentFromBytes(
+	data []byte,
+	fallback StateSnapshot,
+) (StateSnapshot, *RuleConfigV2, error) {
 	return parseSnapshotDocumentBytes(data, fallback)
 }
 
@@ -1446,6 +1492,9 @@ func persistBackupSnapshotToFile(
 }
 
 func isCatalogEntryPathAllowed(source ConfigEntrySource, path string, stateFile string) bool {
+	if source == ConfigEntrySourceSystemDefault && hasEmbeddedSystemDefaultConfigPath(path) {
+		return true
+	}
 	resolvedPath, err := filepath.Abs(filepath.Clean(path))
 	if err != nil {
 		return false

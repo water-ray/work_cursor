@@ -13,8 +13,9 @@ type LinuxSystemProxyTarget = {
 };
 
 let lastAppliedSignature = "";
-let inFlightSignature = "";
-let inFlightPromise: Promise<void> | null = null;
+let lastScheduledSignature = "";
+// Serialize Linux proxy writes so a stale "off" sync cannot race a newer "system" sync.
+let syncQueue: Promise<void> = Promise.resolve();
 
 function describeLinuxSystemProxyTarget(snapshot: DaemonSnapshot): LinuxSystemProxyTarget | null {
   if (snapshot.systemType !== "linux") {
@@ -59,29 +60,30 @@ export async function syncLinuxSystemProxyFromSnapshot(
   if (!options?.force && signature === lastAppliedSignature) {
     return;
   }
-  if (!options?.force && inFlightPromise && inFlightSignature === signature) {
-    return inFlightPromise;
+  if (signature === lastScheduledSignature) {
+    return syncQueue;
   }
 
-  const syncTask = invoke("linux_sync_system_proxy", {
-    enabled: target.enabled,
-    port: target.port,
-  })
-    .then(() => {
+  lastScheduledSignature = signature;
+  const syncTask = syncQueue
+    .catch(() => {
+      // Keep the queue alive after a failed sync so later updates can continue.
+    })
+    .then(async () => {
+      await invoke("linux_sync_system_proxy", {
+        enabled: target.enabled,
+        port: target.port,
+      });
       lastAppliedSignature = signature;
     })
     .catch((error) => {
       throw new Error(describeLinuxSystemProxySyncError(error));
-    })
-    .finally(() => {
-      if (inFlightPromise === syncTask) {
-        inFlightPromise = null;
-        inFlightSignature = "";
-      }
     });
-
-  inFlightPromise = syncTask;
-  inFlightSignature = signature;
+  syncQueue = syncTask.finally(() => {
+    if (lastScheduledSignature === signature) {
+      lastScheduledSignature = "";
+    }
+  });
 
   if (options?.throwOnError) {
     await syncTask;

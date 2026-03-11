@@ -12,6 +12,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from scripts.build.common.build_manifest import DESKTOP_BUILD_MANIFEST_NAME
+
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 CORE_DIR = ROOT_DIR / "core"
@@ -23,7 +25,7 @@ LINUX_HELPER_PATH = (
 LINUX_DEV_INSTALL_DIR = ROOT_DIR / "Bin" / ".tmp" / "wateray-linux-dev"
 LINUX_DEV_STAGE_DIR = ROOT_DIR / "Bin" / ".tmp" / "wateray-linux-dev.stage"
 LINUX_DEV_BINARY_PATH = LINUX_DEV_INSTALL_DIR / "core" / "waterayd"
-LINUX_DEV_MANIFEST_PATH = LINUX_DEV_INSTALL_DIR / ".bundle-manifest.json"
+LINUX_DEV_MANIFEST_PATH = LINUX_DEV_INSTALL_DIR / DESKTOP_BUILD_MANIFEST_NAME
 LINUX_DEV_SERVICE_NAME = "waterayd-dev"
 LINUX_DEV_READY_URL = "http://127.0.0.1:39080/v1/state?withLogs=0"
 LINUX_DEV_READY_TIMEOUT_SEC = 20.0
@@ -100,7 +102,7 @@ def read_linux_dev_manifest() -> dict[str, object] | None:
 
 
 def write_linux_dev_manifest(target_dir: Path, payload: dict[str, object]) -> None:
-    (target_dir / ".bundle-manifest.json").write_text(
+    (target_dir / DESKTOP_BUILD_MANIFEST_NAME).write_text(
         json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )

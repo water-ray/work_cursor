@@ -67,8 +67,6 @@ class DaemonTransportManager {
 
   private recoveryInFlight = false;
 
-  private recoverySuppressed = false;
-
   private listeners = new Set<PushListener>();
 
   private status: TransportStatus = {
@@ -109,14 +107,6 @@ class DaemonTransportManager {
 
   getStatus(): TransportStatus {
     return { ...this.status };
-  }
-
-  suspendRecovery(): void {
-    this.recoverySuppressed = true;
-  }
-
-  resumeRecovery(): void {
-    this.recoverySuppressed = false;
   }
 
   async request(payload: DaemonRequestPayload): Promise<DaemonResponsePayload> {
@@ -261,9 +251,6 @@ class DaemonTransportManager {
   }
 
   private async maybeRecoverDaemon(): Promise<void> {
-    if (this.recoverySuppressed) {
-      return;
-    }
     if (this.recoveryInFlight) {
       return;
     }

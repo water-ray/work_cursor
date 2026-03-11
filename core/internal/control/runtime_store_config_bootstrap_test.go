@@ -150,6 +150,50 @@ func TestLoadWithExecutablePathFallsBackToKernelDefaultWhenBundledMissing(t *tes
 	}
 }
 
+func TestLoadWithExecutablePathUsesEmbeddedBundledDefaultWhenReleaseAssetsEnabled(t *testing.T) {
+	tempDir := t.TempDir()
+	executablePath := filepath.Join(tempDir, "Wateray", "core", "WaterayServer.exe")
+	stateFile := filepath.Join(tempDir, "user", "waterayd_state.json")
+	dataRoot := filepath.Join(tempDir, "appdata", "wateray")
+
+	previousEmbeddedFlag := bundledReleaseAssetsEnabled
+	bundledReleaseAssetsEnabled = "1"
+	t.Cleanup(func() {
+		bundledReleaseAssetsEnabled = previousEmbeddedFlag
+	})
+
+	previousDataRoot := os.Getenv(waterayDataRootEnvName)
+	if err := os.Setenv(waterayDataRootEnvName, dataRoot); err != nil {
+		t.Fatalf("set data root failed: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Setenv(waterayDataRootEnvName, previousDataRoot)
+	})
+
+	store := &RuntimeStore{
+		stateFile: stateFile,
+		state:     defaultSnapshot("embedded-runtime", "1.2.3"),
+	}
+	source, err := store.loadWithExecutablePath(executablePath)
+	if err != nil {
+		t.Fatalf("load failed: %v", err)
+	}
+	if source != stateBootstrapSourceBundledDefault {
+		t.Fatalf("expected source=%s, got=%s", stateBootstrapSourceBundledDefault, source)
+	}
+	if _, err := os.Stat(stateFile); err != nil {
+		t.Fatalf("expected embedded bundled default copied to state file: %v", err)
+	}
+	localRuleSetFile := filepath.Join(dataRoot, "rule-set", "geosite-google.srs")
+	content, err := os.ReadFile(localRuleSetFile)
+	if err != nil {
+		t.Fatalf("expected embedded bundled rule-set seeded to app data dir: %v", err)
+	}
+	if strings.TrimSpace(string(content)) != "placeholder-embedded-rule-set" {
+		t.Fatalf("unexpected embedded rule-set content: %q", string(content))
+	}
+}
+
 func TestLoadWithExecutablePathMigratesBundledLegacySchema(t *testing.T) {
 	tempDir := t.TempDir()
 	executablePath := filepath.Join(tempDir, "Wateray", "core", "WaterayServer.exe")

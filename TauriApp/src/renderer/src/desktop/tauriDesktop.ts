@@ -24,8 +24,6 @@ type MaximizedChangeListener = WaterayDesktopApi["window"]["onMaximizedChanged"]
 ) => () => void
   ? T
   : never;
-type LinuxServiceApi = WaterayDesktopApi["system"]["linuxService"];
-type LinuxServiceStatus = Awaited<ReturnType<LinuxServiceApi["getStatus"]>>;
 
 type DesktopWindow = Window & {
   __waterayDesktopInstalled?: boolean;
@@ -230,19 +228,6 @@ function createDesktopApi(): WaterayDesktopApi {
       },
       writeClipboardFile: (path: string): Promise<{ mode: string }> =>
         invoke("system_write_clipboard_file", { path }),
-      linuxService: {
-        getStatus: (): Promise<LinuxServiceStatus> => invoke("linux_service_get_status"),
-        installOrRepair: async () => {
-          const status = await invoke<LinuxServiceStatus>("linux_service_install_or_repair");
-          daemonTransportManager.resumeRecovery();
-          return status;
-        },
-        uninstall: async () => {
-          const status = await invoke<LinuxServiceStatus>("linux_service_uninstall");
-          daemonTransportManager.suspendRecovery();
-          return status;
-        },
-      },
     },
   };
 }

@@ -10,7 +10,15 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from scripts.release.release_framework import DEFAULT_PUBLIC_REPO, resolve_release_root_dir
+from scripts.build.common.build_manifest import (
+    DESKTOP_BUILD_MANIFEST_NAME,
+    build_desktop_bundle_manifest,
+    manifest_matches,
+)
+from scripts.build.platforms.windows import TARGET as WINDOWS_TARGET
+from scripts.build.targets.linux_package import linux_packages_are_current
+from scripts.build.targets.desktop import resolve_current_platform_id
+from scripts.release.release_framework import DEFAULT_PUBLIC_REPO, resolve_release_root_dir, read_version
 
 
 class BuildAndUploadReleaseError(RuntimeError):
@@ -27,6 +35,44 @@ def run_command(command: list[str]) -> None:
     result = subprocess.run(command, cwd=str(ROOT_DIR), check=False)
     if result.returncode != 0:
         raise BuildAndUploadReleaseError(f"命令执行失败：{' '.join(command)}")
+
+
+def current_platform_release_assets_ready(platform_id: str, version: str) -> bool:
+    if platform_id == "linux":
+        return linux_packages_are_current(version)
+    if platform_id == "windows":
+        bundle_dir = ROOT_DIR / "Bin" / WINDOWS_TARGET.output_dir_name
+        required_paths = [
+            bundle_dir / WINDOWS_TARGET.frontend_entry_name,
+            bundle_dir / "core" / WINDOWS_TARGET.daemon_binary_name,
+        ]
+        if not all(path.exists() for path in required_paths):
+            return False
+        expected_manifest = build_desktop_bundle_manifest(
+            WINDOWS_TARGET.platform_id,
+            version,
+            WINDOWS_TARGET.output_dir_name,
+        )
+        return manifest_matches(bundle_dir / DESKTOP_BUILD_MANIFEST_NAME, expected_manifest)
+    return False
+
+
+def build_current_platform_assets(platform_id: str, version: str) -> None:
+    if current_platform_release_assets_ready(platform_id, version):
+        print("==> 复用当前平台已有构建产物")
+        return
+    print("==> 构建当前平台客户端")
+    if platform_id == "linux":
+        run_command(
+            [
+                sys.executable,
+                str(ROOT_DIR / "scripts" / "build" / "targets" / "linux_package.py"),
+                "--format",
+                "all",
+            ]
+        )
+        return
+    run_command([sys.executable, str(ROOT_DIR / "scripts" / "build" / "targets" / "build_current_platform_client.py")])
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,9 +95,10 @@ def main() -> int:
         args = parse_args()
         repo = args.repo.strip() or DEFAULT_PUBLIC_REPO
         release_root_dir = resolve_release_root_dir(args.release_root_dir)
+        platform_id = resolve_current_platform_id()
+        version = read_version()
 
-        print("==> 构建当前平台客户端")
-        run_command([sys.executable, str(ROOT_DIR / "scripts" / "build" / "targets" / "build_current_platform_client.py")])
+        build_current_platform_assets(platform_id, version)
 
         print("==> 生成当前平台 staging 素材")
         run_command(

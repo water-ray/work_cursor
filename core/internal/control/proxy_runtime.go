@@ -2334,6 +2334,10 @@ func copyBundledRuleSetToLocalIfNeeded(kind string, value string) (string, os.Fi
 		}
 		return bundledPath, fileInfo, true
 	}
+	fileName := fmt.Sprintf("%s-%s.srs", strings.ToLower(strings.TrimSpace(kind)), normalizeGeoRuleSetValue(value))
+	if copiedInfo, copied := copyEmbeddedBundledRuleSetFileToLocal(fileName, localPath); copied {
+		return localPath, copiedInfo, true
+	}
 	return "", nil, false
 }
 

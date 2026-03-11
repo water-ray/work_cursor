@@ -29,9 +29,6 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             backend::ensure_packaged_daemon_running,
-            backend::linux_service_get_status,
-            backend::linux_service_install_or_repair,
-            backend::linux_service_uninstall,
             backend::linux_sync_system_proxy,
             backend::window_close_panel_keep_core,
             backend::window_quit_app,

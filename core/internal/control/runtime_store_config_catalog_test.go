@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -357,5 +358,41 @@ func TestExportConfigContentRejectsCurrentState(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatalf("expected current-state export rejected")
+	}
+}
+
+func TestExportConfigContentUsesEmbeddedSystemDefaultWhenReleaseAssetsEnabled(t *testing.T) {
+	tempDir := t.TempDir()
+	previousEmbeddedFlag := bundledReleaseAssetsEnabled
+	bundledReleaseAssetsEnabled = "1"
+	t.Cleanup(func() {
+		bundledReleaseAssetsEnabled = previousEmbeddedFlag
+	})
+
+	previousCWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd failed: %v", err)
+	}
+	if err := os.Chdir(tempDir); err != nil {
+		t.Fatalf("chdir failed: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chdir(previousCWD)
+	})
+
+	store := &RuntimeStore{
+		state: defaultSnapshot("runtime-test", "1.2.3"),
+	}
+	result, err := store.ExportConfigContent(context.Background(), ExportConfigContentRequest{
+		EntryID: makeConfigEntryID(ConfigEntrySourceSystemDefault, embeddedSystemDefaultConfigPath),
+	})
+	if err != nil {
+		t.Fatalf("export embedded system default failed: %v", err)
+	}
+	if result.FileName != "waterayd_state.json" {
+		t.Fatalf("unexpected exported file name: %q", result.FileName)
+	}
+	if strings.TrimSpace(result.Content) == "" {
+		t.Fatalf("expected embedded system default content")
 	}
 }

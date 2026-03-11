@@ -1,6 +1,6 @@
 {
   "name": "wateray-tauri-app",
-  "version": "1.2.0",
+  "version": "1.2.2",
   "private": true,
   "desktopName": "com.wateray.desktop.desktop",
   "description": "Wateray desktop frontend powered by Tauri v2 + React + Ant Design",

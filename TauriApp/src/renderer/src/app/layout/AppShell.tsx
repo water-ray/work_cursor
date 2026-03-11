@@ -1,5 +1,5 @@
-import { Alert, Layout, Menu } from "antd";
-import { useEffect, useRef, useState } from "react";
+import { Alert, Layout, Menu, Spin } from "antd";
+import { Suspense, lazy, useEffect, useRef, useState } from "react";
 import { Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 
 import { useDaemonSnapshot } from "../../hooks/useDaemonSnapshot";
@@ -13,15 +13,30 @@ import {
   uiPreferenceChangedEventName,
   type UIPreferenceChangedEventDetail,
 } from "../settings/uiPreferences";
-import { DnsPage } from "../../pages/dns/DnsPage";
-import { LogsPage } from "../../pages/logs/LogsPage";
-import { AirportPage } from "../../pages/airport/AirportPage";
-import { ProxyPage } from "../../pages/proxy/ProxyPage";
-import { RulesPage } from "../../pages/rules/RulesPage";
-import { SettingsPage } from "../../pages/settings/SettingsPage";
-import { SubscriptionsPage } from "../../pages/subscriptions/SubscriptionsPage";
 import { navRoutes, resolveTitle } from "../navigation/navItems";
 import { daemonApi } from "../../services/daemonApi";
+
+const SubscriptionsPage = lazy(async () => ({
+  default: (await import("../../pages/subscriptions/SubscriptionsPage")).SubscriptionsPage,
+}));
+const ProxyPage = lazy(async () => ({
+  default: (await import("../../pages/proxy/ProxyPage")).ProxyPage,
+}));
+const DnsPage = lazy(async () => ({
+  default: (await import("../../pages/dns/DnsPage")).DnsPage,
+}));
+const RulesPage = lazy(async () => ({
+  default: (await import("../../pages/rules/RulesPage")).RulesPage,
+}));
+const LogsPage = lazy(async () => ({
+  default: (await import("../../pages/logs/LogsPage")).LogsPage,
+}));
+const AirportPage = lazy(async () => ({
+  default: (await import("../../pages/airport/AirportPage")).AirportPage,
+}));
+const SettingsPage = lazy(async () => ({
+  default: (await import("../../pages/settings/SettingsPage")).SettingsPage,
+}));
 
 function runtimeApplyOperationLabel(operation: string | undefined): string {
   switch (operation) {
@@ -38,6 +53,21 @@ function runtimeApplyOperationLabel(operation: string | undefined): string {
     default:
       return operation && operation.trim() !== "" ? operation : "运行时操作";
   }
+}
+
+function RouteLoadingFallback() {
+  return (
+    <div
+      style={{
+        minHeight: 320,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+      }}
+    >
+      <Spin size="large" />
+    </div>
+  );
 }
 
 export function AppShell() {
@@ -350,45 +380,47 @@ export function AppShell() {
               message={`内核通信失败：${daemonState.error}`}
             />
           ) : null}
-          <Routes>
-            <Route
-              path="/subscriptions"
-              element={<SubscriptionsPage {...daemonState} />}
-            />
-            <Route
-              path="/proxy"
-              element={<ProxyPage {...daemonState} />}
-            />
-            <Route
-              path="/dns"
-              element={<DnsPage {...daemonState} />}
-            />
-            <Route
-              path="/rules"
-              element={<RulesPage {...daemonState} />}
-            />
-            <Route
-              path="/logs"
-              element={<LogsPage {...daemonState} />}
-            />
-            <Route
-              path="/airport"
-              element={<AirportPage command={null} />}
-            />
-            <Route
-              path="/settings"
-              element={<SettingsPage {...daemonState} />}
-            />
-            <Route
-              path="*"
-              element={
-                <Navigate
-                  to={defaultRoutePath}
-                  replace
-                />
-              }
-            />
-          </Routes>
+          <Suspense fallback={<RouteLoadingFallback />}>
+            <Routes>
+              <Route
+                path="/subscriptions"
+                element={<SubscriptionsPage {...daemonState} />}
+              />
+              <Route
+                path="/proxy"
+                element={<ProxyPage {...daemonState} />}
+              />
+              <Route
+                path="/dns"
+                element={<DnsPage {...daemonState} />}
+              />
+              <Route
+                path="/rules"
+                element={<RulesPage {...daemonState} />}
+              />
+              <Route
+                path="/logs"
+                element={<LogsPage {...daemonState} />}
+              />
+              <Route
+                path="/airport"
+                element={<AirportPage command={null} />}
+              />
+              <Route
+                path="/settings"
+                element={<SettingsPage {...daemonState} />}
+              />
+              <Route
+                path="*"
+                element={
+                  <Navigate
+                    to={defaultRoutePath}
+                    replace
+                  />
+                }
+              />
+            </Routes>
+          </Suspense>
         </div>
       </Layout.Content>
       <div className="bottom-nav-wrap">

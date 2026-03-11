@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from scripts.build.targets.linux_package import linux_bundle_is_current, linux_packages_are_current
+
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 VERSION_PATH = ROOT_DIR / "VERSION"
@@ -365,19 +367,18 @@ def ensure_linux_installers_ready(version: str) -> None:
             "Linux 安装包缺失，请先在 Linux 宿主机执行 "
             "`python scripts/build/targets/linux_package.py --format all`"
         )
-    expected_files = [
-        LINUX_PACKAGE_OUTPUT_DIR / f"wateray_{version}_amd64.deb",
-        LINUX_PACKAGE_OUTPUT_DIR / f"Wateray-linux-v{version}-x86_64.AppImage",
-    ]
-    if all(path.exists() for path in expected_files):
+    if linux_packages_are_current(version):
         return
+    skip_build = linux_bundle_is_current(BIN_DIR / PLATFORM_DIRECTORY_NAMES["linux"], version)
+    command = [sys.executable, str(ROOT_DIR / "scripts" / "build" / "targets" / "linux_package.py"), "--format", "all"]
+    if skip_build:
+        command.append("--skip-build")
     run_command(
-        [sys.executable, str(ROOT_DIR / "scripts" / "build" / "targets" / "linux_package.py"), "--format", "all", "--skip-build"],
+        command,
         cwd=ROOT_DIR,
     )
-    missing = [str(path) for path in expected_files if not path.exists()]
-    if missing:
-        raise ReleaseFrameworkError(f"Linux 安装包生成失败：{', '.join(missing)}")
+    if not linux_packages_are_current(version):
+        raise ReleaseFrameworkError("Linux 安装包生成失败或与当前 VERSION/源码不一致")
 
 
 def zip_directory(source_dir: Path, destination_without_suffix: Path) -> Path:

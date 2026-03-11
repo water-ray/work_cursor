@@ -5,6 +5,34 @@ import { defineConfig } from "vite";
 
 const r = (...paths: string[]) => resolve(__dirname, ...paths);
 
+function normalizeModuleId(id: string): string {
+  return id.replaceAll("\\", "/");
+}
+
+function manualChunks(id: string): string | undefined {
+  const normalizedId = normalizeModuleId(id);
+  if (!normalizedId.includes("/node_modules/")) {
+    return undefined;
+  }
+  if (
+    normalizedId.includes("/react/") ||
+    normalizedId.includes("/react-dom/") ||
+    normalizedId.includes("/scheduler/")
+  ) {
+    return "vendor-react";
+  }
+  if (
+    normalizedId.includes("/react-router/") ||
+    normalizedId.includes("/react-router-dom/")
+  ) {
+    return "vendor-router";
+  }
+  if (normalizedId.includes("/@tauri-apps/")) {
+    return "vendor-tauri";
+  }
+  return undefined;
+}
+
 export default defineConfig({
   root: r("src/renderer"),
   plugins: [react()],
@@ -29,5 +57,14 @@ export default defineConfig({
   build: {
     outDir: r("dist"),
     emptyOutDir: true,
+    // Route-level lazy loading has already reduced the bootstrap chunk substantially.
+    // Keep the warning threshold slightly above the remaining shared async UI chunk
+    // to avoid noisy warnings in desktop builds.
+    chunkSizeWarningLimit: 650,
+    rollupOptions: {
+      output: {
+        manualChunks,
+      },
+    },
   },
 });
