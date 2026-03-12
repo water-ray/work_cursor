@@ -37,7 +37,7 @@ function buildTrayMenu(window?: BrowserWindow | null): Menu {
     },
     { type: "separator" },
     {
-      label: "普通退出（仅面板）",
+      label: "后台运行（关面板）",
       click: () => {
         app.quit();
       },

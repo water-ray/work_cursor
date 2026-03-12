@@ -327,7 +327,7 @@ pub fn ensure_system_tray(app: &AppHandle) -> Result<(), String> {
     let menu = MenuBuilder::new(app)
         .text(TRAY_MENU_OPEN_MAIN_WINDOW, "打开主界面")
         .separator()
-        .text(TRAY_MENU_QUIT_PANEL_ONLY, "普通退出（仅面板）")
+        .text(TRAY_MENU_QUIT_PANEL_ONLY, "后台运行（关面板）")
         .separator()
         .text(TRAY_MENU_QUIT_ALL, "完全退出（含内核）")
         .build()

@@ -572,7 +572,7 @@ export function WindowTitleBar({
             size="small"
             type="text"
             className="window-quick-action-btn window-quick-action-btn-large window-quick-action-btn-close-panel"
-            title="普通退出（仅面板）"
+            title="后台运行（关面板）"
             loading={closingApp}
             disabled={!canQuitAll}
             icon={<BiIcon name="box-arrow-right" />}

@@ -445,11 +445,11 @@ export function useTrayMenuController({
       },
       {
         id: trayMenuQuitPanelOnly,
-        text: "普通退出（仅面板）",
+        text: "后台运行（关面板）",
         action: () => {
           runDetachedAction(
             () => window.waterayDesktop.window.closePanelKeepCore(),
-            "普通退出失败",
+            "后台运行失败",
           );
         },
       },
