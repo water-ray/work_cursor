@@ -11,7 +11,11 @@ readonly LEGACY_SYSTEM_DESKTOP_FILE_NAME="wateray.desktop"
 readonly SYSTEM_DESKTOP_PATH="$SYSTEM_DESKTOP_DIR/$SYSTEM_DESKTOP_FILE_NAME"
 readonly LEGACY_SYSTEM_DESKTOP_PATH="$SYSTEM_DESKTOP_DIR/$LEGACY_SYSTEM_DESKTOP_FILE_NAME"
 readonly SYSTEM_ICON_DIR="/usr/local/share/icons/hicolor/128x128/apps"
-readonly SYSTEM_ICON_PATH="$SYSTEM_ICON_DIR/wateray.png"
+readonly SYSTEM_ICON_NAME="com.wateray.desktop"
+readonly SYSTEM_ICON_FILE_NAME="$SYSTEM_ICON_NAME.png"
+readonly LEGACY_SYSTEM_ICON_FILE_NAME="wateray.png"
+readonly SYSTEM_ICON_PATH="$SYSTEM_ICON_DIR/$SYSTEM_ICON_FILE_NAME"
+readonly LEGACY_SYSTEM_ICON_PATH="$SYSTEM_ICON_DIR/$LEGACY_SYSTEM_ICON_FILE_NAME"
 readonly DEFAULT_PACKAGED_SERVICE_NAME="waterayd"
 readonly DEFAULT_DEV_SERVICE_NAME="waterayd-dev"
 readonly DEFAULT_PACKAGED_DATA_ROOT="/var/lib/wateray"
@@ -278,8 +282,9 @@ install_packaged_launcher() {
     fail "Missing desktop template: $template_path"
   fi
   install -m 0644 "$asset_dir/wateray.png" "$SYSTEM_ICON_PATH"
+  rm -f "$LEGACY_SYSTEM_ICON_PATH"
   rm -f "$LEGACY_SYSTEM_DESKTOP_PATH"
-  render_desktop_entry "$template_path" "$SYSTEM_DESKTOP_PATH" "$app_path" "$SYSTEM_ICON_PATH"
+  render_desktop_entry "$template_path" "$SYSTEM_DESKTOP_PATH" "$app_path" "$SYSTEM_ICON_NAME"
 }
 
 command_name="${1:-}"

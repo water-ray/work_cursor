@@ -21,6 +21,7 @@ pub fn run() {
                         .build(),
                 )?;
             }
+            backend::cleanup_stale_linux_dev_desktop_override();
             backend::apply_main_window_icon(app.handle());
             if let Err(error) = backend::ensure_system_tray(app.handle()) {
                 log::error!("failed to initialize system tray: {error}");

@@ -52,13 +52,15 @@ HELPER_ASSET_DIR = "/usr/local/share/wateray/linux"
 LINUX_DESKTOP_FILE_NAME = "com.wateray.desktop.desktop"
 LEGACY_HELPER_DESKTOP_PATH = "/usr/local/share/applications/wateray.desktop"
 HELPER_DESKTOP_PATH = f"/usr/local/share/applications/{LINUX_DESKTOP_FILE_NAME}"
-HELPER_ICON_PATH = "/usr/local/share/icons/hicolor/128x128/apps/wateray.png"
+LINUX_DESKTOP_ICON_NAME = "com.wateray.desktop"
+HELPER_ICON_PATH = f"/usr/local/share/icons/hicolor/128x128/apps/{LINUX_DESKTOP_ICON_NAME}.png"
+LEGACY_HELPER_ICON_PATH = "/usr/local/share/icons/hicolor/128x128/apps/wateray.png"
 POLKIT_POLICY_PATH = "/usr/share/polkit-1/actions/net.wateray.daemon.policy"
 SERVICE_UNIT_PATH = "/etc/systemd/system/waterayd.service"
 APPIMAGE_OUTPUT_NAME_TEMPLATE = "Wateray-linux-v{version}-x86_64.AppImage"
 DEB_OUTPUT_NAME_TEMPLATE = "wateray_{version}_amd64.deb"
 APPIMAGE_DESKTOP_NAME = LINUX_DESKTOP_FILE_NAME
-APPIMAGE_ICON_NAME = "wateray.png"
+APPIMAGE_ICON_NAME = f"{LINUX_DESKTOP_ICON_NAME}.png"
 APPIMAGE_DIRICON_NAME = ".DirIcon"
 APPIMAGE_APPDIR_NAME = "Wateray.AppDir"
 DEB_DEPENDS = (
@@ -354,6 +356,7 @@ def build_deb_postrm() -> str:
         case "$1" in
           remove|purge)
             rm -f "{LEGACY_HELPER_DESKTOP_PATH}"
+            rm -f "{LEGACY_HELPER_ICON_PATH}"
             if command -v systemctl >/dev/null 2>&1; then
               systemctl daemon-reload >/dev/null 2>&1 || true
             fi
@@ -399,7 +402,10 @@ def stage_deb_system_assets(package_root: Path) -> None:
             data_root=DEB_DATA_ROOT,
         ),
     )
-    write_text_file(desktop_target, render_linux_desktop_entry(f"{DEB_INSTALL_DIR}/WaterayApp", "wateray"))
+    write_text_file(
+        desktop_target,
+        render_linux_desktop_entry(f"{DEB_INSTALL_DIR}/WaterayApp", LINUX_DESKTOP_ICON_NAME),
+    )
     icon_target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(LINUX_ICON_SOURCE_PATH, icon_target)
     policy_target.parent.mkdir(parents=True, exist_ok=True)
@@ -508,7 +514,7 @@ def build_appimage_package(source_dir: Path, version: str, output_dir: Path, app
     reset_directory(appdir_root)
     shutil.copytree(source_dir, appdir_root, symlinks=True, dirs_exist_ok=True)
 
-    desktop_content = render_linux_desktop_entry("WaterayApp", "wateray")
+    desktop_content = render_linux_desktop_entry("WaterayApp", LINUX_DESKTOP_ICON_NAME)
     write_text_file(appdir_root / APPIMAGE_DESKTOP_NAME, desktop_content)
     shutil.copy2(LINUX_ICON_SOURCE_PATH, appdir_root / APPIMAGE_ICON_NAME)
     shutil.copy2(LINUX_ICON_SOURCE_PATH, appdir_root / APPIMAGE_DIRICON_NAME)

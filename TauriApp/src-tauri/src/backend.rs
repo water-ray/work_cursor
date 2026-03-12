@@ -57,6 +57,16 @@ const TRAY_MENU_QUIT_ALL: &str = "tray-quit-all";
 #[cfg(target_os = "linux")]
 const LINUX_PACKAGED_SERVICE_NAME: &str = "waterayd";
 #[cfg(target_os = "linux")]
+const LINUX_DEV_DESKTOP_OVERRIDE_MARKER: &str = "X-Wateray-DevDesktop=true";
+#[cfg(target_os = "linux")]
+const LINUX_DEV_DESKTOP_FILE_NAME: &str = "com.wateray.desktop.desktop";
+#[cfg(target_os = "linux")]
+const LINUX_ELECTRON_DEV_DESKTOP_FILE_NAME: &str = "wateray-dev-local.desktop";
+#[cfg(target_os = "linux")]
+const LINUX_TAURI_DEV_ICON_PREFIX: &str = "wateray-tauri-dev-";
+#[cfg(target_os = "linux")]
+const LINUX_ELECTRON_DEV_ICON_PREFIX: &str = "wateray-dev-local-";
+#[cfg(target_os = "linux")]
 const LINUX_EMBEDDED_INSTALL_SCRIPT_NAME: &str = "install-system-service.sh";
 #[cfg(target_os = "linux")]
 const LINUX_EMBEDDED_HELPER_SCRIPT_NAME: &str = "wateray-service-helper.sh";
@@ -239,6 +249,70 @@ pub fn apply_main_window_icon(app: &AppHandle) {
     };
     let _ = window.set_icon(icon);
 }
+
+#[cfg(target_os = "linux")]
+pub fn cleanup_stale_linux_dev_desktop_override() {
+    if is_dev_mode() {
+        return;
+    }
+
+    let home_dir = match std::env::var("HOME") {
+        Ok(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return;
+            }
+            PathBuf::from(trimmed)
+        }
+        Err(_) => return,
+    };
+    let applications_dir = home_dir.join(".local").join("share").join("applications");
+    if !applications_dir.is_dir() {
+        return;
+    }
+
+    let mut cleaned = false;
+    let tauri_dev_desktop_path = applications_dir.join(LINUX_DEV_DESKTOP_FILE_NAME);
+    if let Ok(content) = fs::read_to_string(&tauri_dev_desktop_path) {
+        if content.contains(LINUX_DEV_DESKTOP_OVERRIDE_MARKER) {
+            let _ = fs::remove_file(&tauri_dev_desktop_path);
+            cleaned = true;
+        }
+    }
+
+    let electron_dev_desktop_path = applications_dir.join(LINUX_ELECTRON_DEV_DESKTOP_FILE_NAME);
+    if electron_dev_desktop_path.exists() {
+        let _ = fs::remove_file(&electron_dev_desktop_path);
+        cleaned = true;
+    }
+
+    if let Ok(entries) = fs::read_dir(&applications_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let file_name = entry.file_name();
+            let file_name = file_name.to_string_lossy();
+            let is_dev_icon =
+                file_name.starts_with(LINUX_TAURI_DEV_ICON_PREFIX)
+                    || file_name.starts_with(LINUX_ELECTRON_DEV_ICON_PREFIX);
+            if is_dev_icon {
+                let _ = fs::remove_file(path);
+                cleaned = true;
+            }
+        }
+    }
+
+    if cleaned {
+        let _ = Command::new("update-desktop-database")
+            .arg(&applications_dir)
+            .output();
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn cleanup_stale_linux_dev_desktop_override() {}
 
 pub fn ensure_system_tray(app: &AppHandle) -> Result<(), String> {
     if app.tray_by_id(TRAY_ID).is_some() {
