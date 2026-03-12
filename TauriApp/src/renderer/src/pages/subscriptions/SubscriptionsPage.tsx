@@ -2196,6 +2196,20 @@ export function SubscriptionsPage({
                 }}
               />
             </Tooltip>
+            <Tooltip
+              title={canPullSubscription ? "拉取订阅" : "仅订阅分组可用"}
+            >
+              <Button
+                type="text"
+                size="small"
+                className="subscriptions-main-header-detail-btn"
+                icon={<BiIcon name="arrow-down-square" />}
+                disabled={!canPullSubscription}
+                onClick={() => {
+                  handlePullSubscriptionFromMenu();
+                }}
+              />
+            </Tooltip>
           </div>
           <Space
             size={4}
