@@ -18,6 +18,11 @@ import {
   startServiceWithSmartOptimize,
   stopServiceWithFeedback,
 } from "../../services/serviceControl";
+import {
+  beginSharedServiceAction,
+  finishSharedServiceAction,
+  useSharedServiceActionState,
+} from "../../services/sharedServiceAction";
 
 interface WindowTitleBarProps {
   title: string;
@@ -131,6 +136,7 @@ export function WindowTitleBar({
 }: WindowTitleBarProps) {
   const notice = useAppNotice();
   const noticeHistory = useAppNoticeHistory();
+  const sharedServiceAction = useSharedServiceActionState();
   const [maximized, setMaximized] = useState(false);
   const [noticeCenterOpen, setNoticeCenterOpen] = useState(false);
   const [closingApp, setClosingApp] = useState(false);
@@ -166,8 +172,12 @@ export function WindowTitleBar({
     ? snapshotConnectionStage
     : (optimisticConnectionStage ?? snapshotConnectionStage);
   const isServiceTransitioning =
-    connectionStage === "connecting" || connectionStage === "disconnecting";
-  const serviceActionBusy = togglingService || restartingService;
+    connectionStage === "connecting" ||
+    connectionStage === "disconnecting" ||
+    sharedServiceAction.kind === "start" ||
+    sharedServiceAction.kind === "stop";
+  const serviceActionBusy =
+    togglingService || restartingService || sharedServiceAction.kind !== "idle";
   const canOperateService =
     Boolean(snapshot) && !loading && !serviceActionBusy && !isServiceTransitioning && !quittingAll;
   const canQuitAll = !quittingAll && !closingApp;
@@ -203,10 +213,10 @@ export function WindowTitleBar({
   const realtimeNodeSpeedTitle = `总节点实时速度：下行 ${realtimeNodeDownloadText} / 上行 ${realtimeNodeUploadText}`;
   const startStopActionLabel =
     proxyMode === "off"
-      ? connectionStage === "connecting"
+      ? connectionStage === "connecting" || sharedServiceAction.kind === "start"
         ? "启动中"
         : "启动服务"
-      : connectionStage === "disconnecting"
+      : connectionStage === "disconnecting" || sharedServiceAction.kind === "stop"
         ? "停止中"
         : "停止服务";
   const startStopIcon = useMemo(() => {
@@ -315,6 +325,13 @@ export function WindowTitleBar({
     if (!snapshot || !canOperateService) {
       return;
     }
+    const sharedActionHandle = beginSharedServiceAction(
+      proxyMode === "off" ? "start" : "stop",
+      "titlebar",
+    );
+    if (!sharedActionHandle) {
+      return;
+    }
     setTogglingService(true);
     try {
       if (proxyMode === "off") {
@@ -350,11 +367,16 @@ export function WindowTitleBar({
       notice.error(error instanceof Error ? error.message : "切换服务状态失败");
     } finally {
       setTogglingService(false);
+      finishSharedServiceAction(sharedActionHandle);
     }
   };
 
   const restartService = async () => {
     if (!snapshot || !canOperateService) {
+      return;
+    }
+    const sharedActionHandle = beginSharedServiceAction("restart", "titlebar");
+    if (!sharedActionHandle) {
       return;
     }
     setRestartingService(true);
@@ -369,6 +391,7 @@ export function WindowTitleBar({
       notice.error(error instanceof Error ? error.message : "刷新服务失败");
     } finally {
       setRestartingService(false);
+      finishSharedServiceAction(sharedActionHandle);
     }
   };
 
@@ -526,7 +549,7 @@ export function WindowTitleBar({
             type="text"
             className="window-quick-action-btn window-quick-action-btn-large window-quick-action-btn-restart"
             title="重启服务"
-            loading={restartingService}
+            loading={restartingService || sharedServiceAction.kind === "restart"}
             disabled={!canOperateService || togglingService}
             icon={<BiIcon name="arrow-clockwise" />}
             onClick={() => {

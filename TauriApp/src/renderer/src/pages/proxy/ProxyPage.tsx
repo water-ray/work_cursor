@@ -53,6 +53,11 @@ import {
   syncLinuxSystemProxyWithFeedback,
   type ServiceStartupStage,
 } from "../../services/serviceControl";
+import {
+  beginSharedServiceAction,
+  finishSharedServiceAction,
+  useSharedServiceActionState,
+} from "../../services/sharedServiceAction";
 
 const defaultSniffTimeoutMs = 1000;
 const defaultTunMtu = 1420;
@@ -350,6 +355,7 @@ function proxyModeLabel(mode: ProxyMode): string {
 export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
   const notice = useAppNotice();
   const draftNotice = useDraftNotice();
+  const sharedServiceAction = useSharedServiceActionState();
   const [proxyMode, setProxyMode] = useState<ProxyMode>("off");
   const [configuredProxyMode, setConfiguredProxyMode] = useState<ProxyMode>("system");
   const [clearDNSCacheOnRestart, setClearDNSCacheOnRestart] = useState(false);
@@ -465,14 +471,21 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
 
   const effectiveListenAddress = allowExternalConnections ? "0.0.0.0" : "127.0.0.1";
   const isProxyDisabledMode = proxyMode === "off";
+  const sharedServiceBusy = sharedServiceAction.kind !== "idle";
   const serviceActionBusy =
     togglingService ||
     restartingService ||
-    updatingConfiguredProxyMode;
+    updatingConfiguredProxyMode ||
+    sharedServiceBusy;
   const isServiceTransitioning =
-    snapshot?.connectionStage === "connecting" || snapshot?.connectionStage === "disconnecting";
-  const isStoppingTransition = snapshot?.connectionStage === "disconnecting";
-  const isStartingTransition = snapshot?.connectionStage === "connecting";
+    snapshot?.connectionStage === "connecting" ||
+    snapshot?.connectionStage === "disconnecting" ||
+    sharedServiceAction.kind === "start" ||
+    sharedServiceAction.kind === "stop";
+  const isStoppingTransition =
+    snapshot?.connectionStage === "disconnecting" || sharedServiceAction.kind === "stop";
+  const isStartingTransition =
+    snapshot?.connectionStage === "connecting" || sharedServiceAction.kind === "start";
   const mainToggleVisualOff = proxyMode === "off" && !isStoppingTransition;
   const mainToggleActionLabel =
     isStoppingTransition ? "停止中" : isStartingTransition ? "启动中" : proxyMode === "off" ? "启动" : "停止";
@@ -887,6 +900,13 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
     if (!snapshot || loading || serviceActionBusy || isServiceTransitioning) {
       return;
     }
+    const sharedActionHandle = beginSharedServiceAction(
+      proxyMode === "off" ? "start" : "stop",
+      "proxy",
+    );
+    if (!sharedActionHandle) {
+      return;
+    }
     setTogglingService(true);
     try {
       if (proxyMode === "off") {
@@ -981,10 +1001,18 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
     } finally {
       setForcingCloseStartup(false);
       setTogglingService(false);
+      finishSharedServiceAction(sharedActionHandle);
     }
   };
 
   const restartService = async () => {
+    if (!snapshot || loading || serviceActionBusy || isServiceTransitioning) {
+      return;
+    }
+    const sharedActionHandle = beginSharedServiceAction("restart", "proxy");
+    if (!sharedActionHandle) {
+      return;
+    }
     setRestartingService(true);
     try {
       await restartServiceWithFeedback({
@@ -995,6 +1023,7 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
       notice.error(error instanceof Error ? error.message : "重启服务失败");
     } finally {
       setRestartingService(false);
+      finishSharedServiceAction(sharedActionHandle);
     }
   };
 
@@ -1776,7 +1805,7 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
                   aria-label="重启服务"
                   className="proxy-restart-btn"
                   icon={<BiIcon name="arrow-clockwise" />}
-                  loading={restartingService}
+                  loading={restartingService || sharedServiceAction.kind === "restart"}
                   disabled={!snapshot || loading || serviceActionBusy || isServiceTransitioning}
                   onClick={() => {
                     void restartService();

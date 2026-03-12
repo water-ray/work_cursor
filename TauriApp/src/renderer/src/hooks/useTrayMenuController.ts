@@ -23,6 +23,11 @@ import {
 } from "../services/recentNodeSelections";
 import { daemonApi } from "../services/daemonApi";
 import { emitSubscriptionsExternalFocus } from "../services/subscriptionsExternalFocus";
+import {
+  beginSharedServiceAction,
+  finishSharedServiceAction,
+  useSharedServiceActionState,
+} from "../services/sharedServiceAction";
 
 const trayActionToggleService = "toggle-service";
 const trayActionRestartService = "restart-service";
@@ -140,6 +145,7 @@ export function useTrayMenuController({
   runAction,
   notice,
 }: UseTrayMenuControllerParams): void {
+  const sharedServiceAction = useSharedServiceActionState();
   const [recentSelections, setRecentSelections] = useState<RecentNodeSelection[]>(() =>
     readRecentNodeSelections(),
   );
@@ -235,15 +241,26 @@ export function useTrayMenuController({
     const currentSnapshot = snapshotRef.current;
     const currentRecentSelections = recentSelections;
     const currentBusyAction = busyAction;
+    const currentSharedServiceKind = sharedServiceAction.kind;
     const recentTargets = currentSnapshot
       ? resolveRecentNodeTargets(currentSnapshot, currentRecentSelections)
       : [];
 
     const canTriggerSnapshotAction =
-      currentSnapshot != null && currentBusyAction === "";
-    const serviceToggleText =
+      currentSnapshot != null &&
+      currentBusyAction === "" &&
+      currentSharedServiceKind === "idle";
+    const serviceToggleBusy =
       currentBusyAction === trayActionToggleService
-        ? currentSnapshot?.proxyMode === "off"
+      || currentSharedServiceKind === "start"
+      || currentSharedServiceKind === "stop";
+    const serviceToggleText =
+      serviceToggleBusy
+        ? currentSharedServiceKind === "start"
+          || (
+            currentSharedServiceKind !== "stop" &&
+            currentSnapshot?.proxyMode === "off"
+          )
           ? "正在启动服务..."
           : "正在停止服务..."
         : currentSnapshot == null
@@ -254,7 +271,7 @@ export function useTrayMenuController({
             ? "启动服务"
             : "停止服务";
     const restartServiceText =
-      currentBusyAction === trayActionRestartService
+      currentBusyAction === trayActionRestartService || currentSharedServiceKind === "restart"
         ? "正在重启服务..."
         : "重启服务";
     const clearDnsText =
@@ -267,7 +284,10 @@ export function useTrayMenuController({
         ? recentTargets.map((target) => ({
             id: `${trayActionNodePrefix}${target.groupId}:${target.nodeId}`,
             text: formatRecentNodeLabel(target),
-            enabled: currentBusyAction === "" && !target.isCurrent,
+            enabled:
+              currentBusyAction === "" &&
+              currentSharedServiceKind === "idle" &&
+              !target.isCurrent,
             action: () => {
               void runBusyTrayAction(
                 `${trayActionNodePrefix}${target.groupId}:${target.nodeId}`,
@@ -337,6 +357,7 @@ export function useTrayMenuController({
         enabled:
           currentSnapshot != null
           && currentBusyAction === ""
+          && currentSharedServiceKind === "idle"
           && currentSnapshot.connectionStage !== "connecting"
           && currentSnapshot.connectionStage !== "disconnecting",
         action: () => {
@@ -345,28 +366,39 @@ export function useTrayMenuController({
             if (!latestSnapshot) {
               throw new Error("当前状态尚未同步完成，请稍后再试");
             }
-            if (latestSnapshot.proxyMode === "off") {
-              const startResult = await startServiceWithSmartOptimize({
-                snapshot: latestSnapshot,
-                runAction: runActionRef.current,
-                notice: noticeRef.current,
-                startupSmartOptimize: readProxyStartupSmartOptimizePreference(),
-              });
-              if (startResult.aborted) {
-                return;
-              }
-              noticeRef.current.success(
-                buildServiceStartedMessage(
-                  startResult.targetMode,
-                  startResult.selectedNodeName,
-                ),
-              );
+            const sharedActionHandle = beginSharedServiceAction(
+              latestSnapshot.proxyMode === "off" ? "start" : "stop",
+              "tray",
+            );
+            if (!sharedActionHandle) {
               return;
             }
-            await stopServiceWithFeedback({
-              runAction: runActionRef.current,
-              notice: noticeRef.current,
-            });
+            try {
+              if (latestSnapshot.proxyMode === "off") {
+                const startResult = await startServiceWithSmartOptimize({
+                  snapshot: latestSnapshot,
+                  runAction: runActionRef.current,
+                  notice: noticeRef.current,
+                  startupSmartOptimize: readProxyStartupSmartOptimizePreference(),
+                });
+                if (startResult.aborted) {
+                  return;
+                }
+                noticeRef.current.success(
+                  buildServiceStartedMessage(
+                    startResult.targetMode,
+                    startResult.selectedNodeName,
+                  ),
+                );
+                return;
+              }
+              await stopServiceWithFeedback({
+                runAction: runActionRef.current,
+                notice: noticeRef.current,
+              });
+            } finally {
+              finishSharedServiceAction(sharedActionHandle);
+            }
           });
         },
       },
@@ -376,10 +408,18 @@ export function useTrayMenuController({
         enabled: canTriggerSnapshotAction,
         action: () => {
           void runBusyTrayAction(trayActionRestartService, async () => {
-            await restartServiceWithFeedback({
-              runAction: runActionRef.current,
-              notice: noticeRef.current,
-            });
+            const sharedActionHandle = beginSharedServiceAction("restart", "tray");
+            if (!sharedActionHandle) {
+              return;
+            }
+            try {
+              await restartServiceWithFeedback({
+                runAction: runActionRef.current,
+                notice: noticeRef.current,
+              });
+            } finally {
+              finishSharedServiceAction(sharedActionHandle);
+            }
           });
         },
       },
@@ -469,6 +509,7 @@ export function useTrayMenuController({
     runBusyTrayAction,
     runDetachedAction,
     commitRecentSelections,
+    sharedServiceAction.kind,
     snapshot?.activeGroupId,
     snapshot?.connectionStage,
     snapshot?.proxyMode,
