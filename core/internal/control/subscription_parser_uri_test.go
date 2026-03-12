@@ -47,6 +47,33 @@ func TestParseURINodeSetsInsecureFromSkipCertVerifyAlias(t *testing.T) {
 	}
 }
 
+func TestPostProcessParsedNodesAndStatusKeepsDuplicateNodes(t *testing.T) {
+	nodes := []Node{
+		{
+			ID:       "node-1",
+			Name:     "jp-1",
+			Protocol: NodeProtocol("vmess"),
+			Address:  "example.com",
+			Port:     443,
+		},
+		{
+			ID:       "node-2",
+			Name:     "jp-1",
+			Protocol: NodeProtocol("vmess"),
+			Address:  "example.com",
+			Port:     443,
+		},
+	}
+
+	filtered, status := postProcessParsedNodesAndStatus("", nodes, "")
+	if len(filtered) != 2 {
+		t.Fatalf("expected duplicate parsed nodes to be kept, got %d", len(filtered))
+	}
+	if status != "" {
+		t.Fatalf("expected empty status to stay empty, got %q", status)
+	}
+}
+
 func decodeNodeRawConfig(t *testing.T, rawConfig string) map[string]any {
 	t.Helper()
 	var payload map[string]any

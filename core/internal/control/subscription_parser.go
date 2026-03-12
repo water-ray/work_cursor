@@ -867,12 +867,11 @@ func composeSubscriptionStatus(traffic string, date string, fallback string) str
 }
 
 func postProcessParsedNodesAndStatus(content string, nodes []Node, status string) ([]Node, string) {
-	deduped := dedupeNodes(nodes)
-	if len(deduped) == 0 {
-		return deduped, strings.TrimSpace(status)
+	if len(nodes) == 0 {
+		return nodes, strings.TrimSpace(status)
 	}
 	explicitMarker := hasExplicitStatusMarker(content)
-	filtered, nextStatus := applyStrictStatusNodeFilter(deduped, status, explicitMarker)
+	filtered, nextStatus := applyStrictStatusNodeFilter(nodes, status, explicitMarker)
 	return filtered, strings.TrimSpace(nextStatus)
 }
 
@@ -1490,20 +1489,6 @@ func buildNode(
 		TodayUploadMB:   0,
 		RawConfig:       rawConfig,
 	}
-}
-
-func dedupeNodes(nodes []Node) []Node {
-	seen := map[string]struct{}{}
-	result := make([]Node, 0, len(nodes))
-	for _, node := range nodes {
-		key := fmt.Sprintf("%s|%s|%d|%s", node.Protocol, node.Address, node.Port, node.Name)
-		if _, ok := seen[key]; ok {
-			continue
-		}
-		seen[key] = struct{}{}
-		result = append(result, node)
-	}
-	return result
 }
 
 func splitLines(content string) []string {
