@@ -7,7 +7,8 @@ export const probeIntervalMinOptions = [30, 60, 180, 300] as const;
 export const probeRealConnectTestUrlOptions = [
   "https://www.google.com/generate_204",
   "https://www.gstatic.com/generate_204",
-  "http://cp.cloudflare.com",
+  "http://connect.rom.miui.com/generate_204",
+  "http://cp.cloudflare.com/generate_204",
   "https://www.apple.com/library/test/success.html",
   "http://www.msftconnecttest.com/connecttest.txt",
   "https://time.tv.cctv.com/time.php"
