@@ -332,7 +332,7 @@
       }
     },
     {
-      "label": "私有源码：推送到指定分支",
+      "label": "私有源码：推送到指定分支+++",
       "type": "shell",
       "command": "python scripts/git/private_source_tasks.py push-main --remote \"${input:githubPrivateRemoteName}\" --branch \"${input:githubPrivateTargetBranch}\"",
       "options": {
