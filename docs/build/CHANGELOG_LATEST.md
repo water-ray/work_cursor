@@ -1,20 +1,29 @@
 # CHANGELOG_LATEST
 
-## v1.3.0
-- 生成时间：2026-03-12 06:59:12
-- 版本升级：minor
+## v1.3.1
+- 生成时间：2026-03-12 12:08:02
+- 版本升级：patch
 - 基线标签：无（首次生成）
 
 ### Features
 - feat: finalize adsroot migration and release workflow (f02dc8b)
 
 ### Fixes
+- 修复编译警告 (9407bcb)
 - fix: 修复 Windows DLL 构建时版本符号冲突 (9f0dfa6)
 
 ### Refactors
 - 优化LInux安装包，代理问题修复 (37a13d6)
 
 ### Others
+- 后台运行（关面板） (dcaa4a6)
+- 拉取优化 (6d9cdbe)
+- 拉取优化 (947559c)
+- 拉取订阅图标按钮 (092dd19)
+- 多处启动按钮联动优化 (7287ecd)
+- 测试推送 (1bd4bda)
+- 自动更新支持 (cdcce10)
+- 自动更新支持 (669135a)
 - 自动更新支持 (59c6269)
 - 移除公开发布说明中的发布者提示 (227baed)
 - 分支切换任务优化 (cfb5038)
