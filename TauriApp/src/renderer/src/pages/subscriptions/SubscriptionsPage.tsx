@@ -355,7 +355,7 @@ export function SubscriptionsPage({
   });
   const [draftGroupOrder, setDraftGroupOrder] = useState<string[] | null>(null);
   const [draftNodeOrders, setDraftNodeOrders] = useState<Record<string, string[]>>({});
-  const [draggingGroupID, setDraggingGroupID] = useState<string>("");
+  const draggingGroupIDRef = useRef<string>("");
   const hasDraftChangesRef = useRef(false);
   const [visibleColumnKeys, setVisibleColumnKeys] = useState<ColumnKey[]>(() =>
     loadVisibleColumns(),
@@ -738,10 +738,12 @@ export function SubscriptionsPage({
   );
   const {
     draggingNodeIDs,
+    sortPreview,
     clearDraggingNodeIDs,
-    handleRowDragStart,
-    handleRowDragOver,
-    handleRowDrop,
+    handleRowSortStart,
+    handleRowSortCommit,
+    handleRowSortPreview,
+    handleRowSortLeave,
   } = useNodeRowDragSort<NodeRow>({
     canReorderRows,
     selectedRowKeys,
@@ -755,7 +757,11 @@ export function SubscriptionsPage({
       }));
     },
     notifyDragStart: (movingCount) => {
-      notice.info(`上下拖拽排序(共${movingCount}行)`, 1.2);
+      notice.info(`上下拖拽排序(共${movingCount}行)`, {
+        title: "拖拽排序",
+        durationMs: 1800,
+        placement: "top-center",
+      });
     },
   });
   const isGroupOrderDirty = !sameStringArray(effectiveGroupOrder, snapshotGroupOrder);
@@ -1531,7 +1537,7 @@ export function SubscriptionsPage({
         }
         setDraftGroupOrder(null);
         setDraftNodeOrders({});
-        setDraggingGroupID("");
+        draggingGroupIDRef.current = "";
         clearDraggingNodeIDs();
         setSortState({
           key: "",
@@ -1580,7 +1586,7 @@ export function SubscriptionsPage({
     const hadProbeDraftChanges = hasProbeSettingsDraftChanges;
     setDraftGroupOrder(null);
     setDraftNodeOrders({});
-    setDraggingGroupID("");
+    draggingGroupIDRef.current = "";
     clearDraggingNodeIDs();
     setSortState({
       key: "",
@@ -1613,12 +1619,13 @@ export function SubscriptionsPage({
   }, [notice]);
 
   const handleGroupDragStart = (groupID: string) => (event: React.DragEvent<HTMLElement>) => {
-    setDraggingGroupID(groupID);
+    draggingGroupIDRef.current = groupID;
     event.dataTransfer.effectAllowed = "move";
   };
 
   const handleGroupDragOver = (groupID: string) => (event: React.DragEvent<HTMLElement>) => {
-    if (draggingGroupID === "" || draggingGroupID === groupID) {
+    const currentDraggingGroupID = draggingGroupIDRef.current;
+    if (currentDraggingGroupID === "" || currentDraggingGroupID === groupID) {
       return;
     }
     event.preventDefault();
@@ -1626,17 +1633,23 @@ export function SubscriptionsPage({
   };
 
   const handleGroupDrop = (groupID: string) => (event: React.DragEvent<HTMLElement>) => {
-    if (draggingGroupID === "" || draggingGroupID === groupID) {
+    const currentDraggingGroupID = draggingGroupIDRef.current;
+    if (currentDraggingGroupID === "" || currentDraggingGroupID === groupID) {
       return;
     }
     event.preventDefault();
     const rect = event.currentTarget.getBoundingClientRect();
     const placeAfter = event.clientX >= rect.left + rect.width / 2;
-    const nextOrder = reorderListByMove(effectiveGroupOrder, [draggingGroupID], groupID, placeAfter);
+    const nextOrder = reorderListByMove(
+      effectiveGroupOrder,
+      [currentDraggingGroupID],
+      groupID,
+      placeAfter,
+    );
     if (!sameStringArray(nextOrder, effectiveGroupOrder)) {
       setDraftGroupOrder(nextOrder);
     }
-    setDraggingGroupID("");
+    draggingGroupIDRef.current = "";
   };
 
   const menuItems = useMemo<MenuProps["items"]>(
@@ -1955,21 +1968,14 @@ export function SubscriptionsPage({
           {originNode}
           <span
             className={`subscriptions-drag-handle${canReorderRows ? "" : " is-disabled"}`}
-            draggable={canReorderRows}
             title={canReorderRows ? "拖拽排序" : "仅默认排序可拖拽"}
-            onMouseDown={(event) => {
-              event.stopPropagation();
-            }}
+            onMouseDown={handleRowSortStart(row)}
             onPointerDown={(event) => {
               event.stopPropagation();
             }}
             onClick={(event) => {
               event.preventDefault();
               event.stopPropagation();
-            }}
-            onDragStart={handleRowDragStart(row)}
-            onDragEnd={() => {
-              clearDraggingNodeIDs();
             }}
           >
             <BiIcon name="grip-vertical" />
@@ -1980,7 +1986,7 @@ export function SubscriptionsPage({
         setSelectedRowKeys(keys.map((item) => String(item)));
       },
     };
-  }, [selectedRowKeys, canReorderRows, handleRowDragStart, clearDraggingNodeIDs]);
+  }, [selectedRowKeys, canReorderRows, handleRowSortStart]);
   const handleTableRow = useCallback(
     (row: NodeRow) => ({
       onDoubleClick: (event: ReactMouseEvent<HTMLElement>) => {
@@ -1997,11 +2003,12 @@ export function SubscriptionsPage({
         if (hoveredRowKeyRef.current === row.key) {
           hoveredRowKeyRef.current = "";
         }
+        handleRowSortLeave(row)();
       },
-      onDragOver: handleRowDragOver(row),
-      onDrop: handleRowDrop(row),
+      onMouseMove: handleRowSortPreview(row),
+      onMouseUp: handleRowSortCommit(row),
     }),
-    [activateNode, handleRowDragOver, handleRowDrop, openManualRowEditor],
+    [activateNode, handleRowSortCommit, handleRowSortLeave, handleRowSortPreview, openManualRowEditor],
   );
 
   const handleSubmitNodeEditor = useCallback(
@@ -2346,7 +2353,7 @@ export function SubscriptionsPage({
                   onDragOver={handleGroupDragOver(group.id)}
                   onDrop={handleGroupDrop(group.id)}
                   onDragEnd={() => {
-                    setDraggingGroupID("");
+                    draggingGroupIDRef.current = "";
                   }}
                 >
                   <Tooltip
@@ -2438,6 +2445,13 @@ export function SubscriptionsPage({
         >
           {tableRenderReady ? (
             <>
+              {draggingNodeIDs.length > 0 ? (
+                <div className="table-sort-hint">
+                  <Typography.Text type="secondary">
+                    正在调整 {draggingNodeIDs.length} 行顺序，移动到目标行上半区或下半区后松开左键即可。
+                  </Typography.Text>
+                </div>
+              ) : null}
               <Table<NodeRow>
                 className="subscriptions-node-table table-fixed-leading-columns"
                 rowKey="key"
@@ -2454,6 +2468,16 @@ export function SubscriptionsPage({
                     classNames.push("active-node-row");
                   } else if (row.node.id === locatedNodeID) {
                     classNames.push("subscriptions-located-row");
+                  }
+                  if (draggingNodeIDs.includes(row.key)) {
+                    classNames.push("table-row-sort-dragging");
+                  }
+                  if (sortPreview?.key === row.key) {
+                    classNames.push(
+                      sortPreview.position === "before"
+                        ? "table-row-sort-target-before"
+                        : "table-row-sort-target-after",
+                    );
                   }
                   return classNames.join(" ");
                 }}

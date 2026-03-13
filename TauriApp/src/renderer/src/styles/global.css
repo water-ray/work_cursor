@@ -955,6 +955,14 @@ body.settings-draft-nav-lock .bottom-nav-menu.ant-menu {
   background: #fbfcff;
 }
 
+.table-sort-hint {
+  margin-bottom: 8px;
+  padding: 7px 10px;
+  border: 1px dashed rgba(53, 118, 246, 0.32);
+  border-radius: 8px;
+  background: rgba(240, 245, 255, 0.72);
+}
+
 .subscriptions-context-menu-panel {
   position: fixed;
   z-index: 4000;
@@ -1029,6 +1037,22 @@ body.settings-draft-nav-lock .bottom-nav-menu.ant-menu {
 
 .subscriptions-node-table .ant-table-tbody > tr.subscriptions-locate-row-flash > td {
   animation: subscriptions-row-locate-flash 0.9s ease-out;
+}
+
+.subscriptions-node-table .ant-table-tbody > tr.table-row-sort-dragging > td,
+.rules-composed-table .ant-table-tbody > tr.table-row-sort-dragging > td {
+  background: #eef4ff !important;
+  color: #1d4ed8;
+}
+
+.subscriptions-node-table .ant-table-tbody > tr.table-row-sort-target-before > td,
+.rules-composed-table .ant-table-tbody > tr.table-row-sort-target-before > td {
+  box-shadow: inset 0 2px 0 #3576f6;
+}
+
+.subscriptions-node-table .ant-table-tbody > tr.table-row-sort-target-after > td,
+.rules-composed-table .ant-table-tbody > tr.table-row-sort-target-after > td {
+  box-shadow: inset 0 -2px 0 #3576f6;
 }
 
 @keyframes subscriptions-row-locate-flash {

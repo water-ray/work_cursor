@@ -15,7 +15,7 @@ import {
 } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { DragEvent } from "react";
+import type { MouseEvent as ReactMouseEvent } from "react";
 import { BiIcon } from "../../../components/icons/BiIcon";
 import { DraftActionBar } from "../../../components/draft/DraftActionBar";
 import { HelpLabel } from "../../../components/form/HelpLabel";
@@ -640,8 +640,14 @@ export function ComposedRulesTabs({
   const [savingDraft, setSavingDraft] = useState(false);
   const [selectedRowKeys, setSelectedRowKeys] = useState<string[]>([]);
   const [copiedRules, setCopiedRules] = useState<RuleItemV2[]>([]);
-  const [draggingRuleIDs, setDraggingRuleIDs] = useState<string[]>([]);
-  const [draggingGroupID, setDraggingGroupID] = useState<string>("");
+  const draggingRuleIDsRef = useRef<string[]>([]);
+  const draggingGroupIDRef = useRef<string>("");
+  const [rulePointerSortingActive, setRulePointerSortingActive] = useState(false);
+  const [ruleSortPreview, setRuleSortPreview] = useState<{
+    groupId: string;
+    ruleId: string;
+    position: "before" | "after";
+  } | null>(null);
   const [groupModalOpen, setGroupModalOpen] = useState(false);
   const [groupModalMode, setGroupModalMode] = useState<"add" | "edit">("add");
   const [editingGroupID, setEditingGroupID] = useState("");
@@ -726,11 +732,34 @@ export function ComposedRulesTabs({
     });
   }, [draftActiveGroupID, normalizedGroups]);
 
+  const clearRulePointerSorting = () => {
+    draggingRuleIDsRef.current = [];
+    draggingGroupIDRef.current = "";
+    setRulePointerSortingActive(false);
+    setRuleSortPreview(null);
+  };
+
   useEffect(() => {
     setSelectedRowKeys([]);
-    setDraggingRuleIDs([]);
-    setDraggingGroupID("");
+    clearRulePointerSorting();
   }, [openedGroupID]);
+
+  useEffect(() => {
+    if (!rulePointerSortingActive) {
+      return;
+    }
+    const clearRulePointerSortingLater = () => {
+      window.setTimeout(() => {
+        clearRulePointerSorting();
+      }, 0);
+    };
+    window.addEventListener("mouseup", clearRulePointerSortingLater);
+    window.addEventListener("blur", clearRulePointerSorting);
+    return () => {
+      window.removeEventListener("mouseup", clearRulePointerSortingLater);
+      window.removeEventListener("blur", clearRulePointerSorting);
+    };
+  }, [rulePointerSortingActive]);
 
   useDraftNavLock({
     lockClassName: "rules-draft-nav-lock",
@@ -860,10 +889,104 @@ export function ComposedRulesTabs({
       return sourceActiveGroupID;
     });
     setSelectedRowKeys([]);
-    setDraggingRuleIDs([]);
-    setDraggingGroupID("");
+    clearRulePointerSorting();
     draftNotice.notifyDraftReverted("规则");
   };
+
+  const handleRuleSortStart =
+    (group: RuleGroup, record: RuleItemV2) => (event: ReactMouseEvent<HTMLElement>) => {
+      if (event.button !== 0 || group.locked) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      const groupRules = group.rules ?? [];
+      const candidateIDs = selectedRowKeys.includes(record.id) ? selectedRowKeys : [record.id];
+      const nextDraggingIDs = candidateIDs.filter((id) => groupRules.some((item) => item.id === id));
+      const draggingIDs = nextDraggingIDs.length > 0 ? nextDraggingIDs : [record.id];
+      draggingRuleIDsRef.current = draggingIDs;
+      draggingGroupIDRef.current = group.id;
+      setRulePointerSortingActive(true);
+      notice.info(`上下拖拽排序(共${draggingIDs.length}行)`, {
+        title: "拖拽排序",
+        durationMs: 1800,
+        placement: "top-center",
+      });
+    };
+
+  const handleRuleSortPreview =
+    (group: RuleGroup, record: RuleItemV2) => (event: ReactMouseEvent<HTMLTableRowElement>) => {
+      const draggingRuleIDs = draggingRuleIDsRef.current;
+      const draggingGroupID = draggingGroupIDRef.current;
+      if (
+        group.locked ||
+        draggingRuleIDs.length === 0 ||
+        draggingGroupID !== group.id ||
+        draggingRuleIDs.includes(record.id)
+      ) {
+        return;
+      }
+      const rect = event.currentTarget.getBoundingClientRect();
+      const position = event.clientY > rect.top + rect.height / 2 ? "after" : "before";
+      setRuleSortPreview((previous) =>
+        previous?.groupId === group.id &&
+        previous.ruleId === record.id &&
+        previous.position === position
+          ? previous
+          : {
+              groupId: group.id,
+              ruleId: record.id,
+              position,
+            },
+      );
+    };
+
+  const handleRuleSortLeave = (group: RuleGroup, record: RuleItemV2) => () => {
+    setRuleSortPreview((previous) =>
+      previous?.groupId === group.id && previous.ruleId === record.id ? null : previous,
+    );
+  };
+
+  const handleRuleSortCommit =
+    (group: RuleGroup, record: RuleItemV2) => (event: ReactMouseEvent<HTMLTableRowElement>) => {
+      if (event.button !== 0 || group.locked) {
+        return;
+      }
+      const draggingRuleIDs = draggingRuleIDsRef.current;
+      const draggingGroupID = draggingGroupIDRef.current;
+      if (
+        draggingRuleIDs.length === 0 ||
+        draggingGroupID !== group.id ||
+        draggingRuleIDs.includes(record.id)
+      ) {
+        clearRulePointerSorting();
+        return;
+      }
+      event.preventDefault();
+      const sourceRules = group.rules ?? [];
+      const source = sourceRules.map((item) => item.id);
+      const rect = event.currentTarget.getBoundingClientRect();
+      const placeAfter = event.clientY > rect.top + rect.height / 2;
+      const reordered = reorderListByMove(source, draggingRuleIDs, record.id, placeAfter);
+      if (sameStringArray(source, reordered)) {
+        clearRulePointerSorting();
+        return;
+      }
+      const byID = new Map(sourceRules.map((item) => [item.id, item]));
+      const nextRules = reordered
+        .map((id) => byID.get(id))
+        .filter((item): item is RuleItemV2 => Boolean(item));
+      const nextGroups = normalizedGroups.map((targetGroup) =>
+        targetGroup.id === group.id
+          ? {
+              ...targetGroup,
+              rules: nextRules,
+            }
+          : targetGroup,
+      );
+      void commitGroups(nextGroups, resolvedActiveGroupID);
+      clearRulePointerSorting();
+    };
 
   const columns: ColumnsType<RuleItemV2> = [
     {
@@ -871,7 +994,7 @@ export function ComposedRulesTabs({
       key: "drag",
       width: 40,
       align: "center",
-      render: () => (
+      render: (_value, record) => (
         <span
           style={{
             color: currentGroupLocked ? "#d9d9d9" : "#bfbfbf",
@@ -880,6 +1003,14 @@ export function ComposedRulesTabs({
             alignItems: "center",
             justifyContent: "center",
             opacity: currentGroupLocked ? 0.72 : 1,
+          }}
+          onMouseDown={handleRuleSortStart(currentGroup, record)}
+          onPointerDown={(event) => {
+            event.stopPropagation();
+          }}
+          onClick={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
           }}
         >
           <BiIcon name="grip-vertical" />
@@ -1286,6 +1417,13 @@ export function ComposedRulesTabs({
                     </Tooltip>
                   </Space>
                 </div>
+                {rulePointerSortingActive && draggingGroupIDRef.current === group.id ? (
+                  <div className="table-sort-hint">
+                    <Typography.Text type="secondary">
+                      正在调整 {draggingRuleIDsRef.current.length} 条规则顺序，移动到目标行上半区或下半区后松开左键即可。
+                    </Typography.Text>
+                  </div>
+                ) : null}
                 <Table<RuleItemV2>
                   className="rules-composed-table table-fixed-leading-columns"
                   rowKey="id"
@@ -1293,6 +1431,23 @@ export function ComposedRulesTabs({
                   pagination={false}
                   columns={columns}
                   dataSource={group.rules ?? []}
+                  rowClassName={(record) => {
+                    const classNames: string[] = [];
+                    if (draggingRuleIDsRef.current.includes(record.id)) {
+                      classNames.push("table-row-sort-dragging");
+                    }
+                    if (
+                      ruleSortPreview?.groupId === group.id &&
+                      ruleSortPreview.ruleId === record.id
+                    ) {
+                      classNames.push(
+                        ruleSortPreview.position === "before"
+                          ? "table-row-sort-target-before"
+                          : "table-row-sort-target-after",
+                      );
+                    }
+                    return classNames.join(" ");
+                  }}
                   rowSelection={{
                     selectedRowKeys,
                     columnWidth: 56,
@@ -1300,87 +1455,9 @@ export function ComposedRulesTabs({
                       setSelectedRowKeys(keys.map((item) => String(item))),
                   }}
                   onRow={(record) => ({
-                    draggable: !group.locked,
-                    onDragStart: (event: DragEvent<HTMLTableRowElement>) => {
-                      if (group.locked) {
-                        return;
-                      }
-                      const groupRules = group.rules ?? [];
-                      const candidateIDs = selectedRowKeys.includes(record.id)
-                        ? selectedRowKeys
-                        : [record.id];
-                      const nextDraggingIDs = candidateIDs.filter((id) =>
-                        groupRules.some((item) => item.id === id),
-                      );
-                      const draggingIDs =
-                        nextDraggingIDs.length > 0 ? nextDraggingIDs : [record.id];
-                      setDraggingRuleIDs(draggingIDs);
-                      setDraggingGroupID(group.id);
-                      event.dataTransfer.effectAllowed = "move";
-                      event.dataTransfer.setData(
-                        "text/plain",
-                        JSON.stringify({ ids: draggingIDs, groupId: group.id }),
-                      );
-                    },
-                    onDragOver: (event: DragEvent<HTMLTableRowElement>) => {
-                      if (group.locked) {
-                        return;
-                      }
-                      if (
-                        draggingRuleIDs.length === 0 ||
-                        draggingGroupID !== group.id ||
-                        draggingRuleIDs.includes(record.id)
-                      ) {
-                        return;
-                      }
-                      event.preventDefault();
-                      event.dataTransfer.dropEffect = "move";
-                    },
-                    onDrop: (event: DragEvent<HTMLTableRowElement>) => {
-                      if (group.locked) {
-                        return;
-                      }
-                      if (
-                        draggingRuleIDs.length === 0 ||
-                        draggingGroupID !== group.id ||
-                        draggingRuleIDs.includes(record.id)
-                      ) {
-                        return;
-                      }
-                      event.preventDefault();
-                      const sourceRules = group.rules ?? [];
-                      const source = sourceRules.map((item) => item.id);
-                      const rect = (
-                        event.currentTarget as HTMLTableRowElement
-                      ).getBoundingClientRect();
-                      const placeAfter = event.clientY > rect.top + rect.height / 2;
-                      const reordered = reorderListByMove(
-                        source,
-                        draggingRuleIDs,
-                        record.id,
-                        placeAfter,
-                      );
-                      if (sameStringArray(source, reordered)) {
-                        return;
-                      }
-                      const byID = new Map(sourceRules.map((item) => [item.id, item]));
-                      const nextRules = reordered
-                        .map((id) => byID.get(id))
-                        .filter((item): item is RuleItemV2 => Boolean(item));
-                      const nextGroups = normalizedGroups.map((targetGroup) =>
-                        targetGroup.id === group.id
-                          ? {
-                              ...targetGroup,
-                              rules: nextRules,
-                            }
-                          : targetGroup,
-                      );
-                      void commitGroups(nextGroups, resolvedActiveGroupID);
-                    },
-                    onDragEnd: () => {
-                      setDraggingRuleIDs([]);
-                      setDraggingGroupID("");
-                    },
+                    onMouseMove: handleRuleSortPreview(group, record),
+                    onMouseLeave: handleRuleSortLeave(group, record),
+                    onMouseUp: handleRuleSortCommit(group, record),
                   })}
                 />
               </Space>

@@ -1,9 +1,12 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import type { MouseEvent as ReactMouseEvent } from "react";
 import { reorderListByMove, sameStringArray } from "./subscriptionsOrderUtils";
 
 interface DragSortableRow {
   key: string;
 }
+
+type SortPreviewPosition = "before" | "after";
 
 interface UseNodeRowDragSortOptions<Row extends DragSortableRow> {
   canReorderRows: boolean;
@@ -25,8 +28,15 @@ export function useNodeRowDragSort<Row extends DragSortableRow>({
   notifyDragStart,
 }: UseNodeRowDragSortOptions<Row>) {
   const [draggingNodeIDs, setDraggingNodeIDs] = useState<string[]>([]);
+  const [sortPreview, setSortPreview] = useState<{
+    key: string;
+    position: SortPreviewPosition;
+  } | null>(null);
+  const draggingNodeIDsRef = useRef<string[]>([]);
   const clearDraggingNodeIDs = useCallback(() => {
+    draggingNodeIDsRef.current = [];
     setDraggingNodeIDs([]);
+    setSortPreview(null);
   }, []);
 
   useEffect(() => {
@@ -35,44 +45,59 @@ export function useNodeRowDragSort<Row extends DragSortableRow>({
     }
   }, [canReorderRows, currentGroupID, clearDraggingNodeIDs]);
 
-  const handleRowDragStart = useCallback(
-    (row: Row) => (event: React.DragEvent<HTMLElement>) => {
+  useEffect(() => {
+    if (draggingNodeIDs.length === 0) {
+      return;
+    }
+    const clearDraggingLater = () => {
+      window.setTimeout(() => {
+        clearDraggingNodeIDs();
+      }, 0);
+    };
+    window.addEventListener("mouseup", clearDraggingLater);
+    window.addEventListener("blur", clearDraggingNodeIDs);
+    return () => {
+      window.removeEventListener("mouseup", clearDraggingLater);
+      window.removeEventListener("blur", clearDraggingNodeIDs);
+    };
+  }, [clearDraggingNodeIDs, draggingNodeIDs.length]);
+
+  const handleRowSortStart = useCallback(
+    (row: Row) => (event: ReactMouseEvent<HTMLElement>) => {
+      if (event.button !== 0) {
+        return;
+      }
       if (!canReorderRows || currentGroupID.trim() === "") {
         return;
       }
+      event.preventDefault();
+      event.stopPropagation();
       const visibleNodeIDSet = new Set(rows.map((item) => item.key));
       const selectedInGroup = selectedRowKeys.filter((nodeID) => visibleNodeIDSet.has(nodeID));
       const candidateIDs = selectedInGroup.includes(row.key) ? selectedInGroup : [row.key];
       const movingIDs = candidateIDs.length > 0 ? candidateIDs : [row.key];
+      draggingNodeIDsRef.current = movingIDs;
       setDraggingNodeIDs(movingIDs);
       notifyDragStart?.(movingIDs.length);
-      event.dataTransfer.effectAllowed = "move";
-      event.dataTransfer.setData("text/plain", row.key);
     },
     [canReorderRows, currentGroupID, notifyDragStart, rows, selectedRowKeys],
   );
 
-  const handleRowDragOver = useCallback(
-    (row: Row) => (event: React.DragEvent<HTMLElement>) => {
-      if (!canReorderRows || draggingNodeIDs.length === 0) {
+  const handleRowSortCommit = useCallback(
+    (row: Row) => (event: ReactMouseEvent<HTMLElement>) => {
+      if (event.button !== 0) {
         return;
       }
-      if (draggingNodeIDs.includes(row.key)) {
+      const draggingIDs = draggingNodeIDsRef.current;
+      if (!canReorderRows || currentGroupID.trim() === "" || draggingIDs.length === 0) {
         return;
       }
-      event.preventDefault();
-      event.dataTransfer.dropEffect = "move";
-    },
-    [canReorderRows, draggingNodeIDs],
-  );
-
-  const handleRowDrop = useCallback(
-    (row: Row) => (event: React.DragEvent<HTMLElement>) => {
-      if (!canReorderRows || currentGroupID.trim() === "" || draggingNodeIDs.length === 0) {
+      if (draggingIDs.includes(row.key)) {
+        clearDraggingNodeIDs();
         return;
       }
       event.preventDefault();
-      const movingIDs = draggingNodeIDs.filter((nodeID) => currentGroupNodeOrder.includes(nodeID));
+      const movingIDs = draggingIDs.filter((nodeID) => currentGroupNodeOrder.includes(nodeID));
       if (movingIDs.length === 0) {
         clearDraggingNodeIDs();
         return;
@@ -90,16 +115,51 @@ export function useNodeRowDragSort<Row extends DragSortableRow>({
       clearDraggingNodeIDs,
       currentGroupID,
       currentGroupNodeOrder,
-      draggingNodeIDs,
       setDraftNodeOrder,
     ],
   );
 
+  const handleRowSortPreview = useCallback(
+    (row: Row) => (event: ReactMouseEvent<HTMLElement>) => {
+      const draggingIDs = draggingNodeIDsRef.current;
+      if (!canReorderRows || currentGroupID.trim() === "" || draggingIDs.length === 0) {
+        return;
+      }
+      if (draggingIDs.includes(row.key)) {
+        if (sortPreview?.key === row.key) {
+          setSortPreview(null);
+        }
+        return;
+      }
+      const rect = event.currentTarget.getBoundingClientRect();
+      const position: SortPreviewPosition =
+        event.clientY >= rect.top + rect.height / 2 ? "after" : "before";
+      setSortPreview((previous) =>
+        previous?.key === row.key && previous.position === position
+          ? previous
+          : {
+              key: row.key,
+              position,
+            },
+      );
+    },
+    [canReorderRows, currentGroupID, sortPreview],
+  );
+
+  const handleRowSortLeave = useCallback(
+    (row: Row) => () => {
+      setSortPreview((previous) => (previous?.key === row.key ? null : previous));
+    },
+    [],
+  );
+
   return {
     draggingNodeIDs,
+    sortPreview,
     clearDraggingNodeIDs,
-    handleRowDragStart,
-    handleRowDragOver,
-    handleRowDrop,
+    handleRowSortStart,
+    handleRowSortCommit,
+    handleRowSortPreview,
+    handleRowSortLeave,
   };
 }

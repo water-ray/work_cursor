@@ -469,7 +469,6 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
     );
   }, [snapshot, proxyDraftDirty]);
 
-  const effectiveListenAddress = allowExternalConnections ? "0.0.0.0" : "127.0.0.1";
   const isProxyDisabledMode = proxyMode === "off";
   const sharedServiceBusy = sharedServiceAction.kind !== "idle";
   const serviceActionBusy =
@@ -592,16 +591,9 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
   const proxyUptimeLabel =
     proxyMode === "off" ? "-" : formatDurationLabel(snapshot?.proxyStartedAtMs, nowMs);
   const totalConnections = Math.max(0, snapshot?.totalConnections ?? 0);
-  const tcpConnections = Math.max(0, snapshot?.tcpConnections ?? 0);
-  const udpConnections = Math.max(0, snapshot?.udpConnections ?? 0);
   const activeNodeCount = Math.max(0, snapshot?.activeNodeCount ?? 0);
-  const currentTrafficMonitorIntervalSec = resolveTrafficMonitorIntervalSec(
-    snapshot?.trafficMonitorIntervalSec,
-  );
-  const trafficMonitoringEnabled = currentTrafficMonitorIntervalSec > 0;
-  const trafficMonitorLabel = trafficMonitoringEnabled
-    ? `${currentTrafficMonitorIntervalSec} 秒`
-    : "关闭";
+  const trafficMonitoringEnabled =
+    resolveTrafficMonitorIntervalSec(snapshot?.trafficMonitorIntervalSec) > 0;
   const runtimeTrafficLabel = useMemo(
     () =>
       `↓${formatTrafficVolumeMB(Math.max(0, Number(snapshot?.downloadBytes ?? 0)) / (1024 * 1024))} / ↑${formatTrafficVolumeMB(
@@ -616,22 +608,6 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
   const totalNodeRealtimeRateLabel = trafficMonitoringEnabled
     ? formatRealtimeRatePair(snapshot?.nodeDownloadRateBps, snapshot?.nodeUploadRateBps)
     : "-";
-  const activeNodeRealtimeRateLabel = useMemo(() => {
-    if (!trafficMonitoringEnabled) {
-      return "-";
-    }
-    const activeNodeID = (snapshot?.selectedNodeId ?? "").trim();
-    if (activeNodeID === "") {
-      return "-";
-    }
-    const activeNodeTraffic = (snapshot?.activeConnectionNodes ?? []).find(
-      (item) => item.nodeId === activeNodeID,
-    );
-    if (!activeNodeTraffic) {
-      return "↓0 B/s  ↑0 B/s";
-    }
-    return formatRealtimeRatePair(activeNodeTraffic.downloadRateBps, activeNodeTraffic.uploadRateBps);
-  }, [trafficMonitoringEnabled, snapshot?.selectedNodeId, snapshot?.activeConnectionNodes]);
   const startupElapsedSeconds = useMemo(() => {
     if (!startupProgress) {
       return 0;
@@ -1652,52 +1628,44 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
           <table className="proxy-compact-status-table">
             <tbody>
               <tr>
-                <th>订阅分组</th>
+                <th>活动分组</th>
                 <td>{activeGroup?.name ?? snapshot?.activeGroupId ?? "-"}</td>
-                <th>节点</th>
+                <th>活动节点</th>
                 <td>{activeNode?.name ?? snapshot?.selectedNodeId ?? "-"}</td>
               </tr>
               <tr>
-                <th>规则</th>
-                <td>{activeRuleGroup?.name ?? snapshot?.ruleConfigV2?.activeGroupId ?? "-"}</td>
-                <th>当前监听</th>
-                <td>{effectiveListenAddress}:{localProxyPort}</td>
-              </tr>
-              <tr>
+                <th>活动规则</th>
+                <td >
+                  {activeRuleGroup?.name ?? snapshot?.ruleConfigV2?.activeGroupId ?? "-"}
+                </td>
                 <th>内核版本</th>
                 <td>{coreVersionLabel}</td>
-                <th>内核运行时长</th>
+              </tr>
+              <tr>
+                
+                <th>内核运行</th>
                 <td>{daemonUptimeLabel}</td>
+                <th>代理运行</th>
+                <td >{proxyUptimeLabel}</td>
               </tr>
               <tr>
-                <th>代理启动时长</th>
-                <td>{proxyUptimeLabel}</td>
-                <th>流量监控</th>
-                <td>{trafficMonitorLabel}</td>
+              <th>活跃节点</th>
+              <td>{activeNodeCount}</td>
+                <th>总连接数</th>
+                <td >{totalConnections}</td>
               </tr>
+              
+             
               <tr>
-                <th>代理总连接数</th>
-                <td>{totalConnections}</td>
-                <th>TCP / UDP</th>
-                <td>{tcpConnections} / {udpConnections}</td>
-              </tr>
-              <tr>
-                <th>活跃代理节点数</th>
-                <td>{activeNodeCount}</td>
-                <th>本次内核上传/下载</th>
-                <td>{runtimeTrafficLabel}</td>
-              </tr>
-              <tr>
-                <th>总实时速度</th>
+                <th>系统速度</th>
                 <td>{systemRealtimeRateLabel}</td>
-                <th>总节点实时速度</th>
+                <th>代理速度</th>
                 <td>{totalNodeRealtimeRateLabel}</td>
               </tr>
               <tr>
-                <th>激活节点实时速度</th>
-                <td>{activeNodeRealtimeRateLabel}</td>
-                <th></th>
-                <td></td>
+                
+                <th>本次流量</th>
+                <td>{runtimeTrafficLabel}</td>
               </tr>
             </tbody>
           </table>
