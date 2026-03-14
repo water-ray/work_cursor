@@ -236,6 +236,9 @@ export function useTrayMenuController({
   );
 
   useEffect(() => {
+    if (window.waterayPlatform?.isDesktop === false) {
+      return;
+    }
     let disposed = false;
     const buildId = ++menuBuildIdRef.current;
     const currentSnapshot = snapshotRef.current;

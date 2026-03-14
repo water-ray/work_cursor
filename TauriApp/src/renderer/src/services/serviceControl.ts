@@ -9,7 +9,13 @@ import {
 import { daemonApi } from "./daemonApi";
 import { notifyStartPrecheckResult, type NoticeApiLike } from "./configChangeMessage";
 
-export type ServiceStartupStage = "precheck" | "probe" | "select" | "apply_mode" | "start";
+export type ServiceStartupStage =
+  | "precheck"
+  | "authorize"
+  | "probe"
+  | "select"
+  | "apply_mode"
+  | "start";
 
 export const startupCancelledErrorMessage = "启动过程已被强制停止";
 
@@ -22,6 +28,8 @@ const defaultSmartOptimizeProbeConcurrency = 8;
 const smartOptimizeProbePollIntervalMs = 250;
 const minimumSmartOptimizeProbeWaitMs = 5000;
 const maximumSmartOptimizeProbeWaitMs = 45000;
+const mobileVpnPermissionConfirmTimeoutMs = 3000;
+const mobileVpnPermissionConfirmPollIntervalMs = 100;
 
 function normalizeCountryValue(value: string | undefined): string {
   const raw = (value ?? "").trim();
@@ -85,6 +93,24 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolveDelay) => {
     window.setTimeout(resolveDelay, ms);
   });
+}
+
+async function waitForMobileVpnAuthorization(
+  mobileHost: NonNullable<Window["waterayPlatform"]["mobileHost"]>,
+): Promise<boolean> {
+  const deadline = Date.now() + mobileVpnPermissionConfirmTimeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const status = await mobileHost.getStatus();
+      if (status.permissionGranted) {
+        return true;
+      }
+    } catch {
+      // Ignore transient state reads while Android returns from the consent dialog.
+    }
+    await delay(mobileVpnPermissionConfirmPollIntervalMs);
+  }
+  return false;
 }
 
 type SmartOptimizeProbeBaseline = {
@@ -169,6 +195,17 @@ function ensureStartupNotCancelled(isCancelled?: () => boolean): void {
   }
 }
 
+function isMobilePlatform(): boolean {
+  return window.waterayPlatform?.isMobile === true;
+}
+
+function resolveStartupTargetMode(snapshot: DaemonSnapshot): ProxyMode {
+  if (isMobilePlatform()) {
+    return "tun";
+  }
+  return snapshot.configuredProxyMode === "tun" ? "tun" : "system";
+}
+
 async function waitForSmartOptimizeProbeResults(params: {
   snapshot: DaemonSnapshot;
   groupId: string;
@@ -245,22 +282,25 @@ async function resolveSmartOptimizeTargetNode(params: {
 }): Promise<{
   selectedNodeName: string;
   fallbackWarning: string;
+  switchedNode: boolean;
 }> {
   const { snapshot, runAction, startupSmartOptimize, onStageChange, isCancelled } = params;
   if (startupSmartOptimize === startupSmartOptimizeOff) {
-    return { selectedNodeName: "", fallbackWarning: "" };
+    return { selectedNodeName: "", fallbackWarning: "", switchedNode: false };
   }
   const currentGroup = snapshot.groups.find((group) => group.id === snapshot.activeGroupId) ?? null;
   if (!currentGroup || currentGroup.nodes.length === 0) {
     return {
       selectedNodeName: "",
       fallbackWarning: "智能优选未找到可评估分组，已回退当前激活节点继续启动。",
+      switchedNode: false,
     };
   }
   if (currentGroup.kind !== "subscription") {
     return {
       selectedNodeName: "",
       fallbackWarning: "当前激活分组不是订阅分组，已跳过智能优选并继续启动。",
+      switchedNode: false,
     };
   }
 
@@ -274,6 +314,7 @@ async function resolveSmartOptimizeTargetNode(params: {
       return {
         selectedNodeName: "",
         fallbackWarning: "当前订阅分组没有该国家节点，已回退当前激活节点继续启动。",
+        switchedNode: false,
       };
     }
   }
@@ -313,6 +354,7 @@ async function resolveSmartOptimizeTargetNode(params: {
       return {
         selectedNodeName: "",
         fallbackWarning: "启动前节点评分失败，已回退当前激活节点继续启动。",
+        switchedNode: false,
       };
     }
   } else {
@@ -338,22 +380,27 @@ async function resolveSmartOptimizeTargetNode(params: {
     return {
       selectedNodeName: "",
       fallbackWarning: "智能优选未找到可用候选节点，已回退当前激活节点继续启动。",
+      switchedNode: false,
     };
   }
+  let switchedNode = false;
   if (nextNode.id !== probeSnapshot.selectedNodeId) {
     try {
       onStageChange?.("select", `正在切换到优选节点：${nextNode.name}`);
-      await runAction(() => daemonApi.selectNode(nextNode.id, probeGroup.id));
+      probeSnapshot = await runAction(() => daemonApi.selectNode(nextNode.id, probeGroup.id));
+      switchedNode = true;
     } catch {
       return {
         selectedNodeName: "",
         fallbackWarning: "智能优选切换节点失败，已回退当前激活节点继续启动。",
+        switchedNode: false,
       };
     }
   }
   return {
     selectedNodeName: nextNode.name,
     fallbackWarning: "",
+    switchedNode,
   };
 }
 
@@ -373,6 +420,55 @@ export function buildServiceStartedMessage(
 ): string {
   const selectedNodeSuffix = selectedNodeName.trim() !== "" ? `，智能优选：${selectedNodeName.trim()}` : "";
   return `服务已启动（${resolveModeLabel(targetMode)}${selectedNodeSuffix}）`;
+}
+
+async function ensureMobileVpnAuthorization(params: {
+  targetMode: ProxyMode;
+  onStageChange?: (stage: ServiceStartupStage, detail: string) => void;
+  isCancelled?: () => boolean;
+  cancellationErrorMessage?: string;
+}): Promise<void> {
+  const {
+    targetMode,
+    onStageChange,
+    isCancelled,
+    cancellationErrorMessage = startupCancelledErrorMessage,
+  } = params;
+  if (targetMode !== "tun" || window.waterayPlatform?.isMobile !== true) {
+    return;
+  }
+  const mobileHost = window.waterayPlatform.mobileHost;
+  if (!mobileHost) {
+    throw new Error("移动端代理宿主尚未接入");
+  }
+  const currentStatus = await mobileHost.getStatus();
+  if (currentStatus.permissionGranted) {
+    return;
+  }
+  onStageChange?.("authorize", "正在请求 Android VPN 授权...");
+  try {
+    const prepareResult = await mobileHost.prepare();
+    if (isCancelled?.()) {
+      throw new Error(cancellationErrorMessage);
+    }
+    if (prepareResult.granted || prepareResult.status.permissionGranted) {
+      return;
+    }
+  } catch (error) {
+    if (isCancelled?.()) {
+      throw new Error(cancellationErrorMessage);
+    }
+    if (!(await waitForMobileVpnAuthorization(mobileHost))) {
+      throw error;
+    }
+    return;
+  }
+  if (isCancelled?.()) {
+    throw new Error(cancellationErrorMessage);
+  }
+  if (!(await waitForMobileVpnAuthorization(mobileHost))) {
+    throw new Error("Android VPN 授权未完成，请在系统弹窗中允许后重试");
+  }
 }
 
 export async function syncLinuxSystemProxyWithFeedback(params: {
@@ -451,7 +547,17 @@ export async function startServiceWithSmartOptimize(params: {
     isCancelled,
     cancellationErrorMessage = startupCancelledErrorMessage,
   } = params;
-  const targetMode: ProxyMode = snapshot.configuredProxyMode === "tun" ? "tun" : "system";
+  const mobilePlatform = isMobilePlatform();
+  const targetMode: ProxyMode = resolveStartupTargetMode(snapshot);
+  await ensureMobileVpnAuthorization({
+    targetMode,
+    onStageChange,
+    isCancelled,
+    cancellationErrorMessage,
+  });
+  if (isCancelled?.()) {
+    throw new Error(cancellationErrorMessage);
+  }
   onStageChange?.("precheck", `正在检查 ${resolveModeLabel(targetMode)} 的启动参数与运行环境...`);
   const precheck = await daemonApi.checkStartPreconditions();
   if (isCancelled?.()) {
@@ -465,18 +571,22 @@ export async function startServiceWithSmartOptimize(params: {
       precheckResult: precheck.result,
     };
   }
-  const smartOptimizeResult = await resolveSmartOptimizeTargetNode({
-    snapshot,
-    runAction,
-    startupSmartOptimize,
-    onStageChange,
-    isCancelled,
-  });
-  if (isCancelled?.()) {
-    throw new Error(cancellationErrorMessage);
-  }
-  if (smartOptimizeResult.fallbackWarning) {
-    notice.warning(smartOptimizeResult.fallbackWarning);
+  let selectedNodeName = "";
+  if (!mobilePlatform) {
+    const smartOptimizeResult = await resolveSmartOptimizeTargetNode({
+      snapshot,
+      runAction,
+      startupSmartOptimize,
+      onStageChange,
+      isCancelled,
+    });
+    if (isCancelled?.()) {
+      throw new Error(cancellationErrorMessage);
+    }
+    if (smartOptimizeResult.fallbackWarning) {
+      notice.warning(smartOptimizeResult.fallbackWarning);
+    }
+    selectedNodeName = smartOptimizeResult.selectedNodeName;
   }
   onStageChange?.("apply_mode", `正在应用本次启动模式：${resolveModeLabel(targetMode)}...`);
   await runAction(() =>
@@ -489,7 +599,27 @@ export async function startServiceWithSmartOptimize(params: {
     throw new Error(cancellationErrorMessage);
   }
   onStageChange?.("start", "正在启动代理服务...");
-  const nextSnapshot = await runAction(() => daemonApi.startConnection());
+  let nextSnapshot = await runAction(() => daemonApi.startConnection());
+  if (mobilePlatform) {
+    const smartOptimizeResult = await resolveSmartOptimizeTargetNode({
+      snapshot: nextSnapshot,
+      runAction,
+      startupSmartOptimize,
+      onStageChange,
+      isCancelled,
+    });
+    if (isCancelled?.()) {
+      throw new Error(cancellationErrorMessage);
+    }
+    if (smartOptimizeResult.fallbackWarning) {
+      notice.warning(smartOptimizeResult.fallbackWarning);
+    }
+    selectedNodeName = smartOptimizeResult.selectedNodeName;
+    if (smartOptimizeResult.switchedNode) {
+      onStageChange?.("start", "优选节点已更新，正在刷新代理服务使其生效...");
+      nextSnapshot = await runAction(() => daemonApi.restartConnection());
+    }
+  }
   await syncLinuxSystemProxyWithFeedback({
     snapshot: nextSnapshot,
     notice,
@@ -500,7 +630,7 @@ export async function startServiceWithSmartOptimize(params: {
     aborted: false,
     nextSnapshot,
     targetMode,
-    selectedNodeName: smartOptimizeResult.selectedNodeName,
+    selectedNodeName,
     precheckResult: precheck.result,
   };
 }

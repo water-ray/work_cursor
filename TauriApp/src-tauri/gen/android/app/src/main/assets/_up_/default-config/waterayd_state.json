@@ -1,0 +1,672 @@
+{
+  "schemaVersion": 20,
+  "stateRevision": 1710,
+  "connectionStage": "connected",
+  "lastRuntimeApply": {
+    "operation": "set_rule_config",
+    "strategy": "noop",
+    "result": "saved_only",
+    "changeSetSummary": "rule_config",
+    "success": true,
+    "rollbackApplied": false,
+    "timestampMs": 1773188420516
+  },
+  "routingMode": "recommended",
+  "proxyMode": "off",
+  "configuredProxyMode": "tun",
+  "clearDNSCacheOnRestart": true,
+  "sniffEnabled": true,
+  "sniffOverrideDestination": true,
+  "sniffTimeoutMs": 1000,
+  "blockQuic": true,
+  "blockUdp": false,
+  "mux": {
+    "enabled": false,
+    "protocol": "smux",
+    "maxConnections": 0,
+    "minStreams": 0,
+    "maxStreams": 4,
+    "padding": false,
+    "brutal": {
+      "enabled": false,
+      "upMbps": 100,
+      "downMbps": 100
+    }
+  },
+  "proxyLogLevel": "none",
+  "coreLogLevel": "error",
+  "uiLogLevel": "error",
+  "recordLogsToFile": false,
+  "proxyRecordLogsToFile": false,
+  "coreRecordLogsToFile": false,
+  "uiRecordLogsToFile": false,
+  "proxyLogs": [],
+  "coreLogs": [],
+  "uiLogs": [],
+  "subscriptions": [],
+  "groups": [],
+  "activeGroupId": "",
+  "selectedNodeId": "",
+  "autoConnect": true,
+  "trafficMonitorIntervalSec": 1,
+  "probeSettings": {
+    "concurrency": 5,
+    "timeoutSec": 3,
+    "probeIntervalMin": 180,
+    "realConnectTestUrl": "https://www.google.com/generate_204",
+    "nodeInfoQueryUrl": "https://api.ipapi.is",
+    "autoProbeOnActiveGroup": false
+  },
+  "tunEnabled": false,
+  "systemProxyEnabled": false,
+  "localProxyPort": 59527,
+  "tunMtu": 1320,
+  "tunStack": "system",
+  "allowExternalConnections": false,
+  "dns": {
+    "version": 2,
+    "remote": {
+      "type": "https",
+      "address": "dns.google",
+      "port": 443,
+      "path": "/dns-query",
+      "detour": "proxy"
+    },
+    "direct": {
+      "type": "https",
+      "address": "dns.alidns.com",
+      "port": 443,
+      "path": "/dns-query",
+      "detour": "direct"
+    },
+    "bootstrap": {
+      "type": "udp",
+      "address": "223.5.5.5",
+      "port": 53,
+      "detour": "direct"
+    },
+    "policy": {
+      "strategy": "prefer_ipv4",
+      "final": "remote"
+    },
+    "cache": {
+      "independentCache": false,
+      "capacity": 16384,
+      "fileEnabled": false,
+      "storeRDRC": false
+    },
+    "fakeip": {
+      "enabled": true,
+      "ipv4Range": "10.128.0.0/9",
+      "ipv6Range": "fc00::/18"
+    },
+    "hosts": {
+      "useSystemHosts": false,
+      "useCustomHosts": false
+    },
+    "rules": [
+      {
+        "id": "builtin-lan-direct",
+        "enabled": true,
+        "domainSuffix": [
+          "lan",
+          "local"
+        ],
+        "action": "route",
+        "server": "direct"
+      }
+    ]
+  },
+  "ruleProfiles": [
+    {
+      "id": "rule-profile-default",
+      "name": "Default Rules",
+      "sourceKind": "manual",
+      "lastUpdatedMs": 1773188420516,
+      "config": {
+        "version": 3,
+        "probeIntervalSec": 180,
+        "onMissMode": "proxy",
+        "groups": [
+          {
+            "id": "default",
+            "name": "默认分组",
+            "onMissMode": "direct",
+            "locked": true,
+            "rules": [
+              {
+                "id": "rule-mmagvyvf-am4mfi-copy",
+                "name": "广告拦截",
+                "enabled": true,
+                "match": {
+                  "domain": {},
+                  "geosite": [
+                    "category-ads-all"
+                  ],
+                  "process": {}
+                },
+                "action": {
+                  "type": "reject",
+                  "targetPolicy": "reject"
+                }
+              },
+              {
+                "id": "rule-1772410994155",
+                "name": "谷歌浏览器",
+                "enabled": true,
+                "match": {
+                  "domain": {},
+                  "process": {
+                    "nameContains": [
+                      "chrome.exe"
+                    ]
+                  }
+                },
+                "action": {
+                  "type": "route",
+                  "targetPolicy": "proxy"
+                }
+              },
+              {
+                "id": "rule-mm8vmugw-dx15l2",
+                "name": "谷歌",
+                "enabled": true,
+                "match": {
+                  "domain": {},
+                  "geosite": [
+                    "google"
+                  ],
+                  "process": {}
+                },
+                "action": {
+                  "type": "route",
+                  "targetPolicy": "proxy"
+                }
+              }
+            ]
+          },
+          {
+            "id": "group-2",
+            "name": "系统白名单",
+            "onMissMode": "proxy",
+            "rules": [
+              {
+                "id": "rule-mmgb2rvm-0mkzq2",
+                "name": "谷歌-谷歌上不了就改动作为代理",
+                "enabled": true,
+                "match": {
+                  "domain": {
+                    "keyword": [
+                      "ip111.cn"
+                    ]
+                  },
+                  "geosite": [
+                    "google"
+                  ],
+                  "process": {}
+                },
+                "action": {
+                  "type": "route",
+                  "targetPolicy": "pool-qenjodc4"
+                }
+              },
+              {
+                "id": "rule-mmgb04le-9ksfxx",
+                "name": "系统进程",
+                "enabled": true,
+                "match": {
+                  "domain": {},
+                  "process": {
+                    "pathContains": [
+                      "\\Edge\\",
+                      "\\system\\",
+                      "\\Huorong\\",
+                      "\\RayLink\\"
+                    ]
+                  }
+                },
+                "action": {
+                  "type": "route",
+                  "targetPolicy": "direct"
+                }
+              }
+            ]
+          },
+          {
+            "id": "group-3",
+            "name": "全局",
+            "onMissMode": "proxy",
+            "rules": [
+              {
+                "id": "rule-mmlalkkr-qnyv5q",
+                "name": "全局就是什么都不需要，漏网走代理",
+                "enabled": false,
+                "match": {
+                  "domain": {},
+                  "ipCidr": [
+                    "10.10.10.0/32"
+                  ],
+                  "process": {}
+                },
+                "action": {
+                  "type": "reject",
+                  "targetPolicy": "reject"
+                }
+              }
+            ]
+          }
+        ],
+        "activeGroupId": "group-3",
+        "defaults": {
+          "onMatch": "proxy",
+          "onMiss": "proxy"
+        },
+        "policyGroups": [
+          {
+            "id": "direct",
+            "name": "DIRECT",
+            "type": "builtin",
+            "builtin": "direct"
+          },
+          {
+            "id": "proxy",
+            "name": "PROXY",
+            "type": "builtin",
+            "builtin": "proxy"
+          },
+          {
+            "id": "reject",
+            "name": "REJECT",
+            "type": "builtin",
+            "builtin": "reject"
+          },
+          {
+            "id": "活动订阅",
+            "name": "活动订阅",
+            "type": "node_pool",
+            "nodePool": {
+              "enabled": false,
+              "nodes": [],
+              "nodeSelectStrategy": "fastest",
+              "fallbackMode": "reject"
+            }
+          },
+          {
+            "id": "香港",
+            "name": "香港",
+            "type": "node_pool",
+            "nodePool": {
+              "enabled": true,
+              "nodes": [
+                {
+                  "node": "HK",
+                  "type": "country"
+                }
+              ],
+              "nodeSelectStrategy": "fastest",
+              "fallbackMode": "reject"
+            }
+          },
+          {
+            "id": "亚洲",
+            "name": "亚洲",
+            "type": "node_pool",
+            "nodePool": {
+              "enabled": true,
+              "nodes": [
+                {
+                  "node": "HK",
+                  "type": "country"
+                },
+                {
+                  "node": "TW",
+                  "type": "country"
+                },
+                {
+                  "node": "JP",
+                  "type": "country"
+                },
+                {
+                  "node": "KR",
+                  "type": "country"
+                }
+              ],
+              "nodeSelectStrategy": "fastest",
+              "fallbackMode": "reject"
+            }
+          },
+          {
+            "id": "pool-qenjodc4",
+            "name": "谷歌",
+            "type": "node_pool",
+            "nodePool": {
+              "enabled": true,
+              "nodes": [
+                {
+                  "node": "US",
+                  "type": "country"
+                }
+              ],
+              "nodeSelectStrategy": "fastest",
+              "fallbackMode": "active_node"
+            }
+          },
+          {
+            "id": "pool-2nenwzv9",
+            "name": "节点名带有DMIT的",
+            "type": "node_pool",
+            "nodePool": {
+              "enabled": true,
+              "nodes": [
+                {
+                  "node": "DMIT",
+                  "type": "name"
+                }
+              ],
+              "nodeSelectStrategy": "fastest",
+              "fallbackMode": "reject"
+            }
+          }
+        ],
+        "providers": {
+          "ruleSets": []
+        },
+        "rules": [
+          {
+            "id": "rule-mmlalkkr-qnyv5q",
+            "name": "全局就是什么都不需要，漏网走代理",
+            "enabled": false,
+            "match": {
+              "domain": {},
+              "ipCidr": [
+                "10.10.10.0/32"
+              ],
+              "process": {}
+            },
+            "action": {
+              "type": "reject",
+              "targetPolicy": "reject"
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "activeRuleProfileId": "rule-profile-default",
+  "ruleConfigV2": {
+    "version": 3,
+    "probeIntervalSec": 180,
+    "onMissMode": "proxy",
+    "groups": [
+      {
+        "id": "default",
+        "name": "默认分组",
+        "onMissMode": "direct",
+        "locked": true,
+        "rules": [
+          {
+            "id": "rule-mmagvyvf-am4mfi-copy",
+            "name": "广告拦截",
+            "enabled": true,
+            "match": {
+              "domain": {},
+              "geosite": [
+                "category-ads-all"
+              ],
+              "process": {}
+            },
+            "action": {
+              "type": "reject",
+              "targetPolicy": "reject"
+            }
+          },
+          {
+            "id": "rule-1772410994155",
+            "name": "谷歌浏览器",
+            "enabled": true,
+            "match": {
+              "domain": {},
+              "process": {
+                "nameContains": [
+                  "chrome.exe"
+                ]
+              }
+            },
+            "action": {
+              "type": "route",
+              "targetPolicy": "proxy"
+            }
+          },
+          {
+            "id": "rule-mm8vmugw-dx15l2",
+            "name": "谷歌",
+            "enabled": true,
+            "match": {
+              "domain": {},
+              "geosite": [
+                "google"
+              ],
+              "process": {}
+            },
+            "action": {
+              "type": "route",
+              "targetPolicy": "proxy"
+            }
+          }
+        ]
+      },
+      {
+        "id": "group-2",
+        "name": "系统白名单",
+        "onMissMode": "proxy",
+        "rules": [
+          {
+            "id": "rule-mmgb2rvm-0mkzq2",
+            "name": "谷歌-谷歌上不了就改动作为代理",
+            "enabled": true,
+            "match": {
+              "domain": {
+                "keyword": [
+                  "ip111.cn"
+                ]
+              },
+              "geosite": [
+                "google"
+              ],
+              "process": {}
+            },
+            "action": {
+              "type": "route",
+              "targetPolicy": "pool-qenjodc4"
+            }
+          },
+          {
+            "id": "rule-mmgb04le-9ksfxx",
+            "name": "系统进程",
+            "enabled": true,
+            "match": {
+              "domain": {},
+              "process": {
+                "pathContains": [
+                  "\\Edge\\",
+                  "\\system\\",
+                  "\\Huorong\\",
+                  "\\RayLink\\"
+                ]
+              }
+            },
+            "action": {
+              "type": "route",
+              "targetPolicy": "direct"
+            }
+          }
+        ]
+      },
+      {
+        "id": "group-3",
+        "name": "全局",
+        "onMissMode": "proxy",
+        "rules": [
+          {
+            "id": "rule-mmlalkkr-qnyv5q",
+            "name": "全局就是什么都不需要，漏网走代理",
+            "enabled": false,
+            "match": {
+              "domain": {},
+              "ipCidr": [
+                "10.10.10.0/32"
+              ],
+              "process": {}
+            },
+            "action": {
+              "type": "reject",
+              "targetPolicy": "reject"
+            }
+          }
+        ]
+      }
+    ],
+    "activeGroupId": "group-3",
+    "defaults": {
+      "onMatch": "proxy",
+      "onMiss": "proxy"
+    },
+    "policyGroups": [
+      {
+        "id": "direct",
+        "name": "DIRECT",
+        "type": "builtin",
+        "builtin": "direct"
+      },
+      {
+        "id": "proxy",
+        "name": "PROXY",
+        "type": "builtin",
+        "builtin": "proxy"
+      },
+      {
+        "id": "reject",
+        "name": "REJECT",
+        "type": "builtin",
+        "builtin": "reject"
+      },
+      {
+        "id": "活动订阅",
+        "name": "活动订阅",
+        "type": "node_pool",
+        "nodePool": {
+          "enabled": false,
+          "nodes": [],
+          "nodeSelectStrategy": "fastest",
+          "fallbackMode": "reject"
+        }
+      },
+      {
+        "id": "香港",
+        "name": "香港",
+        "type": "node_pool",
+        "nodePool": {
+          "enabled": true,
+          "nodes": [
+            {
+              "node": "HK",
+              "type": "country"
+            }
+          ],
+          "nodeSelectStrategy": "fastest",
+          "fallbackMode": "reject"
+        }
+      },
+      {
+        "id": "亚洲",
+        "name": "亚洲",
+        "type": "node_pool",
+        "nodePool": {
+          "enabled": true,
+          "nodes": [
+            {
+              "node": "HK",
+              "type": "country"
+            },
+            {
+              "node": "TW",
+              "type": "country"
+            },
+            {
+              "node": "JP",
+              "type": "country"
+            },
+            {
+              "node": "KR",
+              "type": "country"
+            }
+          ],
+          "nodeSelectStrategy": "fastest",
+          "fallbackMode": "reject"
+        }
+      },
+      {
+        "id": "pool-qenjodc4",
+        "name": "谷歌",
+        "type": "node_pool",
+        "nodePool": {
+          "enabled": true,
+          "nodes": [
+            {
+              "node": "US",
+              "type": "country"
+            }
+          ],
+          "nodeSelectStrategy": "fastest",
+          "fallbackMode": "active_node"
+        }
+      },
+      {
+        "id": "pool-2nenwzv9",
+        "name": "节点名带有DMIT的",
+        "type": "node_pool",
+        "nodePool": {
+          "enabled": true,
+          "nodes": [
+            {
+              "node": "DMIT",
+              "type": "name"
+            }
+          ],
+          "nodeSelectStrategy": "fastest",
+          "fallbackMode": "reject"
+        }
+      }
+    ],
+    "providers": {
+      "ruleSets": []
+    },
+    "rules": [
+      {
+        "id": "rule-mmlalkkr-qnyv5q",
+        "name": "全局就是什么都不需要，漏网走代理",
+        "enabled": false,
+        "match": {
+          "domain": {},
+          "ipCidr": [
+            "10.10.10.0/32"
+          ],
+          "process": {}
+        },
+        "action": {
+          "type": "reject",
+          "targetPolicy": "reject"
+        }
+      }
+    ]
+  },
+  "systemType": "windows",
+  "runtimeAdmin": true,
+  "coreVersion": "1.0.7",
+  "proxyVersion": "unknown",
+  "runtimeLabel": "waterayd:http://127.0.0.1:39080",
+  "daemonStartedAtMs": 1773188360859,
+  "activeClientSessions": 1,
+  "lastClientHeartbeatMs": 1773188402065,
+  "activePushSubscribers": 1
+}

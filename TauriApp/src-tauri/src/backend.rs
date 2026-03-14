@@ -16,7 +16,9 @@ use std::process::Stdio;
 use std::os::windows::process::CommandExt;
 
 use serde::Serialize;
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 use tauri::menu::MenuBuilder;
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, State};
 use tokio::time::sleep;
@@ -43,6 +45,7 @@ const DAEMON_PROBE_TIMEOUT_MS: u64 = 1200;
 const DAEMON_READY_TIMEOUT_MS: u64 = 12_000;
 const DAEMON_READY_POLL_INTERVAL_MS: u64 = 300;
 const DAEMON_SHUTDOWN_TIMEOUT_MS: u64 = 1200;
+const FRONTEND_READY_TIMEOUT_MOBILE_MS: u64 = 60_000;
 const FRONTEND_READY_TIMEOUT_DEV_MS: u64 = 20_000;
 const FRONTEND_READY_TIMEOUT_RELEASE_MS: u64 = 12_000;
 const MAX_TEXT_FILE_BYTES: usize = 16 * 1024 * 1024;
@@ -50,9 +53,13 @@ const MAX_TEXT_FILE_BYTES: usize = 16 * 1024 * 1024;
 const STARTUP_ERROR_WEBVIEW2_MISSING: &str = "WEBVIEW2_RUNTIME_MISSING";
 const STARTUP_ERROR_FRONTEND_TIMEOUT: &str = "FRONTEND_READY_TIMEOUT";
 const STARTUP_ERROR_FRONTEND_BOOTSTRAP: &str = "FRONTEND_BOOTSTRAP_FAILED";
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 const TRAY_ID: &str = "wateray-tray";
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 const TRAY_MENU_OPEN_MAIN_WINDOW: &str = "tray-open-main-window";
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 const TRAY_MENU_QUIT_PANEL_ONLY: &str = "tray-quit-panel-only";
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 const TRAY_MENU_QUIT_ALL: &str = "tray-quit-all";
 #[cfg(target_os = "linux")]
 const LINUX_PACKAGED_SERVICE_NAME: &str = "waterayd";
@@ -109,6 +116,21 @@ const EMBEDDED_LINUX_ICON: &[u8] = include_bytes!(concat!(
 #[derive(Serialize)]
 pub struct ClipboardWriteResult {
     mode: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimePlatformInfo {
+    pub kind: String,
+    pub is_mobile: bool,
+    pub supports_window_controls: bool,
+    pub supports_tray: bool,
+    pub supports_packaged_daemon: bool,
+    pub supports_system_proxy_mode: bool,
+    pub supports_local_file_access: bool,
+    pub supports_in_app_updates: bool,
+    pub supports_mobile_vpn_host: bool,
+    pub requires_sandbox_data_root: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -186,12 +208,53 @@ impl FrontendStartupState {
     }
 }
 
+#[cfg(target_os = "android")]
+fn runtime_platform_kind() -> &'static str {
+    "android"
+}
+
+#[cfg(target_os = "ios")]
+fn runtime_platform_kind() -> &'static str {
+    "ios"
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn runtime_platform_kind() -> &'static str {
+    "desktop"
+}
+
+fn is_mobile_platform() -> bool {
+    runtime_platform_kind() != "desktop"
+}
+
+#[tauri::command]
+pub fn runtime_platform_info() -> RuntimePlatformInfo {
+    let is_mobile = is_mobile_platform();
+    RuntimePlatformInfo {
+        kind: runtime_platform_kind().to_string(),
+        is_mobile,
+        supports_window_controls: !is_mobile,
+        supports_tray: !is_mobile,
+        supports_packaged_daemon: !is_mobile,
+        supports_system_proxy_mode: !is_mobile,
+        supports_local_file_access: !is_mobile,
+        supports_in_app_updates: !is_mobile,
+        supports_mobile_vpn_host: is_mobile,
+        requires_sandbox_data_root: is_mobile,
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn hide_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.hide();
     }
 }
 
+#[cfg(any(target_os = "android", target_os = "ios"))]
+fn hide_main_window(_app: &AppHandle) {}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn restore_main_window(app: &AppHandle) {
     let Some(window) = app.get_webview_window("main") else {
         return;
@@ -204,6 +267,10 @@ fn restore_main_window(app: &AppHandle) {
     let _ = window.set_focus();
 }
 
+#[cfg(any(target_os = "android", target_os = "ios"))]
+fn restore_main_window(_app: &AppHandle) {}
+
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 fn should_restore_main_window_from_tray_event(event: &TrayIconEvent) -> bool {
     matches!(
         event,
@@ -240,6 +307,7 @@ fn quit_all(app: AppHandle) {
     });
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn apply_main_window_icon(app: &AppHandle) {
     let Some(window) = app.get_webview_window("main") else {
         return;
@@ -249,6 +317,9 @@ pub fn apply_main_window_icon(app: &AppHandle) {
     };
     let _ = window.set_icon(icon);
 }
+
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub fn apply_main_window_icon(_app: &AppHandle) {}
 
 #[cfg(target_os = "linux")]
 pub fn cleanup_stale_linux_dev_desktop_override() {
@@ -314,6 +385,7 @@ pub fn cleanup_stale_linux_dev_desktop_override() {
 #[cfg(not(target_os = "linux"))]
 pub fn cleanup_stale_linux_dev_desktop_override() {}
 
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 pub fn ensure_system_tray(app: &AppHandle) -> Result<(), String> {
     if app.tray_by_id(TRAY_ID).is_some() {
         return Ok(());
@@ -352,6 +424,11 @@ pub fn ensure_system_tray(app: &AppHandle) -> Result<(), String> {
         .build(app)
         .map(|_| ())
         .map_err(|error| format!("创建托盘图标失败：{error}"))
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+pub fn ensure_system_tray(_app: &AppHandle) -> Result<(), String> {
+    Ok(())
 }
 
 fn normalize_file_name(raw: &str) -> String {
@@ -402,8 +479,14 @@ fn is_dev_mode() -> bool {
     cfg!(debug_assertions)
 }
 
+fn is_frontend_dev_server_mode() -> bool {
+    !is_mobile_platform() && is_dev_mode()
+}
+
 fn frontend_ready_timeout_ms() -> u64 {
-    if is_dev_mode() {
+    if is_mobile_platform() {
+        FRONTEND_READY_TIMEOUT_MOBILE_MS
+    } else if is_frontend_dev_server_mode() {
         FRONTEND_READY_TIMEOUT_DEV_MS
     } else {
         FRONTEND_READY_TIMEOUT_RELEASE_MS
@@ -412,7 +495,12 @@ fn frontend_ready_timeout_ms() -> u64 {
 
 fn format_frontend_timeout_message(timeout_ms: u64) -> String {
     let timeout_seconds = timeout_ms / 1000;
-    if is_dev_mode() {
+    if is_mobile_platform() {
+        return format!(
+            "因为移动端前端页面在 {timeout_seconds} 秒内未完成加载，前端无法启动。错误代码 {STARTUP_ERROR_FRONTEND_TIMEOUT}。\n\n可能原因：模拟器或真机首次冷启动较慢、前端资源初始化卡住，或 WebView 页面未成功加载。"
+        );
+    }
+    if is_frontend_dev_server_mode() {
         return format!(
             "因为开发态前端页面在 {timeout_seconds} 秒内未完成加载，前端无法启动。错误代码 {STARTUP_ERROR_FRONTEND_TIMEOUT}。\n\n可能原因：Vite 服务未启动、1420 端口被占用，或 localhost/127.0.0.1 无法访问。"
         );
@@ -922,6 +1010,10 @@ async fn shutdown_daemon_best_effort() {
 }
 
 pub async fn ensure_packaged_daemon_running_impl() -> Result<(), String> {
+    if is_mobile_platform() {
+        return Ok(());
+    }
+
     if !should_manage_packaged_daemon() {
         return Ok(());
     }

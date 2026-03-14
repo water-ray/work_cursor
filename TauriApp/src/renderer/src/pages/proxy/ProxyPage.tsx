@@ -343,6 +343,7 @@ const startupProgressStages: Array<{
   title: string;
 }> = [
   { key: "precheck", title: "检查启动参数与环境" },
+  { key: "authorize", title: "请求 Android VPN 授权" },
   { key: "probe", title: "执行节点评分" },
   { key: "select", title: "筛选并切换优选节点" },
   { key: "apply_mode", title: "写入本次启动模式" },
@@ -356,8 +357,9 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
   const notice = useAppNotice();
   const draftNotice = useDraftNotice();
   const sharedServiceAction = useSharedServiceActionState();
+
   const [proxyMode, setProxyMode] = useState<ProxyMode>("off");
-  const [configuredProxyMode, setConfiguredProxyMode] = useState<ProxyMode>("system");
+  const [configuredProxyMode, setConfiguredProxyMode] = useState<ProxyMode>("tun");
   const [clearDNSCacheOnRestart, setClearDNSCacheOnRestart] = useState(false);
   const [updatingConfiguredProxyMode, setUpdatingConfiguredProxyMode] = useState(false);
   const [togglingService, setTogglingService] = useState(false);
@@ -448,7 +450,11 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
       return;
     }
     setProxyMode(snapshot.proxyMode ?? "off");
-    setConfiguredProxyMode(snapshot.configuredProxyMode === "tun" ? "tun" : "system");
+    setConfiguredProxyMode(
+      window.waterayPlatform?.isMobile
+        ? "tun"
+        : snapshot.configuredProxyMode === "tun" ? "tun" : "system",
+    );
     if (proxyDraftDirty) {
       return;
     }
@@ -889,7 +895,9 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
         startupCancelRequestedRef.current = false;
         const startupSessionID = startupSessionRef.current + 1;
         startupSessionRef.current = startupSessionID;
-        const targetMode = configuredProxyMode === "tun" ? "tun" : "system";
+        const targetMode = window.waterayPlatform?.isMobile
+          ? "tun"
+          : configuredProxyMode === "tun" ? "tun" : "system";
         const startedAtMs = Date.now();
         setStartupProgress({
           startedAtMs,
@@ -1676,17 +1684,30 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
           <div className="proxy-startup-left-panel">
             <div className="proxy-startup-panel-stack">
               <SwitchWithLabel
-                checked={configuredProxyMode === "tun"}
-                disabled={!snapshot || loading || serviceActionBusy}
+                checked={window.waterayPlatform?.isMobile ? true : configuredProxyMode === "tun"}
+                disabled={window.waterayPlatform?.isMobile || !snapshot || loading || serviceActionBusy}
                 onChange={(checked) => {
                   void updateConfiguredMode(checked);
                 }}
-                label="网卡模式"
-                helpContent={{
-                  effect: "控制默认启动模式：开启为虚拟网卡模式，关闭为系统代理模式。",
-                  recommendation: "需全局接管流量时优先开启；仅浏览器等显式代理场景可关闭。若当前代理正在运行，切换后会自动刷新服务。",
-                }}
+                label={window.waterayPlatform?.isMobile ? "VPN 模式" : "网卡模式"}
+                helpContent={window.waterayPlatform?.isMobile
+                  ? {
+                    effect: "Android 当前固定使用虚拟网卡（VPN/TUN）模式运行。",
+                    recommendation: "启动后才会接管系统流量与 DNS；停止后系统网络与 DNS 将完全回归 Android 本身。",
+                  }
+                  : {
+                    effect: "控制默认启动模式：开启为虚拟网卡模式，关闭为系统代理模式。",
+                    recommendation: "需全局接管流量时优先开启；仅浏览器等显式代理场景可关闭。若当前代理正在运行，切换后会自动刷新服务。",
+                  }}
               />
+              {window.waterayPlatform?.isMobile ? (
+                <Alert
+                  showIcon
+                  type="info"
+                  message="Android 模式说明"
+                  description="Android 当前仅支持虚拟网卡（VPN/TUN）模式。未启动代理时不会单独运行最小实例，也不支持节点测速/真连评分；点击启动后会先建立 VPN，再在运行中的代理环境里执行节点评分与优选切换，停止后系统 DNS 与网络完全回交给 Android。"
+                />
+              ) : null}
               <SwitchWithLabel
                 checked={clearDNSCacheOnRestart}
                 disabled={!snapshot || loading || serviceActionBusy || applyingProxyDraft}
@@ -1703,16 +1724,23 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
               <div className="proxy-startup-smart-optimize">
                 <HelpLabel
                   label="智能优选"
-                  helpContent={{
-                    scene:
-                      "启动前希望自动挑选更稳或更符合地区偏好的节点，例如固定优先某个国家，或日常直接选当前激活订阅分组里的最佳节点。",
-                    effect:
-                      "仅在点击“启动”时会先执行评分；选择“订阅激活分组最佳”时会评分当前激活订阅分组全部节点，选择国家时只评分该国家候选节点，以减少检测耗时。",
-                    caution:
-                      "“重启服务”不会重新执行智能优选。智能优选仅对当前激活订阅分组生效；国家优选还要求节点具备国家字段。若没有可用候选，系统会回退当前激活节点继续启动并提示警告。",
-                    recommendation:
-                      "默认建议“关闭优选”；想始终优先当前订阅分组最佳线路可选“订阅激活分组最佳”；有明确地区偏好时再切换到对应国家。",
-                  }}
+                  helpContent={window.waterayPlatform?.isMobile
+                    ? {
+                      scene: "Android 端希望在 VPN 代理已经建立后，再为当前订阅分组执行评分并自动切到更优节点。",
+                      effect: "点击“启动”后先建立代理服务，再在运行中的代理环境里执行评分；若优选结果变更节点，会自动刷新服务使其生效。",
+                      caution: "未启动代理时不会单独拉起最小实例，因此也不支持离线测速/真连评分。",
+                      recommendation: "默认建议“关闭优选”；需要自动筛选更优节点时再开启。",
+                    }
+                    : {
+                      scene:
+                        "启动前希望自动挑选更稳或更符合地区偏好的节点，例如固定优先某个国家，或日常直接选当前激活订阅分组里的最佳节点。",
+                      effect:
+                        "仅在点击“启动”时会先执行评分；选择“订阅激活分组最佳”时会评分当前激活订阅分组全部节点，选择国家时只评分该国家候选节点，以减少检测耗时。",
+                      caution:
+                        "“重启服务”不会重新执行智能优选。智能优选仅对当前激活订阅分组生效；国家优选还要求节点具备国家字段。若没有可用候选，系统会回退当前激活节点继续启动并提示警告。",
+                      recommendation:
+                        "默认建议“关闭优选”；想始终优先当前订阅分组最佳线路可选“订阅激活分组最佳”；有明确地区偏好时再切换到对应国家。",
+                    }}
                 />
                 <Select<ProxyStartupSmartOptimizePreference>
                   className="proxy-startup-smart-optimize-select"

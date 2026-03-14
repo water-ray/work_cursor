@@ -379,6 +379,7 @@ export interface ProbeNodesRequestPayload extends Record<string, unknown> {
   timeoutMs?: number;
   probeType?: ProbeType;
   probeTypes?: ProbeType[];
+  background?: boolean;
 }
 
 export interface ProbeNodesSummary {

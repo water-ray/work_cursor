@@ -4,6 +4,7 @@ import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
 
 const r = (...paths: string[]) => resolve(__dirname, ...paths);
+const tauriDevHost = process.env.TAURI_DEV_HOST?.trim();
 
 function normalizeModuleId(id: string): string {
   return id.replaceAll("\\", "/");
@@ -45,9 +46,16 @@ export default defineConfig({
     },
   },
   server: {
-    host: "127.0.0.1",
+    host: tauriDevHost || "127.0.0.1",
     port: 1420,
     strictPort: true,
+    hmr: tauriDevHost
+      ? {
+          protocol: "ws",
+          host: tauriDevHost,
+          port: 1421,
+        }
+      : undefined,
   },
   preview: {
     host: "127.0.0.1",

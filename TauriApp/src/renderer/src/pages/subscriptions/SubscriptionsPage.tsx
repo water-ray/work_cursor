@@ -461,6 +461,16 @@ export function SubscriptionsPage({
     () => normalizeProbeRuntimeTasks(snapshot?.probeRuntimeTasks),
     [snapshot?.probeRuntimeTasks],
   );
+  const hasPendingBackgroundProbeTask = useMemo(
+    () =>
+      (snapshot?.backgroundTasks ?? []).some(
+        (task) =>
+          task.type === "node_probe" &&
+          (task.status === "queued" || task.status === "running"),
+      ),
+    [snapshot?.backgroundTasks],
+  );
+  const probeBusy = probingNodes || hasPendingBackgroundProbeTask;
   const trafficMonitoringEnabled =
     resolveTrafficMonitorIntervalSec(snapshot?.trafficMonitorIntervalSec) > 0;
   const realtimeNodeSpeedByID = useMemo(() => {
@@ -717,17 +727,17 @@ export function SubscriptionsPage({
     activeTabId !== ALL_GROUP_TAB_ID &&
     snapshot?.connectionStage === "connected" &&
     probeRows.length > 0 &&
-    !probingNodes;
+    !probeBusy;
   const canProbeRealConnectFromContext =
     activeTabId !== ALL_GROUP_TAB_ID &&
     snapshot?.connectionStage === "connected" &&
     probeRows.length > 0 &&
-    !probingNodes;
+    !probeBusy;
   const canClearProbeFromContext =
-    canOperateRows && !probingNodes && !clearingProbeData && !resettingTrafficStats;
+    canOperateRows && !probeBusy && !clearingProbeData && !resettingTrafficStats;
   const canUpdateCountryFromContext =
     canOperateRows &&
-    !probingNodes &&
+    !probeBusy &&
     !updatingNodeCountries;
   const activeNodeID = snapshot?.selectedNodeId || localActiveNodeID;
   const canSortRows = activeTabId !== ALL_GROUP_TAB_ID;
@@ -926,8 +936,18 @@ export function SubscriptionsPage({
         groupId: activeGroupId,
         nodeIds: targetNodeIDs,
         probeType: "node_latency",
+        background: window.waterayPlatform?.isMobile === true,
       });
       const next = await runAction(async () => probeResult.snapshot);
+      if (probeResult.task && !probeResult.summary) {
+        notice.info(
+          window.waterayPlatform?.isMobile === true
+            ? "延迟探测已加入后台任务，请通过左上角悬浮图标查看进度。"
+            : "延迟探测已加入后台任务，请通过后台任务查看进度。",
+          { title: "后台任务" },
+        );
+        return;
+      }
       if (Number(probeResult.summary?.requested ?? 0) <= 0) {
         return;
       }
@@ -957,8 +977,18 @@ export function SubscriptionsPage({
         groupId: activeGroupId,
         nodeIds: targetNodeIDs,
         probeType: "real_connect",
+        background: window.waterayPlatform?.isMobile === true,
       });
       const next = await runAction(async () => probeResult.snapshot);
+      if (probeResult.task && !probeResult.summary) {
+        notice.info(
+          window.waterayPlatform?.isMobile === true
+            ? "节点评分已加入后台任务，请通过左上角悬浮图标查看进度。"
+            : "节点评分已加入后台任务，请通过后台任务查看进度。",
+          { title: "后台任务" },
+        );
+        return;
+      }
       if (Number(probeResult.summary?.requested ?? 0) <= 0) {
         return;
       }
@@ -986,7 +1016,7 @@ export function SubscriptionsPage({
   };
 
   const clearProbeDataFromContext = async (): Promise<void> => {
-    if (operationRows.length === 0 || clearingProbeData || probingNodes || resettingTrafficStats) {
+    if (operationRows.length === 0 || clearingProbeData || probeBusy || resettingTrafficStats) {
       return;
     }
     const nodeIDs = Array.from(new Set(operationRows.map((row) => row.node.id)));
@@ -1226,8 +1256,18 @@ export function SubscriptionsPage({
           groupId: currentTabGroup.id,
           nodeIds: targetNodeIDs,
           probeTypes,
+          background: window.waterayPlatform?.isMobile === true,
         });
         const next = await runAction(async () => probeResult.snapshot);
+        if (probeResult.task && !probeResult.summary) {
+          notice.info(
+            window.waterayPlatform?.isMobile === true
+              ? `${actionName}已加入后台任务，请通过左上角悬浮图标查看进度。`
+              : `${actionName}已加入后台任务，请通过后台任务查看进度。`,
+            { title: "后台任务" },
+          );
+          return;
+        }
         if (Number(probeResult.summary?.requested ?? 0) <= 0) {
           return;
         }
@@ -1283,7 +1323,7 @@ export function SubscriptionsPage({
       activeTabId === ALL_GROUP_TAB_ID ||
       !currentTabGroup ||
       batchOperationRows.length === 0 ||
-      probingNodes ||
+      probeBusy ||
       clearingProbeData ||
       resettingTrafficStats
     ) {
@@ -1309,7 +1349,7 @@ export function SubscriptionsPage({
     activeTabId,
     currentTabGroup,
     batchOperationRows,
-    probingNodes,
+    probeBusy,
     clearingProbeData,
     resettingTrafficStats,
     runAction,
@@ -1321,7 +1361,7 @@ export function SubscriptionsPage({
       activeTabId === ALL_GROUP_TAB_ID ||
       !currentTabGroup ||
       batchOperationRows.length === 0 ||
-      probingNodes ||
+      probeBusy ||
       clearingProbeData ||
       resettingTrafficStats
     ) {
@@ -1346,7 +1386,7 @@ export function SubscriptionsPage({
     activeTabId,
     currentTabGroup,
     batchOperationRows,
-    probingNodes,
+    probeBusy,
     clearingProbeData,
     resettingTrafficStats,
     runAction,
@@ -1354,7 +1394,7 @@ export function SubscriptionsPage({
   ]);
 
   const updateNodeCountriesFromContext = useCallback(async (): Promise<void> => {
-    if (operationRows.length === 0 || probingNodes || updatingNodeCountries) {
+    if (operationRows.length === 0 || probeBusy || updatingNodeCountries) {
       return;
     }
     const targetNodeIDs = Array.from(new Set(operationRows.map((row) => row.node.id)));
@@ -1395,7 +1435,7 @@ export function SubscriptionsPage({
     } finally {
       setUpdatingNodeCountries(false);
     }
-  }, [operationRows, probingNodes, runAction, updatingNodeCountries, notice]);
+  }, [operationRows, probeBusy, runAction, updatingNodeCountries, notice]);
 
   const copyNodesToClipboard = useCallback(
     async (rowsToCopy?: NodeRow[]): Promise<void> => {
@@ -1665,7 +1705,7 @@ export function SubscriptionsPage({
         canPasteToCurrentGroup: Boolean(canPasteToCurrentGroup),
         activeTabId,
         allGroupTabId: ALL_GROUP_TAB_ID,
-        probingNodes,
+        probingNodes: probeBusy,
         canProbeLatencyFromContext,
         canProbeRealConnectFromContext,
         canClearProbeFromContext,
@@ -1685,7 +1725,7 @@ export function SubscriptionsPage({
       canUpdateCountryFromContext,
       canPasteToCurrentGroup,
       activeTabId,
-      probingNodes,
+      probeBusy,
       canProbeLatencyFromContext,
       canProbeRealConnectFromContext,
       canClearProbeFromContext,
@@ -1933,14 +1973,14 @@ export function SubscriptionsPage({
     if (!currentTabGroup) {
       return "当前没有可用分组。";
     }
-    if (probingNodes || clearingProbeData || resettingTrafficStats) {
+    if (probeBusy || clearingProbeData || resettingTrafficStats) {
       return "操作执行中，请稍候。";
     }
     if (rows.length === 0) {
       return "当前表格没有可探测节点。";
     }
     return "";
-  }, [activeTabId, currentTabGroup, probingNodes, clearingProbeData, resettingTrafficStats, rows.length]);
+  }, [activeTabId, currentTabGroup, probeBusy, clearingProbeData, resettingTrafficStats, rows.length]);
   const canBatchProbeByGroup = probeActionDisabledReason === "";
   const clearProbeDisabledReason = useMemo(() => {
     if (activeTabId === ALL_GROUP_TAB_ID) {
@@ -1949,14 +1989,14 @@ export function SubscriptionsPage({
     if (!currentTabGroup) {
       return "当前没有可用分组。";
     }
-    if (probingNodes || clearingProbeData || resettingTrafficStats) {
+    if (probeBusy || clearingProbeData || resettingTrafficStats) {
       return "操作执行中，请稍候。";
     }
     if (rows.length === 0) {
       return "当前表格没有可清理节点。";
     }
     return "";
-  }, [activeTabId, currentTabGroup, probingNodes, clearingProbeData, resettingTrafficStats, rows.length]);
+  }, [activeTabId, currentTabGroup, probeBusy, clearingProbeData, resettingTrafficStats, rows.length]);
   const canClearProbeByGroup = clearProbeDisabledReason === "";
   const canResetTrafficByGroup = clearProbeDisabledReason === "";
   const rowSelection: TableRowSelection<NodeRow> = useMemo(() => {
@@ -2247,7 +2287,7 @@ export function SubscriptionsPage({
                 className="subscriptions-main-header-action-btn"
                 icon={<BiIcon name="lightning-charge-fill" />}
                 disabled={!canBatchProbeByGroup}
-                loading={probingNodes}
+                loading={probeBusy}
                 onClick={probeCurrentGroupLatency}
               />
             </Tooltip>
@@ -2258,7 +2298,7 @@ export function SubscriptionsPage({
                 className="subscriptions-main-header-action-btn"
                 icon={<BiIcon name="star-fill" />}
                 disabled={!canBatchProbeByGroup}
-                loading={probingNodes}
+                loading={probeBusy}
                 onClick={probeCurrentGroupRealConnect}
               />
             </Tooltip>

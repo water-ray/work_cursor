@@ -1,5 +1,6 @@
 mod app_update;
 mod backend;
+mod mobile_host;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -13,6 +14,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(mobile_host::init())
         .setup(|app| {
             if cfg!(debug_assertions) {
                 app.handle().plugin(
@@ -23,14 +25,17 @@ pub fn run() {
             }
             backend::cleanup_stale_linux_dev_desktop_override();
             backend::apply_main_window_icon(app.handle());
-            if let Err(error) = backend::ensure_system_tray(app.handle()) {
-                log::error!("failed to initialize system tray: {error}");
-                eprintln!("failed to initialize system tray: {error}");
+            if backend::runtime_platform_info().supports_tray {
+                if let Err(error) = backend::ensure_system_tray(app.handle()) {
+                    log::error!("failed to initialize system tray: {error}");
+                    eprintln!("failed to initialize system tray: {error}");
+                }
             }
             backend::start_frontend_startup_guard(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            backend::runtime_platform_info,
             backend::ensure_packaged_daemon_running,
             app_update::app_update_get_state,
             app_update::app_update_check,
@@ -48,6 +53,13 @@ pub fn run() {
             backend::system_write_temp_text_file,
             backend::system_read_clipboard_file_paths,
             backend::system_write_clipboard_file,
+            mobile_host::mobile_host_get_status,
+            mobile_host::mobile_host_prepare,
+            mobile_host::mobile_host_check_config,
+            mobile_host::mobile_host_start,
+            mobile_host::mobile_host_stop,
+            mobile_host::mobile_host_probe,
+            mobile_host::mobile_host_dns_health,
         ])
         .run(tauri::generate_context!());
 

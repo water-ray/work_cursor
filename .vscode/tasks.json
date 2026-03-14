@@ -191,6 +191,28 @@
       }
     },
     {
+      "label": "客户端：构建：Android",
+      "type": "shell",
+      "command": "python scripts/build/targets/build_android_release.py",
+      "linux": {
+        "command": "/bin/bash",
+        "args": [
+          "-lc",
+          "source \"$HOME/.cargo/env\" && exec python3 scripts/build/targets/build_android_release.py"
+        ]
+      },
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": "build",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": false
+      }
+    },
+    {
       "label": "客户端：构建：清理 Tauri 编译缓存",
       "type": "process",
       "command": "cargo",

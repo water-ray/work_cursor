@@ -4,6 +4,7 @@ import type {
   DaemonResponsePayload,
   TransportStatus,
 } from "../../../shared/daemon";
+import type { WaterayPlatformApi } from "../platform/runtimeTypes";
 
 type UpdatePlatform = "windows" | "linux" | "macos" | "android" | "ios" | "unknown";
 type UpdateAssetKind = "portable-zip" | "deb" | "appimage" | "unknown";
@@ -91,6 +92,7 @@ interface WaterayDesktopApi {
 declare global {
   interface Window {
     waterayDesktop: WaterayDesktopApi;
+    waterayPlatform: WaterayPlatformApi;
   }
 }
 

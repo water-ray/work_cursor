@@ -15,6 +15,7 @@ import {
 } from "../settings/uiPreferences";
 import { navRoutes, resolveTitle } from "../navigation/navItems";
 import { daemonApi } from "../../services/daemonApi";
+import { MobileQuickPanels } from "./MobileQuickPanels";
 
 const SubscriptionsPage = lazy(async () => ({
   default: (await import("../../pages/subscriptions/SubscriptionsPage")).SubscriptionsPage,
@@ -71,6 +72,7 @@ function RouteLoadingFallback() {
 }
 
 export function AppShell() {
+  const isDesktopRuntime = window.waterayPlatform?.isDesktop !== false;
   const location = useLocation();
   const notice = useAppNotice();
   const daemonState = useDaemonSnapshot({
@@ -342,31 +344,52 @@ export function AppShell() {
 
   return (
     <Layout className="app-shell">
-      <WindowTitleBar
-        title={resolveTitle(location.pathname)}
-        systemType={daemonState.snapshot?.systemType}
-        runtimeAdmin={daemonState.snapshot?.runtimeAdmin}
-        snapshot={daemonState.snapshot}
-        loading={daemonState.loading}
-        runAction={daemonState.runAction}
-        taskCenterOpen={taskCenter.open}
-        taskCenterHasUnread={taskCenter.hasUnread}
-        onTaskCenterToggle={taskCenter.toggleOpen}
-      />
-      <TaskCenterPanel
-        open={taskCenter.open}
-        runningCount={taskCenter.runningCount}
-        queuedCount={taskCenter.queuedCount}
-        runningTasks={taskCenter.runningTasks}
-        queuedTasks={taskCenter.queuedTasks}
-        recentFinishedTasks={taskCenter.recentFinishedTasks}
-        scheduledTasks={taskCenter.scheduledTasks}
-        removingTaskID={removingTaskID}
-        onRemoveQueuedTask={(task) => {
-          void removeQueuedTask(task.id, task.title);
-        }}
-        onClose={taskCenter.closePanel}
-      />
+      {isDesktopRuntime ? (
+        <WindowTitleBar
+          title={resolveTitle(location.pathname)}
+          systemType={daemonState.snapshot?.systemType}
+          runtimeAdmin={daemonState.snapshot?.runtimeAdmin}
+          snapshot={daemonState.snapshot}
+          loading={daemonState.loading}
+          runAction={daemonState.runAction}
+          taskCenterOpen={taskCenter.open}
+          taskCenterHasUnread={taskCenter.hasUnread}
+          onTaskCenterToggle={taskCenter.toggleOpen}
+        />
+      ) : null}
+      {isDesktopRuntime ? (
+        <TaskCenterPanel
+          open={taskCenter.open}
+          runningCount={taskCenter.runningCount}
+          queuedCount={taskCenter.queuedCount}
+          runningTasks={taskCenter.runningTasks}
+          queuedTasks={taskCenter.queuedTasks}
+          recentFinishedTasks={taskCenter.recentFinishedTasks}
+          scheduledTasks={taskCenter.scheduledTasks}
+          removingTaskID={removingTaskID}
+          onRemoveQueuedTask={(task) => {
+            void removeQueuedTask(task.id, task.title);
+          }}
+          onClose={taskCenter.closePanel}
+        />
+      ) : (
+        <MobileQuickPanels
+          taskCenterOpen={taskCenter.open}
+          taskCenterHasUnread={taskCenter.hasUnread}
+          runningCount={taskCenter.runningCount}
+          queuedCount={taskCenter.queuedCount}
+          runningTasks={taskCenter.runningTasks}
+          queuedTasks={taskCenter.queuedTasks}
+          recentFinishedTasks={taskCenter.recentFinishedTasks}
+          scheduledTasks={taskCenter.scheduledTasks}
+          removingTaskID={removingTaskID}
+          onTaskCenterToggle={taskCenter.toggleOpen}
+          onTaskCenterClose={taskCenter.closePanel}
+          onRemoveQueuedTask={(task) => {
+            void removeQueuedTask(task.id, task.title);
+          }}
+        />
+      )}
       <Layout.Content className="content-area">
         <div
           ref={contentScrollRef}

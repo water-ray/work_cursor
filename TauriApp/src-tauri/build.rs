@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use tauri_build::{Attributes, WindowsAttributes};
+use tauri_build::{Attributes, InlinedPlugin, WindowsAttributes};
 
 fn sync_windows_icon(source: &str, target: &str) {
     let source_path = Path::new(source);
@@ -34,7 +34,19 @@ fn main() {
     sync_windows_icon("../ico.ico", "icons/icon.ico");
 
     let windows_attributes = WindowsAttributes::new().window_icon_path("icons/icon.ico");
-    let attributes = Attributes::new().windows_attributes(windows_attributes);
+    let attributes = Attributes::new()
+        .windows_attributes(windows_attributes)
+        .plugin(
+            "mobile-host",
+            InlinedPlugin::new().commands(&[
+                "getStatus",
+                "prepare",
+                "checkConfig",
+                "start",
+                "stop",
+                "probe",
+            ]),
+        );
 
     tauri_build::try_build(attributes).expect("failed to run tauri-build");
 }

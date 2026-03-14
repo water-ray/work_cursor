@@ -6,6 +6,7 @@ import { BiIcon } from "../icons/BiIcon";
 
 interface TaskCenterPanelProps {
   open: boolean;
+  variant?: "desktop" | "mobile";
   runningCount: number;
   queuedCount: number;
   runningTasks: BackgroundTask[];
@@ -193,6 +194,7 @@ function ScheduledTaskList({
 
 export function TaskCenterPanel({
   open,
+  variant = "desktop",
   runningCount,
   queuedCount,
   runningTasks,
@@ -262,9 +264,13 @@ export function TaskCenterPanel({
     queuedTasks.length > 0 ||
     recentFinishedTasks.length > 0 ||
     scheduledTasks.length > 0;
+  const overlayClassName =
+    variant === "mobile" ? "task-center-overlay task-center-overlay-mobile" : "task-center-overlay";
+  const panelClassName =
+    variant === "mobile" ? "task-center-panel task-center-panel-mobile" : "task-center-panel";
   return (
-    <div className="task-center-overlay" onClick={onClose}>
-      <div className="task-center-panel" onClick={(event) => event.stopPropagation()}>
+    <div className={overlayClassName} onClick={onClose}>
+      <div className={panelClassName} onClick={(event) => event.stopPropagation()}>
         <div className="task-center-panel-header">
           <div>
             <div className="task-center-panel-title">后台任务</div>
