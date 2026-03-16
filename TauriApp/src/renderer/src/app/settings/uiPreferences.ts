@@ -1,11 +1,7 @@
 export const uiPreferenceKeys = {
-  dragScrollEnabled: "wateray.ui.dragScrollEnabled.v1",
   closeBehavior: "wateray.ui.closeBehavior.v1",
   proxyStartupSmartOptimize: "wateray.ui.proxyStartupSmartOptimize.v1",
-  mobileLogsNavVisible: "wateray.ui.mobileLogsNavVisible.v1",
 } as const;
-
-export const uiPreferenceChangedEventName = "wateray:ui-preference-changed";
 
 export type CloseBehavior =
   | "ask_every_time"
@@ -17,24 +13,6 @@ export type ProxyStartupSmartOptimizePreference =
   | "off"
   | "best"
   | `country:${string}`;
-
-export interface UIPreferenceChangedEventDetail {
-  key: keyof typeof uiPreferenceKeys;
-  value: boolean | CloseBehavior | ProxyStartupSmartOptimizePreference;
-}
-
-export function readDragScrollEnabled(): boolean {
-  const raw = window.localStorage.getItem(uiPreferenceKeys.dragScrollEnabled);
-  if (raw == null) {
-    return false;
-  }
-  return raw === "1" || raw.toLowerCase() === "true";
-}
-
-export function writeDragScrollEnabled(value: boolean): void {
-  window.localStorage.setItem(uiPreferenceKeys.dragScrollEnabled, value ? "1" : "0");
-  dispatchPreferenceChanged("dragScrollEnabled", value);
-}
 
 export function readCloseBehavior(): CloseBehavior {
   const raw = window.localStorage.getItem(uiPreferenceKeys.closeBehavior);
@@ -50,7 +28,6 @@ export function readCloseBehavior(): CloseBehavior {
 
 export function writeCloseBehavior(value: CloseBehavior): void {
   window.localStorage.setItem(uiPreferenceKeys.closeBehavior, value);
-  dispatchPreferenceChanged("closeBehavior", value);
 }
 
 function normalizeProxyStartupSmartOptimizePreference(
@@ -80,32 +57,4 @@ export function writeProxyStartupSmartOptimizePreference(
 ): void {
   const normalized = normalizeProxyStartupSmartOptimizePreference(value);
   window.localStorage.setItem(uiPreferenceKeys.proxyStartupSmartOptimize, normalized);
-  dispatchPreferenceChanged("proxyStartupSmartOptimize", normalized);
-}
-
-export function readMobileLogsNavVisible(): boolean {
-  const raw = window.localStorage.getItem(uiPreferenceKeys.mobileLogsNavVisible);
-  if (raw == null) {
-    return false;
-  }
-  return raw === "1" || raw.toLowerCase() === "true";
-}
-
-export function writeMobileLogsNavVisible(value: boolean): void {
-  window.localStorage.setItem(uiPreferenceKeys.mobileLogsNavVisible, value ? "1" : "0");
-  dispatchPreferenceChanged("mobileLogsNavVisible", value);
-}
-
-function dispatchPreferenceChanged(
-  key: keyof typeof uiPreferenceKeys,
-  value: boolean | CloseBehavior | ProxyStartupSmartOptimizePreference,
-): void {
-  window.dispatchEvent(
-    new CustomEvent<UIPreferenceChangedEventDetail>(uiPreferenceChangedEventName, {
-      detail: {
-        key,
-        value,
-      },
-    }),
-  );
 }

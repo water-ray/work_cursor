@@ -365,6 +365,11 @@ def main() -> int:
             print("跳过 Android release 构建，直接复用现有 release APK 输出")
         else:
             exit_code = run_build(env)
+            if exit_code != 0:
+                raise AndroidReleaseBuildError(
+                    "Tauri Android release 构建失败，已停止签名与拷贝旧 APK，"
+                    "请先检查上方 tauri android build 输出"
+                )
 
         release_apks = collect_release_apks()
         artifacts = sign_and_copy_release_apks(
@@ -381,12 +386,6 @@ def main() -> int:
             signing_config=signing_config,
         )
         validate_artifacts(artifacts)
-
-        if exit_code != 0:
-            print(
-                "警告：Tauri Android release 构建命令返回非零，"
-                f"但已检测到完整 APK 产物并签名到 {ANDROID_BIN_DIR}"
-            )
 
         print("Android release 构建完成。")
         for item in artifacts:

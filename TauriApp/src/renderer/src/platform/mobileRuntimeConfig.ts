@@ -3,6 +3,7 @@ import type {
   DNSConfig,
   DNSResolverEndpoint,
   DNSRule,
+  LoopbackInternalPortBundle,
   LogLevel,
   NodeGroup,
   ProxyMode,
@@ -14,6 +15,12 @@ import type {
   RuleNodeRef,
   VpnNode,
 } from "../../../shared/daemon";
+import {
+  buildPolicyGroupRuntimeOutbounds as buildPolicyGroupRuntimeOutboundsFromRulePools,
+  resolveNodePoolRefsToNodeIds as resolveNodePoolRefsToNodeIdsFromRulePools,
+} from "./mobileRuntimeRulePools";
+import { buildMobileProbeProfile } from "./mobileRuntimeProbe";
+import { buildMobileRuntimeProfile } from "./mobileRuntimeProfile";
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -26,6 +33,7 @@ export interface MobileResolverContext {
   systemDnsServers?: string[];
   builtInRuleSetPaths?: Record<string, string>;
   dnsCacheFilePath?: string;
+  internalPorts?: LoopbackInternalPortBundle;
 }
 
 const defaultTunInterfaceName = "wateray-tun";
@@ -50,12 +58,12 @@ const geoIPRuleSetURLTemplate = "https://raw.githubusercontent.com/SagerNet/sing
 const geoSiteRuleSetURLTemplate = "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-%s.srs";
 
 const defaultProbeSocksListenAddress = "127.0.0.1";
-export const defaultMobileProbeSocksPort = 39091;
+export const defaultMobileProbeSocksPort = 59530;
 const dnsHealthProxyInboundTag = "dns-health-proxy-in";
 const dnsHealthDirectInboundTag = "dns-health-direct-in";
-export const defaultMobileDnsHealthProxySocksPort = 39092;
-export const defaultMobileDnsHealthDirectSocksPort = 39093;
-const defaultMobileClashAPIController = "127.0.0.1:39081";
+export const defaultMobileDnsHealthProxySocksPort = 59540;
+export const defaultMobileDnsHealthDirectSocksPort = 59550;
+const defaultMobileClashAPIController = "127.0.0.1:59520";
 const defaultMobileDnsCacheFilePath = "singbox-cache.db";
 const defaultMobileDnsCacheRDRCTimeout = "7d";
 
@@ -535,81 +543,7 @@ export function resolveNodePoolRefsToNodeIds(
   refs: RuleNodeRef[] | undefined,
   activeNodes: VpnNode[],
 ): string[] {
-  if (activeNodes.length === 0) {
-    return [];
-  }
-  if ((refs ?? []).length === 0) {
-    return uniqueNonEmptyStrings(activeNodes.map((node) => node.id));
-  }
-  const result: string[] = [];
-  const seen = new Set<string>();
-  const appendNodeId = (nodeId: string) => {
-    const value = nodeId.trim();
-    if (value === "") {
-      return;
-    }
-    const key = value.toLowerCase();
-    if (seen.has(key)) {
-      return;
-    }
-    seen.add(key);
-    result.push(value);
-  };
-  for (const ref of refs ?? []) {
-    const refValue = String(ref.node ?? "").trim();
-    if (refValue === "") {
-      continue;
-    }
-    switch (normalizeRuleNodeRefType(String(ref.type ?? ""))) {
-      case "index": {
-        const index = parseRuleNodeIndex(refValue);
-        if (!index || index > activeNodes.length) {
-          continue;
-        }
-        appendNodeId(activeNodes[index - 1]?.id ?? "");
-        break;
-      }
-      case "country": {
-        const queryCountry = normalizeCountryValue(refValue);
-        const queryRaw = refValue.toLowerCase();
-        for (const node of activeNodes) {
-          const countrySource = node.country || node.region || node.name;
-          const country = normalizeCountryValue(countrySource);
-          if (queryCountry !== "") {
-            if (country === queryCountry) {
-              appendNodeId(node.id);
-            }
-            continue;
-          }
-          const nodeRaw = (node.country || node.region || node.name).trim().toLowerCase();
-          if (queryRaw !== "" && nodeRaw.includes(queryRaw)) {
-            appendNodeId(node.id);
-          }
-        }
-        break;
-      }
-      case "name": {
-        const queryName = refValue.toLowerCase();
-        if (queryName === "") {
-          continue;
-        }
-        for (const node of activeNodes) {
-          if (node.name.toLowerCase().includes(queryName)) {
-            appendNodeId(node.id);
-          }
-        }
-        break;
-      }
-      default:
-        for (const node of activeNodes) {
-          if (node.id.trim().toLowerCase() === refValue.toLowerCase()) {
-            appendNodeId(node.id);
-          }
-        }
-        break;
-    }
-  }
-  return result;
+  return resolveNodePoolRefsToNodeIdsFromRulePools(refs, activeNodes);
 }
 
 function resolveRulePoolFallbackOutboundTag(pool: RuleNodePool | undefined): string {
@@ -744,80 +678,13 @@ function buildPolicyGroupRuntimeOutbounds(
   policyOutbounds: UnknownRecord[];
   selectorSelections: MobileSelectorSwitchSelection[];
 } {
-  const policyOutboundTag: Record<string, string> = {
-    direct: "direct",
-    proxy: proxySelectorTag,
-    reject: "block",
-  };
-  const policyOutbounds: UnknownRecord[] = [];
-  const selectorSelections: MobileSelectorSwitchSelection[] = [];
-  for (const [index, group] of (config.policyGroups ?? []).entries()) {
-    switch (String(group.type ?? "").trim().toLowerCase()) {
-      case "builtin":
-        switch (String(group.builtin ?? "").trim().toLowerCase()) {
-          case "direct":
-            policyOutboundTag[group.id] = "direct";
-            break;
-          case "reject":
-            policyOutboundTag[group.id] = "block";
-            break;
-          default:
-            policyOutboundTag[group.id] = proxySelectorTag;
-            break;
-        }
-        break;
-      case "node_pool": {
-        if (!group.nodePool) {
-          policyOutboundTag[group.id] = proxySelectorTag;
-          break;
-        }
-        const decision = resolveRulePoolDecision(group.nodePool, activeNodes, nodeById);
-        const nodeTags: string[] = [];
-        const seenTags = new Set<string>();
-        for (const nodeId of decision.candidateNodeIds) {
-          const tag = nodeTagsById[nodeId];
-          if (!tag || seenTags.has(tag)) {
-            continue;
-          }
-          seenTags.add(tag);
-          nodeTags.push(tag);
-        }
-        const fallbackTag = decision.fallbackOutboundTag.trim() || "block";
-        let defaultTag = fallbackTag;
-        if (decision.selectedNodeId !== "") {
-          defaultTag = nodeTagsById[decision.selectedNodeId] ?? fallbackTag;
-        }
-        const selectorOutbounds = [...nodeTags];
-        if (!seenTags.has(fallbackTag)) {
-          selectorOutbounds.push(fallbackTag);
-        }
-        if (selectorOutbounds.length === 0) {
-          selectorOutbounds.push(fallbackTag);
-        }
-        const selectorTag = buildPolicyGroupSelectorTag(group.id, index);
-        policyOutboundTag[group.id] = selectorTag;
-        selectorSelections.push({
-          selectorTag,
-          outboundTag: defaultTag,
-        });
-        policyOutbounds.push({
-          type: "selector",
-          tag: selectorTag,
-          outbounds: selectorOutbounds,
-          default: defaultTag,
-          interrupt_exist_connections: true,
-        });
-        break;
-      }
-      default:
-        break;
-    }
-  }
-  return {
-    policyOutboundTag,
-    policyOutbounds,
-    selectorSelections,
-  };
+  return buildPolicyGroupRuntimeOutboundsFromRulePools(
+    config,
+    activeNodes,
+    nodeTagsById,
+    nodeById,
+    proxySelectorTag,
+  );
 }
 
 function resolvePolicyOutboundTag(
@@ -1739,6 +1606,38 @@ function resolveMobileDnsCacheFilePath(resolverContext: MobileResolverContext): 
   return defaultMobileDnsCacheFilePath;
 }
 
+function resolveMobileClashApiController(resolverContext: MobileResolverContext): string {
+  const port = Math.trunc(Number(resolverContext.internalPorts?.clashApiControllerPort ?? 0));
+  if (Number.isFinite(port) && port > 0) {
+    return `127.0.0.1:${port}`;
+  }
+  return defaultMobileClashAPIController;
+}
+
+function resolveMobileProbeSocksPort(resolverContext: MobileResolverContext): number {
+  const port = Math.trunc(Number(resolverContext.internalPorts?.probeSocksPort ?? 0));
+  if (Number.isFinite(port) && port > 0) {
+    return port;
+  }
+  return defaultMobileProbeSocksPort;
+}
+
+function resolveMobileDnsHealthProxySocksPort(resolverContext: MobileResolverContext): number {
+  const port = Math.trunc(Number(resolverContext.internalPorts?.dnsHealthProxySocksPort ?? 0));
+  if (Number.isFinite(port) && port > 0) {
+    return port;
+  }
+  return defaultMobileDnsHealthProxySocksPort;
+}
+
+function resolveMobileDnsHealthDirectSocksPort(resolverContext: MobileResolverContext): number {
+  const port = Math.trunc(Number(resolverContext.internalPorts?.dnsHealthDirectSocksPort ?? 0));
+  if (Number.isFinite(port) && port > 0) {
+    return port;
+  }
+  return defaultMobileDnsHealthDirectSocksPort;
+}
+
 function buildExperimentalConfig(
   snapshot: DaemonSnapshot,
   resolverContext: MobileResolverContext,
@@ -1749,7 +1648,7 @@ function buildExperimentalConfig(
   const dnsConfig = deepClone(snapshot.dns ?? defaultDnsConfig);
   const experimental: UnknownRecord = {
     clash_api: {
-      external_controller: defaultMobileClashAPIController,
+      external_controller: resolveMobileClashApiController(resolverContext),
       default_mode: "Rule",
     },
   };
@@ -1843,12 +1742,6 @@ function buildRuntimeRouteRules(
   return rules;
 }
 
-function buildProbeRouteRules(): UnknownRecord[] {
-  return [
-    { ip_is_private: true, action: "route", outbound: "direct" },
-  ];
-}
-
 function buildTunInbound(snapshot: DaemonSnapshot): UnknownRecord {
   const inbound: UnknownRecord = {
     type: "tun",
@@ -1856,6 +1749,7 @@ function buildTunInbound(snapshot: DaemonSnapshot): UnknownRecord {
     interface_name: defaultTunInterfaceName,
     address: ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
     auto_route: true,
+    strict_route: snapshot.strictRoute !== false,
     mtu: normalizeTunMtu(snapshot.tunMtu),
     stack: normalizeTunStack(snapshot.tunStack),
   };
@@ -1921,6 +1815,10 @@ function toSingboxLogLevel(level: LogLevel | string | undefined): string {
   }
 }
 
+function resolveMobileRuntimeLogLevel(): string {
+  return toSingboxLogLevel("none");
+}
+
 export function buildMobileRuntimeConfig(
   snapshot: DaemonSnapshot,
   targetMode: ProxyMode = snapshot.configuredProxyMode,
@@ -1973,16 +1871,19 @@ export function buildMobileRuntimeConfig(
   });
   outbounds.push({ type: "direct", tag: "direct" }, { type: "block", tag: "block" });
 
-  const config = {
-    log: {
-      level: toSingboxLogLevel(snapshot.proxyLogLevel),
-      timestamp: true,
-    },
+  return buildMobileRuntimeProfile({
+    targetMode,
     inbounds: [
       ...(targetMode === "system" ? [] : [buildTunInbound(snapshot)]),
       buildMixedInbound(snapshot),
-      buildSocksInbound(dnsHealthProxyInboundTag, defaultMobileDnsHealthProxySocksPort),
-      buildSocksInbound(dnsHealthDirectInboundTag, defaultMobileDnsHealthDirectSocksPort),
+      buildSocksInbound(
+        dnsHealthProxyInboundTag,
+        resolveMobileDnsHealthProxySocksPort(resolverContext),
+      ),
+      buildSocksInbound(
+        dnsHealthDirectInboundTag,
+        resolveMobileDnsHealthDirectSocksPort(resolverContext),
+      ),
     ],
     outbounds,
     dns: buildDnsConfig(snapshot, proxySelectorTag, resolverContext, {
@@ -1991,63 +1892,34 @@ export function buildMobileRuntimeConfig(
     experimental: buildExperimentalConfig(snapshot, resolverContext, {
       fakeipEnabled,
     }),
-    route: {
-      rules: buildRuntimeRouteRules(snapshot, targetMode, trafficRuntime.routeRules),
-      final: trafficRuntime.finalOutbound || proxySelectorTag,
-      default_domain_resolver: bootstrapDnsServerTag,
-      auto_detect_interface: targetMode === "tun",
-      override_android_vpn: targetMode === "tun",
-      ...(mergedRuleSetDefinitions.length > 0
-        ? {
-            rule_set: mergedRuleSetDefinitions,
-          }
-        : {}),
-    },
-  };
-
-  return {
-    configJson: JSON.stringify(config),
-    profileName: `${runtimeNodes.group.name || "移动代理"} · ${runtimeNodes.selectedNode.name}`,
+    routeRules: buildRuntimeRouteRules(snapshot, targetMode, trafficRuntime.routeRules),
+    finalOutbound: trafficRuntime.finalOutbound,
+    mergedRuleSetDefinitions,
+    proxySelectorTag,
+    bootstrapDnsServerTag,
+    groupName: runtimeNodes.group.name || "移动代理",
+    selectedNodeName: runtimeNodes.selectedNode.name,
     selectedNodeId: runtimeNodes.selectedNode.id,
-  };
+    logLevel: resolveMobileRuntimeLogLevel(),
+  });
 }
 
 export function buildMobileProbeConfig(
   snapshot: DaemonSnapshot,
   node: VpnNode,
   resolverContext: MobileResolverContext = {},
-  socksPort = defaultMobileProbeSocksPort,
+  socksPort = resolveMobileProbeSocksPort(resolverContext),
 ): string {
-  const tag = runtimeNodeTag(node.id);
-  const config = {
-    log: {
-      level: "error",
-      timestamp: false,
-    },
-    inbounds: [
-      {
-        type: "socks",
-        tag: "probe-in",
-        listen: defaultProbeSocksListenAddress,
-        listen_port: socksPort,
-      },
-    ],
-    outbounds: [
-      buildNodeOutbound(node, tag),
-      {
-        type: "direct",
-        tag: dnsDirectOutboundTag,
-        connect_timeout: "5s",
-      },
-      { type: "direct", tag: "direct" },
-      { type: "block", tag: "block" },
-    ],
-    dns: buildDnsConfig(snapshot, tag, resolverContext, { fakeipEnabled: false }),
-    route: {
-      rules: buildProbeRouteRules(),
-      final: tag,
-      default_domain_resolver: bootstrapDnsServerTag,
-    },
-  };
-  return JSON.stringify(config);
+  return buildMobileProbeProfile({
+    snapshot,
+    node,
+    resolverContext,
+    socksPort,
+    runtimeNodeTag,
+    buildNodeOutbound,
+    buildDnsConfig,
+    dnsDirectOutboundTag,
+    bootstrapDnsServerTag,
+    defaultProbeSocksListenAddress,
+  });
 }

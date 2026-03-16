@@ -41,6 +41,7 @@ struct MobileHostStartArgs {
 struct MobileProbeConfigArgs {
     node_id: String,
     config_json: String,
+    probe_types: Option<Vec<String>>,
 }
 
 #[cfg(target_os = "android")]
@@ -137,12 +138,50 @@ where
 
 #[cfg_attr(not(target_os = "android"), allow(unused_variables))]
 #[tauri::command]
+pub fn mobile_host_bootstrap<R: Runtime>(app: AppHandle<R>) -> Result<serde_json::Value, String> {
+    #[cfg(target_os = "android")]
+    {
+        run_mobile_host_command(
+            &app,
+            platform_contracts::MOBILE_HOST_BOOTSTRAP_PLUGIN_COMMAND,
+            serde_json::json!({}),
+        )
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        Err("移动端代理宿主仅在 Android 平台可用".to_string())
+    }
+}
+
+#[cfg_attr(not(target_os = "android"), allow(unused_variables))]
+#[tauri::command]
 pub fn mobile_host_get_status<R: Runtime>(app: AppHandle<R>) -> Result<serde_json::Value, String> {
     #[cfg(target_os = "android")]
     {
         run_mobile_host_command(
             &app,
             platform_contracts::MOBILE_HOST_GET_STATUS_PLUGIN_COMMAND,
+            serde_json::json!({}),
+        )
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        Err("移动端代理宿主仅在 Android 平台可用".to_string())
+    }
+}
+
+#[cfg_attr(not(target_os = "android"), allow(unused_variables))]
+#[tauri::command]
+pub fn mobile_host_get_versions<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<serde_json::Value, String> {
+    #[cfg(target_os = "android")]
+    {
+        run_mobile_host_command(
+            &app,
+            platform_contracts::MOBILE_HOST_GET_VERSIONS_PLUGIN_COMMAND,
             serde_json::json!({}),
         )
     }
@@ -221,6 +260,26 @@ pub fn mobile_host_stop<R: Runtime>(app: AppHandle<R>) -> Result<serde_json::Val
         run_mobile_host_command(
             &app,
             platform_contracts::MOBILE_HOST_STOP_PLUGIN_COMMAND,
+            serde_json::json!({}),
+        )
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        Err("移动端代理宿主仅在 Android 平台可用".to_string())
+    }
+}
+
+#[cfg_attr(not(target_os = "android"), allow(unused_variables))]
+#[tauri::command]
+pub fn mobile_host_clear_dns_cache<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<serde_json::Value, String> {
+    #[cfg(target_os = "android")]
+    {
+        run_mobile_host_command(
+            &app,
+            platform_contracts::MOBILE_HOST_CLEAR_DNS_CACHE_PLUGIN_COMMAND,
             serde_json::json!({}),
         )
     }

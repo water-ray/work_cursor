@@ -229,15 +229,22 @@ export function useDaemonSnapshot(options: UseDaemonSnapshotOptions = {}) {
         return;
       }
       const tasks = event.payload?.taskQueue?.tasks ?? [];
+      const probeTasks = event.payload?.taskQueue?.probeTasks;
+      const probeResultPatches = event.payload?.taskQueue?.probeResultPatches ?? [];
       lastTaskQueueEventTsRef.current = eventTimestamp;
       setSnapshot((current) => {
         if (!current) {
           return current;
         }
-        return {
+        let nextSnapshot = {
           ...current,
           backgroundTasks: tasks,
+          probeRuntimeTasks: Array.isArray(probeTasks) ? probeTasks : current.probeRuntimeTasks,
         };
+        for (const patch of probeResultPatches) {
+          nextSnapshot = applyProbeResultPatchToSnapshot(nextSnapshot, patch);
+        }
+        return nextSnapshot;
       });
       return;
     }

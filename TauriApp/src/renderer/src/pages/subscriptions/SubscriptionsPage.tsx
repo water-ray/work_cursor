@@ -87,6 +87,15 @@ const subscriptionsTableScrollHeightPx = 360;
 const mobileVirtualNodeCardHeightPx = 52;
 const mobileVirtualNodeCardGapPx = 8;
 
+function buildNodeSelectionKey(groupId: string | undefined, nodeId: string | undefined): string {
+  const normalizedGroupId = String(groupId ?? "").trim();
+  const normalizedNodeId = String(nodeId ?? "").trim();
+  if (normalizedGroupId === "" || normalizedNodeId === "") {
+    return "";
+  }
+  return `${normalizedGroupId}:${normalizedNodeId}`;
+}
+
 function formatProbeExecutionHint(summary: ProbeNodesSummary | undefined): string {
   const cachedCount = Math.max(0, Number(summary?.cachedResultCount ?? 0));
   const freshCount = Math.max(0, Number(summary?.freshProbeCount ?? 0));
@@ -305,7 +314,7 @@ function resolveMobileMetricText(
   pending: boolean,
   formatter: (input: number | undefined) => string,
 ): string {
-  return pending ? "探测中" : formatter(value);
+  return pending && (typeof value !== "number" || value === 0) ? "探测中" : formatter(value);
 }
 
 function resolveTrafficMonitorIntervalSec(value: number | undefined): 0 | 1 | 2 | 5 {
@@ -437,6 +446,10 @@ export function SubscriptionsPage({
   const [selectedRowKeys, setSelectedRowKeys] = useState<string[]>([]);
   const [mobileMultiSelectEnabled, setMobileMultiSelectEnabled] = useState(false);
   const [localActiveNodeID, setLocalActiveNodeID] = useState<string>("");
+  const activeSelectionKeyRef = useRef<string>(
+    buildNodeSelectionKey(snapshot?.activeGroupId, snapshot?.selectedNodeId),
+  );
+  const activatingNodeKeyRef = useRef<string>("");
   const [sortState, setSortState] = useState<SortState>({
     key: "",
     order: "none",
@@ -462,6 +475,7 @@ export function SubscriptionsPage({
   const hoveredRowKeyRef = useRef<string>("");
   const rowsByKeyRef = useRef<Map<string, NodeRow>>(new Map());
   const nodeTableContextRef = useRef<HTMLDivElement | null>(null);
+  const mobileExpandedGroupScrollRef = useRef<HTMLDivElement | null>(null);
   const contextMenuOverlayRef = useRef<HTMLDivElement | null>(null);
   const {
     probeSettingsExpandedKeys,
@@ -688,6 +702,7 @@ export function SubscriptionsPage({
       setContextMenu(null);
       setActiveTabId(detail.groupId);
       if (isMobileView) {
+        setMobileMultiSelectEnabled(false);
         setMobileExpandedGroupId(detail.groupId);
       }
       setSelectedRowKeys([detail.nodeId]);
@@ -988,10 +1003,14 @@ export function SubscriptionsPage({
   }, [groups, snapshotGroupOrder]);
 
   useEffect(() => {
+    activeSelectionKeyRef.current = buildNodeSelectionKey(
+      snapshot?.activeGroupId,
+      snapshot?.selectedNodeId,
+    );
     if (snapshot?.selectedNodeId) {
       setLocalActiveNodeID(snapshot.selectedNodeId);
     }
-  }, [snapshot?.selectedNodeId]);
+  }, [snapshot?.activeGroupId, snapshot?.selectedNodeId]);
 
   useEffect(() => {
     if (!locatedNodeID) {
@@ -1004,12 +1023,30 @@ export function SubscriptionsPage({
 
   const activateNode = useCallback(
     async (row: NodeRow): Promise<void> => {
+      const targetSelectionKey = buildNodeSelectionKey(row.groupId, row.node.id);
+      if (targetSelectionKey === "") {
+        return;
+      }
+      if (activeSelectionKeyRef.current === targetSelectionKey) {
+        return;
+      }
+      if (activatingNodeKeyRef.current === targetSelectionKey) {
+        return;
+      }
+      activatingNodeKeyRef.current = targetSelectionKey;
       try {
         const next = await runAction(() => daemonApi.selectNode(row.node.id, row.groupId));
-        setLocalActiveNodeID(next.selectedNodeId || row.node.id);
+        const nextGroupId = next.activeGroupId || row.groupId;
+        const nextNodeId = next.selectedNodeId || row.node.id;
+        activeSelectionKeyRef.current = buildNodeSelectionKey(nextGroupId, nextNodeId);
+        setLocalActiveNodeID(nextNodeId);
         notice.success(`已激活节点：${row.node.name}`);
       } catch (error) {
         notice.error(error instanceof Error ? error.message : "切换节点失败");
+      } finally {
+        if (activatingNodeKeyRef.current === targetSelectionKey) {
+          activatingNodeKeyRef.current = "";
+        }
       }
     },
     [runAction, notice],
@@ -1142,7 +1179,7 @@ export function SubscriptionsPage({
           probeTypes: ["node_latency", "real_connect"],
         }),
       );
-      notice.success(`已重置 ${nodeIDs.length} 个节点的评分数据`);
+      notice.success(`已重置 ${nodeIDs.length} 个节点的延迟/真连/评分数据`);
     } catch (error) {
       notice.error(error instanceof Error ? error.message : "重置评分失败");
     } finally {
@@ -1274,6 +1311,9 @@ export function SubscriptionsPage({
   );
 
   useEffect(() => {
+    if (isMobileView) {
+      return;
+    }
     if (!pendingExternalFocus || !tableRenderReady) {
       return;
     }
@@ -1310,6 +1350,7 @@ export function SubscriptionsPage({
     };
   }, [
     activeTabId,
+    isMobileView,
     locateNodeInTable,
     orderedGroups,
     pendingExternalFocus,
@@ -1450,7 +1491,7 @@ export function SubscriptionsPage({
           probeTypes: ["node_latency", "real_connect"],
         }),
       );
-      notice.success(`已重置 ${targetNodeIDs.length} 个节点的评分数据`);
+      notice.success(`已重置 ${targetNodeIDs.length} 个节点的延迟/真连/评分数据`);
     } catch (error) {
       notice.error(error instanceof Error ? error.message : "重置评分失败");
     } finally {
@@ -1670,7 +1711,7 @@ export function SubscriptionsPage({
             probeTypes: ["node_latency", "real_connect"],
           }),
         );
-        notice.success(`已重置 ${targetNodeIDs.length} 个节点的评分数据`);
+        notice.success(`已重置 ${targetNodeIDs.length} 个节点的延迟/真连/评分数据`);
       } catch (error) {
         notice.error(error instanceof Error ? error.message : "重置评分失败");
       } finally {
@@ -2474,6 +2515,71 @@ export function SubscriptionsPage({
     () => mobileExpandedGroupRows.filter((row) => selectedRowKeySet.has(row.key)),
     [mobileExpandedGroupRows, selectedRowKeySet],
   );
+  const locateNodeInMobileList = useCallback(
+    (targetNodeID: string): boolean => {
+      const normalizedNodeID = targetNodeID.trim();
+      if (!normalizedNodeID || !mobileExpandedGroup) {
+        return false;
+      }
+      const targetIndex = mobileExpandedGroupRows.findIndex((row) => row.node.id === normalizedNodeID);
+      if (targetIndex < 0) {
+        return false;
+      }
+      const scrollContainer = mobileExpandedGroupScrollRef.current;
+      if (!scrollContainer) {
+        return false;
+      }
+      const itemStride = mobileVirtualNodeCardHeightPx + mobileVirtualNodeCardGapPx;
+      const centeredTop =
+        targetIndex * itemStride - scrollContainer.clientHeight / 2 + mobileVirtualNodeCardHeightPx / 2;
+      scrollContainer.scrollTo({
+        top: Math.max(0, centeredTop),
+        behavior: "smooth",
+      });
+      setLocatedNodeID(normalizedNodeID === activeNodeID.trim() ? "" : normalizedNodeID);
+      return true;
+    },
+    [activeNodeID, mobileExpandedGroup, mobileExpandedGroupRows],
+  );
+  useEffect(() => {
+    if (!isMobileView || !pendingExternalFocus || !mobileExpandedGroup) {
+      return;
+    }
+    if (mobileExpandedGroup.id !== pendingExternalFocus.groupId) {
+      return;
+    }
+    const targetExists = mobileExpandedGroupRows.some((row) => row.node.id === pendingExternalFocus.nodeId);
+    if (!targetExists) {
+      if (!orderedGroups.some((group) => group.id === pendingExternalFocus.groupId)) {
+        setPendingExternalFocus(null);
+      }
+      return;
+    }
+    const timerId = window.setTimeout(() => {
+      if (locateNodeInMobileList(pendingExternalFocus.nodeId)) {
+        setPendingExternalFocus((current) => {
+          if (
+            current &&
+            current.groupId === pendingExternalFocus.groupId &&
+            current.nodeId === pendingExternalFocus.nodeId
+          ) {
+            return null;
+          }
+          return current;
+        });
+      }
+    }, 60);
+    return () => {
+      window.clearTimeout(timerId);
+    };
+  }, [
+    isMobileView,
+    locateNodeInMobileList,
+    mobileExpandedGroup,
+    mobileExpandedGroupRows,
+    orderedGroups,
+    pendingExternalFocus,
+  ]);
   const mobileExpandedGroupActionRows =
     mobileMultiSelectEnabled && mobileSelectedExpandedGroupRows.length > 0
       ? mobileSelectedExpandedGroupRows
@@ -2814,7 +2920,10 @@ export function SubscriptionsPage({
                       mobileExpandedGroupActionRows,
                       { sticky: true },
                     )}
-                    <div className="subscriptions-mobile-active-group-nodes-scroll">
+                    <div
+                      ref={mobileExpandedGroupScrollRef}
+                      className="subscriptions-mobile-active-group-nodes-scroll"
+                    >
                       {mobileExpandedGroupRows.length === 0 ? (
                         <div className="subscriptions-mobile-empty-state is-panel-empty">
                           <Typography.Text type="secondary">当前分组暂无节点。</Typography.Text>
@@ -2882,7 +2991,7 @@ export function SubscriptionsPage({
                               >
                                 <button
                                   type="button"
-                                  className={`subscriptions-mobile-node-card${isActiveNode ? " is-active" : ""}${isSelected ? " is-selected" : ""}`}
+                                  className={`subscriptions-mobile-node-card${isActiveNode ? " is-active" : ""}${isSelected ? " is-selected" : ""}${row.node.id === locatedNodeID ? " is-located" : ""}`}
                                   onClick={() => {
                                     if (mobileMultiSelectEnabled) {
                                       toggleMobileRowSelection(row.key);
@@ -2910,7 +3019,13 @@ export function SubscriptionsPage({
                                     {(() => {
                                       const latencyPending = isProbePending(row.node.id, "node_latency");
                                       const realConnectPending = isProbePending(row.node.id, "real_connect");
-                                      const scorePending = latencyPending || realConnectPending;
+                                      const scorePending =
+                                        (latencyPending || realConnectPending) &&
+                                        Number(row.node.probeScore ?? 0) === 0;
+                                      const displayLatencyPending =
+                                        latencyPending && Number(row.node.latencyMs ?? 0) === 0;
+                                      const displayRealConnectPending =
+                                        realConnectPending && Number(row.node.probeRealConnectMs ?? 0) === 0;
                                       const scoreText = resolveMobileMetricText(
                                         row.node.probeScore,
                                         scorePending,
@@ -2918,21 +3033,21 @@ export function SubscriptionsPage({
                                       );
                                       const latencyText = resolveMobileMetricText(
                                         row.node.latencyMs,
-                                        latencyPending,
+                                        displayLatencyPending,
                                         formatProbeLatencyLabel,
                                       );
                                       const realConnectText = resolveMobileMetricText(
                                         row.node.probeRealConnectMs,
-                                        realConnectPending,
+                                        displayRealConnectPending,
                                         formatProbeLatencyLabel,
                                       );
                                       const scoreTone = scorePending
                                         ? "pending"
                                         : resolveMobileScoreMetricTone(row.node.probeScore);
-                                      const latencyTone = latencyPending
+                                      const latencyTone = displayLatencyPending
                                         ? "pending"
                                         : resolveMobileLatencyMetricTone(row.node.latencyMs);
-                                      const realConnectTone = realConnectPending
+                                      const realConnectTone = displayRealConnectPending
                                         ? "pending"
                                         : resolveMobileLatencyMetricTone(row.node.probeRealConnectMs);
                                       return (

@@ -1,14 +1,15 @@
+import { invoke } from "@tauri-apps/api/core";
 import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
 
 import type {
   DaemonRequestPayload,
   DaemonResponsePayload,
+  LoopbackTransportBootstrap,
 } from "@shared/daemon";
 
-export const DEFAULT_DAEMON_BASE_URL = "http://127.0.0.1:39080";
+export const DEFAULT_DAEMON_BASE_URL = "http://127.0.0.1:59500";
 
-const daemonBaseURL =
-  import.meta.env.VITE_WATERAY_DAEMON_URL?.trim() || DEFAULT_DAEMON_BASE_URL;
+let daemonBaseURL = normalizeBaseURL(import.meta.env.VITE_WATERAY_DAEMON_URL);
 
 const defaultDaemonRequestTimeoutMs = 60000;
 const heartbeatRequestTimeoutMs = 5000;
@@ -18,6 +19,14 @@ const logStreamRequestTimeoutMs = 5000;
 const stopRequestTimeoutMs = 15000;
 
 const pendingControllers = new Set<AbortController>();
+
+function normalizeBaseURL(raw: string | undefined | null): string {
+  const value = String(raw ?? "").trim();
+  if (value === "") {
+    return DEFAULT_DAEMON_BASE_URL;
+  }
+  return value.replace(/\/+$/, "");
+}
 
 function resolveRequestTimeoutMs(payload: DaemonRequestPayload): number {
   const explicitTimeoutMs = Math.max(
@@ -56,10 +65,23 @@ export function getDaemonBaseURL(): string {
   return daemonBaseURL;
 }
 
+export function setDaemonBaseURL(nextBaseURL: string): void {
+  daemonBaseURL = normalizeBaseURL(nextBaseURL);
+}
+
 export function getDaemonWebSocketURL(path = "/v1/events/ws"): string {
   const url = new URL(path, daemonBaseURL);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   return url.toString();
+}
+
+export async function invokeDesktopTransportBootstrap(): Promise<LoopbackTransportBootstrap> {
+  const bootstrap = await invoke<LoopbackTransportBootstrap>("daemon_transport_bootstrap");
+  const activePort = Math.max(1, Math.trunc(Number(bootstrap.activeControlPort ?? 0)));
+  if (activePort > 0) {
+    setDaemonBaseURL(`http://127.0.0.1:${activePort}`);
+  }
+  return bootstrap;
 }
 
 export function abortPendingDaemonRequests(

@@ -14,7 +14,7 @@ import {
   type MobileResolverContext,
 } from "./mobileRuntimeConfig";
 
-const defaultDnsHealthDomain = "www.qq.com";
+const defaultDnsHealthDomain = "www.baidu.com";
 const defaultDnsHealthTimeoutMs = 5000;
 const minDnsHealthTimeoutMs = 500;
 const maxDnsHealthTimeoutMs = 20000;
@@ -312,19 +312,25 @@ function shouldUseRunningServiceDns(
   return endpoint.type === "https" || endpoint.type === "tcp" || endpoint.type === "tls";
 }
 
-function resolveServiceSocksPort(serverTag: string, endpoint: DNSResolverEndpoint): number | undefined {
+function resolveServiceSocksPortWithContext(
+  serverTag: string,
+  endpoint: DNSResolverEndpoint,
+  resolverContext: MobileResolverContext,
+): number | undefined {
   const detour = String(endpoint.detour ?? "").trim().toLowerCase();
+  const proxyPort = resolverContext.internalPorts?.dnsHealthProxySocksPort;
+  const directPort = resolverContext.internalPorts?.dnsHealthDirectSocksPort;
   if (detour === "proxy") {
-    return defaultMobileDnsHealthProxySocksPort;
+    return proxyPort ?? defaultMobileDnsHealthProxySocksPort;
   }
   if (detour === "direct") {
-    return defaultMobileDnsHealthDirectSocksPort;
+    return directPort ?? defaultMobileDnsHealthDirectSocksPort;
   }
   if (serverTag === "remote") {
-    return defaultMobileDnsHealthProxySocksPort;
+    return proxyPort ?? defaultMobileDnsHealthProxySocksPort;
   }
   if (serverTag === "direct") {
-    return defaultMobileDnsHealthDirectSocksPort;
+    return directPort ?? defaultMobileDnsHealthDirectSocksPort;
   }
   return undefined;
 }
@@ -403,7 +409,11 @@ async function checkEndpoint(params: {
             timeoutMs,
             host,
             viaService: shouldUseRunningService,
-            serviceSocksPort: resolveServiceSocksPort(serverTag, resolvedEndpoint),
+            serviceSocksPort: resolveServiceSocksPortWithContext(
+              serverTag,
+              resolvedEndpoint,
+              resolverContext,
+            ),
           });
           return {
             target,
@@ -440,7 +450,11 @@ async function checkEndpoint(params: {
           timeoutMs,
           host,
           viaService: shouldUseRunningService,
-          serviceSocksPort: resolveServiceSocksPort(serverTag, resolvedEndpoint),
+          serviceSocksPort: resolveServiceSocksPortWithContext(
+            serverTag,
+            resolvedEndpoint,
+            resolverContext,
+          ),
         });
         return {
           target,

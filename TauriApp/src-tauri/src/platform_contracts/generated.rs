@@ -67,9 +67,17 @@ pub const MOBILE_HOST_PLUGIN_NAME: &str = "mobile-host";
 pub const MOBILE_HOST_ANDROID_PLUGIN_IDENTIFIER: &str = "com.wateray.desktop.mobilehost";
 pub const MOBILE_HOST_ANDROID_PLUGIN_CLASS: &str = "MobileHostPlugin";
 
+pub const MOBILE_HOST_BOOTSTRAP_INVOKE_COMMAND: &str = "mobile_host_bootstrap";
+pub const MOBILE_HOST_BOOTSTRAP_PLUGIN_COMMAND: &str = "bootstrap";
+pub const MOBILE_HOST_BOOTSTRAP_PERMISSION: &str = "mobile-host:allow-bootstrap";
+
 pub const MOBILE_HOST_GET_STATUS_INVOKE_COMMAND: &str = "mobile_host_get_status";
 pub const MOBILE_HOST_GET_STATUS_PLUGIN_COMMAND: &str = "getStatus";
 pub const MOBILE_HOST_GET_STATUS_PERMISSION: &str = "mobile-host:allow-getStatus";
+
+pub const MOBILE_HOST_GET_VERSIONS_INVOKE_COMMAND: &str = "mobile_host_get_versions";
+pub const MOBILE_HOST_GET_VERSIONS_PLUGIN_COMMAND: &str = "getVersions";
+pub const MOBILE_HOST_GET_VERSIONS_PERMISSION: &str = "mobile-host:allow-getVersions";
 
 pub const MOBILE_HOST_PREPARE_INVOKE_COMMAND: &str = "mobile_host_prepare";
 pub const MOBILE_HOST_PREPARE_PLUGIN_COMMAND: &str = "prepare";
@@ -115,5 +123,5 @@ pub const MOBILE_HOST_SWITCH_SELECTORS_INVOKE_COMMAND: &str = "mobile_host_switc
 pub const MOBILE_HOST_SWITCH_SELECTORS_PLUGIN_COMMAND: &str = "switchSelectors";
 pub const MOBILE_HOST_SWITCH_SELECTORS_PERMISSION: &str = "mobile-host:allow-switchSelectors";
 
-pub const MOBILE_HOST_PLUGIN_COMMANDS: &[&str] = &["getStatus", "prepare", "checkConfig", "start", "stop", "clearDnsCache", "probe", "probeStart", "probeCancel", "getTaskQueue", "dnsHealth", "switchSelectors"];
-pub const MOBILE_HOST_PERMISSIONS: &[&str] = &["mobile-host:allow-getStatus", "mobile-host:allow-prepare", "mobile-host:allow-checkConfig", "mobile-host:allow-start", "mobile-host:allow-stop", "mobile-host:allow-clearDnsCache", "mobile-host:allow-probe", "mobile-host:allow-probeStart", "mobile-host:allow-probeCancel", "mobile-host:allow-getTaskQueue", "mobile-host:allow-dnsHealth", "mobile-host:allow-switchSelectors"];
+pub const MOBILE_HOST_PLUGIN_COMMANDS: &[&str] = &["bootstrap", "getStatus", "getVersions", "prepare", "checkConfig", "start", "stop", "clearDnsCache", "probe", "probeStart", "probeCancel", "getTaskQueue", "dnsHealth", "switchSelectors"];
+pub const MOBILE_HOST_PERMISSIONS: &[&str] = &["mobile-host:allow-bootstrap", "mobile-host:allow-getStatus", "mobile-host:allow-getVersions", "mobile-host:allow-prepare", "mobile-host:allow-checkConfig", "mobile-host:allow-start", "mobile-host:allow-stop", "mobile-host:allow-clearDnsCache", "mobile-host:allow-probe", "mobile-host:allow-probeStart", "mobile-host:allow-probeCancel", "mobile-host:allow-getTaskQueue", "mobile-host:allow-dnsHealth", "mobile-host:allow-switchSelectors"];

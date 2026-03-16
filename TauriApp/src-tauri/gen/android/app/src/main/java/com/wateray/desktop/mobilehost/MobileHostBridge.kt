@@ -11,6 +11,7 @@ import java.util.Locale
 data class MobileHostStatus(
   val state: String = "idle",
   val runtimeMode: String = "off",
+  val runtimeGeneration: Long = 0,
   val permissionGranted: Boolean = false,
   val systemDnsServers: List<String> = emptyList(),
   val serviceRunning: Boolean = false,
@@ -43,8 +44,6 @@ object MobileHostBridge {
   private val lock = Any()
   private var status = MobileHostStatus()
   private var statusEmitter: ((MobileHostStatus) -> Unit)? = null
-  private var taskQueueEmitter: ((MobileTaskQueueResult) -> Unit)? = null
-  private var probeResultPatchEmitter: ((MobileProbeResultPatchPayload) -> Unit)? = null
 
   fun attachStatusEmitter(listener: (MobileHostStatus) -> Unit) {
     val snapshot = synchronized(lock) {
@@ -54,25 +53,9 @@ object MobileHostBridge {
     listener(snapshot)
   }
 
-  fun attachTaskQueueEmitter(listener: (MobileTaskQueueResult) -> Unit) {
-    synchronized(lock) {
-      taskQueueEmitter = listener
-    }
-    val snapshot = MobileTaskCenter.queueSnapshot()
-    listener(snapshot)
-  }
-
-  fun attachProbeResultEmitter(listener: (MobileProbeResultPatchPayload) -> Unit) {
-    synchronized(lock) {
-      probeResultPatchEmitter = listener
-    }
-  }
-
   fun clearEmitters() {
     synchronized(lock) {
       statusEmitter = null
-      taskQueueEmitter = null
-      probeResultPatchEmitter = null
     }
   }
 
@@ -110,12 +93,14 @@ object MobileHostBridge {
     configJson: String,
     tunReady: Boolean,
     runtimeMode: String,
+    runtimeGeneration: Long,
   ): MobileHostStatus {
     val now = System.currentTimeMillis()
     return update {
       it.copy(
         state = "running",
         runtimeMode = runtimeMode,
+        runtimeGeneration = runtimeGeneration,
         profileName = profileName,
         configDigest = digestConfig(configJson),
         serviceRunning = true,
@@ -154,11 +139,12 @@ object MobileHostBridge {
     }
   }
 
-  fun setStopped(message: String? = null): MobileHostStatus {
+  fun setStopped(message: String? = null, runtimeGeneration: Long? = null): MobileHostStatus {
     return update {
       it.copy(
         state = "stopped",
         runtimeMode = "off",
+        runtimeGeneration = runtimeGeneration ?: it.runtimeGeneration,
         serviceRunning = false,
         tunReady = false,
         lastError = message,
@@ -167,10 +153,11 @@ object MobileHostBridge {
     }
   }
 
-  fun setError(message: String): MobileHostStatus {
+  fun setError(message: String, runtimeGeneration: Long? = null): MobileHostStatus {
     return update {
       it.copy(
         state = "error",
+        runtimeGeneration = runtimeGeneration ?: it.runtimeGeneration,
         serviceRunning = false,
         tunReady = false,
         lastError = message,
@@ -189,16 +176,6 @@ object MobileHostBridge {
     }
     listener?.invoke(next)
     return next
-  }
-
-  fun emitTaskQueueChanged(snapshot: MobileTaskQueueResult) {
-    val listener = synchronized(lock) { taskQueueEmitter }
-    listener?.invoke(snapshot)
-  }
-
-  fun emitProbeResultPatch(payload: MobileProbeResultPatchPayload) {
-    val listener = synchronized(lock) { probeResultPatchEmitter }
-    listener?.invoke(payload)
   }
 
   private fun digestConfig(configJson: String): String {

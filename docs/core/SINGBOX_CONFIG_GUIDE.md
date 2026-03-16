@@ -136,7 +136,7 @@
 
 ### 11.1 Runtime 基线
 
-- TUN 模式固定启用：`auto_route=true` + `strict_route=true`。
+- TUN 模式默认启用：`auto_route=true`；`strict_route` 跟随 Wateray 的“严格路由”配置，默认开启。
 - Linux 下额外启用 `auto_redirect=true`（官方推荐，性能/兼容性更好）。
 - 路由规则基线固定包含：
   - `action=sniff`

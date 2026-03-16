@@ -2,24 +2,17 @@ package com.wateray.desktop.mobilehost
 
 import android.content.Context
 import android.util.Log
-import io.nekohasekai.libbox.CommandClientHandler
-import io.nekohasekai.libbox.CommandClientOptions
-import io.nekohasekai.libbox.ConnectionEvents
-import io.nekohasekai.libbox.Libbox
-import io.nekohasekai.libbox.LogIterator
-import io.nekohasekai.libbox.OutboundGroup
-import io.nekohasekai.libbox.OutboundGroupIterator
-import io.nekohasekai.libbox.StatusMessage
-import io.nekohasekai.libbox.StringIterator
-import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Callable
+import java.util.concurrent.ExecutorCompletionService
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
-import kotlin.math.ceil
 import kotlin.math.max
 import kotlin.math.min
 
 data class MobileProbeConfig(
   val nodeId: String,
   val configJson: String,
+  val probeTypes: List<String> = emptyList(),
 )
 
 data class MobileProbeResultItem(
@@ -33,166 +26,20 @@ data class MobileProbeResult(
   val results: List<MobileProbeResultItem>,
 )
 
-private data class UrlTestSnapshot(
-  val delayMs: Int,
-  val testedAtMs: Long,
+private data class NodeProbeExecutionPlan(
+  val nodeId: String,
+  val requestedStages: List<String>,
 )
 
-private class ProbeCommandClientHandler : CommandClientHandler {
-  private val connectedLatch = CountDownLatch(1)
-  private val groupsLock = Object()
-
-  @Volatile
-  private var disconnectedMessage: String? = null
-
-  private var groupsByTag: Map<String, Map<String, UrlTestSnapshot>> = emptyMap()
-
-  override fun clearLogs() {}
-
-  override fun connected() {
-    connectedLatch.countDown()
-    synchronized(groupsLock) {
-      groupsLock.notifyAll()
-    }
-  }
-
-  override fun disconnected(message: String) {
-    disconnectedMessage = message.trim().ifEmpty { "移动端命令服务连接已断开" }
-    connectedLatch.countDown()
-    synchronized(groupsLock) {
-      groupsLock.notifyAll()
-    }
-  }
-
-  override fun initializeClashMode(modeList: StringIterator, currentMode: String) {}
-
-  override fun setDefaultLogLevel(level: Int) {}
-
-  override fun updateClashMode(newMode: String) {}
-
-  override fun writeConnectionEvents(events: ConnectionEvents) {}
-
-  override fun writeGroups(message: OutboundGroupIterator) {
-    val nextGroups = mutableMapOf<String, Map<String, UrlTestSnapshot>>()
-    while (message.hasNext()) {
-      val group = message.next()
-      val tag = group.getTag().trim()
-      if (tag.isEmpty()) {
-        continue
-      }
-      nextGroups[tag] = readGroupItems(group)
-    }
-    synchronized(groupsLock) {
-      val merged = groupsByTag.toMutableMap()
-      merged.putAll(nextGroups)
-      groupsByTag = merged
-      groupsLock.notifyAll()
-    }
-  }
-
-  override fun writeLogs(messageList: LogIterator) {}
-
-  override fun writeStatus(message: StatusMessage) {}
-
-  fun awaitConnected(timeoutMs: Int) {
-    if (!connectedLatch.await(timeoutMs.toLong(), TimeUnit.MILLISECONDS)) {
-      throw IllegalStateException("连接移动端命令服务超时")
-    }
-    disconnectedMessage?.let { message ->
-      throw IllegalStateException(message)
-    }
-  }
-
-  fun waitForGroupSnapshot(
-    groupTag: String,
-    minimumItemCount: Int,
-    timeoutMs: Int,
-  ): Map<String, UrlTestSnapshot> {
-    val deadline = System.nanoTime() + timeoutMs * 1_000_000L
-    synchronized(groupsLock) {
-      while (true) {
-        disconnectedMessage?.let { message ->
-          throw IllegalStateException(message)
-        }
-        val current = groupsByTag[groupTag]
-        if (current != null && current.size >= minimumItemCount) {
-          return current
-        }
-        val remainingMs = ((deadline - System.nanoTime()) / 1_000_000L).coerceAtLeast(0L)
-        if (remainingMs <= 0L) {
-          throw IllegalStateException("等待运行中代理返回节点列表超时")
-        }
-        groupsLock.wait(remainingMs)
-      }
-    }
-  }
-
-  fun currentGroup(groupTag: String): Map<String, UrlTestSnapshot> {
-    return synchronized(groupsLock) {
-      groupsByTag[groupTag].orEmpty()
-    }
-  }
-
-  fun waitForUpdatedUrlTestResults(
-    groupTag: String,
-    targetTags: Set<String>,
-    baselineTimes: Map<String, Long>,
-    timeoutMs: Int,
-  ): Map<String, UrlTestSnapshot> {
-    if (targetTags.isEmpty()) {
-      return emptyMap()
-    }
-    val deadline = System.nanoTime() + timeoutMs * 1_000_000L
-    synchronized(groupsLock) {
-      while (true) {
-        disconnectedMessage?.let { message ->
-          throw IllegalStateException(message)
-        }
-        val current = groupsByTag[groupTag].orEmpty()
-        val updated = mutableMapOf<String, UrlTestSnapshot>()
-        for (tag in targetTags) {
-          val snapshot = current[tag] ?: continue
-          if (snapshot.testedAtMs <= max(0L, baselineTimes[tag] ?: 0L)) {
-            continue
-          }
-          updated[tag] = snapshot
-        }
-        if (updated.isNotEmpty()) {
-          return updated
-        }
-        val remainingMs = ((deadline - System.nanoTime()) / 1_000_000L).coerceAtLeast(0L)
-        if (remainingMs <= 0L) {
-          return emptyMap()
-        }
-        groupsLock.wait(remainingMs)
-      }
-    }
-  }
-
-  private fun readGroupItems(group: OutboundGroup): Map<String, UrlTestSnapshot> {
-    val result = mutableMapOf<String, UrlTestSnapshot>()
-    val items = group.getItems()
-    while (items.hasNext()) {
-      val item = items.next()
-      val tag = item.getTag().trim()
-      if (tag.isEmpty()) {
-        continue
-      }
-      result[tag] = UrlTestSnapshot(
-        delayMs = item.getURLTestDelay(),
-        testedAtMs = max(0L, item.getURLTestTime()),
-      )
-    }
-    return result
-  }
-}
+private data class MutableNodeProbeState(
+  var latencyMs: Int? = null,
+  var realConnectMs: Int? = null,
+  val errorMessages: LinkedHashSet<String> = linkedSetOf(),
+)
 
 object MobileProbeRunner {
   private const val TAG = "MobileProbeRunner"
-  private const val proxyUrlTestTag = "proxy-auto"
-  private const val connectTimeoutMs = 5000
-  private const val minWaitMs = 5000
-  private const val maxWaitMs = 45000
+  private const val defaultLatencyUrl = "https://www.gstatic.com/generate_204"
   private const val defaultTimeoutMs = 3000
   private const val assumedProbeConcurrency = 8
   private const val probeScoreLatencyGoodMs = 80
@@ -201,8 +48,6 @@ object MobileProbeRunner {
   private const val probeScoreRealConnectBadMs = 2000
   private const val probeScoreLatencyWeight = 0.35
   private const val probeScoreRealConnectWeight = 0.65
-  private const val probeScoreLatencyOnlyCap = 55.0
-  private const val probeScoreRealOnlyCap = 80.0
 
   @Suppress("UNUSED_PARAMETER")
   fun run(
@@ -235,10 +80,11 @@ object MobileProbeRunner {
       MobileProbeResult(
         configs.map { config ->
           val nodeId = config.nodeId.trim()
+          val requestedStages = resolveProbeTypesForConfig(config, normalizedProbeTypes)
           MobileProbeResultItem(
             nodeId = nodeId,
-            latencyMs = -1,
-            realConnectMs = if (normalizedProbeTypes.contains("real_connect")) -1 else null,
+            latencyMs = if (requestedStages.contains("node_latency")) -1 else null,
+            realConnectMs = if (requestedStages.contains("real_connect")) -1 else null,
             error = message,
           )
         },
@@ -254,190 +100,247 @@ object MobileProbeRunner {
     emitter: MobileProbeTaskEmitter?,
   ): MobileProbeResult {
     WaterayVpnService.ensureLibboxSetup(context)
-    val normalizedProbeTypes = normalizeProbeTypes(request.probeTypes)
     val normalizedTimeoutMs = normalizeTimeoutMs(request.timeoutMs)
-    val targetNodeIds = request.configs.map { it.nodeId.trim() }.filter { it.isNotEmpty() }.distinct()
-    if (targetNodeIds.isEmpty()) {
-      throw IllegalArgumentException("节点ID不能为空")
-    }
-
-    val handler = ProbeCommandClientHandler()
-    val options = CommandClientOptions().apply {
-      addCommand(Libbox.CommandGroup)
-    }
-    val client = Libbox.newCommandClient(handler, options)
-    try {
-      Log.d(
-        TAG,
-        "runStreaming taskId=$taskId nodes=${targetNodeIds.size} probeTypes=${normalizedProbeTypes.joinToString(",")}",
-      )
-      cancellationSignal.throwIfCancelled()
-      client.connect()
-      handler.awaitConnected(connectTimeoutMs)
-
-      val initialGroup = handler.waitForGroupSnapshot(proxyUrlTestTag, 1, connectTimeoutMs)
-      val nodeTags = targetNodeIds.associateWith(::runtimeNodeTag)
-      val nodeIdByTag = nodeTags.entries.associate { (nodeId, tag) -> tag to nodeId }
-      val missingNodeIds = nodeTags.filterValues { tag -> !initialGroup.containsKey(tag) }.keys
-      val availableTags = nodeTags
-        .filterKeys { nodeId -> !missingNodeIds.contains(nodeId) }
-        .values
-        .toSet()
-      val totalCount = targetNodeIds.size
-      val resultByNodeId = linkedMapOf<String, MobileProbeResultItem>()
-      var completedCount: Int
-
-      val baselineTimes = availableTags.associateWith { tag ->
-        initialGroup[tag]?.testedAtMs ?: 0L
-      }.toMutableMap()
-      if (missingNodeIds.isNotEmpty()) {
-        val updates = missingNodeIds.map { nodeId ->
-          val result = MobileProbeResultItem(
+    val defaultProbeTypes = normalizeProbeTypes(request.probeTypes)
+    val executionPlans = request.configs
+      .mapNotNull { config ->
+        val nodeId = config.nodeId.trim()
+        if (nodeId.isEmpty()) {
+          null
+        } else {
+          NodeProbeExecutionPlan(
             nodeId = nodeId,
-            latencyMs = -1,
-            realConnectMs = if (normalizedProbeTypes.contains("real_connect")) -1 else null,
-            error = "当前运行中的代理实例未包含该节点，请先激活对应分组并重启代理",
-          )
-          resultByNodeId[nodeId] = result
-          buildResultPatch(nodeId, normalizedProbeTypes, result)
-        }
-        completedCount = resultByNodeId.size
-        emitter?.onResultPatch(
-          MobileProbeResultPatchPayload(
-            taskId = taskId,
-            groupId = request.groupId.trim().takeIf { it.isNotEmpty() },
-            updates = updates,
-            completedCount = completedCount,
-            totalCount = totalCount,
-            final = false,
-          ),
-        )
-      }
-      if (availableTags.isNotEmpty()) {
-        cancellationSignal.throwIfCancelled()
-        client.urlTest(proxyUrlTestTag)
-      }
-      val pendingTags = availableTags.toMutableSet()
-      val deadline = System.nanoTime() + resolveWaitTimeoutMs(
-        normalizedTimeoutMs,
-        availableTags.size,
-      ) * 1_000_000L
-      while (pendingTags.isNotEmpty()) {
-        cancellationSignal.throwIfCancelled()
-        val remainingMs = ((deadline - System.nanoTime()) / 1_000_000L).coerceAtLeast(0L).toInt()
-        if (remainingMs <= 0) {
-          break
-        }
-        val updated = handler.waitForUpdatedUrlTestResults(
-          proxyUrlTestTag,
-          pendingTags,
-          baselineTimes,
-          min(500, remainingMs),
-        )
-        if (updated.isEmpty()) {
-          continue
-        }
-        val patchItems = updated.entries.mapNotNull { (tag, snapshot) ->
-          val nodeId = nodeIdByTag[tag] ?: return@mapNotNull null
-          baselineTimes[tag] = snapshot.testedAtMs
-          pendingTags.remove(tag)
-          val result = buildResultItem(nodeId, normalizedProbeTypes, snapshot)
-          resultByNodeId[nodeId] = result
-          buildResultPatch(nodeId, normalizedProbeTypes, result)
-        }
-        completedCount = resultByNodeId.size
-        if (patchItems.isNotEmpty()) {
-          Log.d(TAG, "taskId=$taskId incremental patch count=${patchItems.size}")
-          emitter?.onResultPatch(
-            MobileProbeResultPatchPayload(
-              taskId = taskId,
-              groupId = request.groupId.trim().takeIf { it.isNotEmpty() },
-              updates = patchItems,
-              completedCount = completedCount,
-              totalCount = totalCount,
-              final = false,
-            ),
+            requestedStages = resolveProbeTypesForConfig(config, defaultProbeTypes),
           )
         }
       }
-      val latestResults = handler.currentGroup(proxyUrlTestTag)
-      val finalUpdates = mutableListOf<MobileProbeNodeResultPatch>()
-      for ((nodeId, tag) in nodeTags) {
-        if (resultByNodeId.containsKey(nodeId)) {
-          continue
-        }
-        val result = buildResultItem(nodeId, normalizedProbeTypes, latestResults[tag])
-        resultByNodeId[nodeId] = result
-        finalUpdates += buildResultPatch(nodeId, normalizedProbeTypes, result)
+      .distinctBy { it.nodeId }
+    if (executionPlans.isEmpty()) {
+      throw IllegalArgumentException("移动端探测配置不能为空")
+    }
+    val totalCount = executionPlans.size
+    val resultStateByNodeId = linkedMapOf<String, MutableNodeProbeState>()
+    executionPlans.forEach { plan ->
+      resultStateByNodeId[plan.nodeId] = MutableNodeProbeState()
+    }
+    val finalizedNodeIds = linkedSetOf<String>()
+    val resultLock = Any()
+    val taskScopeKey =
+      "node_probe:${if (defaultProbeTypes.contains("real_connect")) "real_connect" else "node_latency"}:runtime:${request.runtimeGeneration}:digest:${request.configDigest ?: "-"}"
+    val workerCount = min(
+      assumedProbeConcurrency,
+      max(1, executionPlans.size),
+    )
+    val probeExecutor = Executors.newFixedThreadPool(workerCount)
+    val probeCompletionService = ExecutorCompletionService<Unit>(probeExecutor)
+
+    fun currentResult(nodeId: String): MobileProbeResultItem {
+      synchronized(resultLock) {
+        val state = resultStateByNodeId[nodeId] ?: MutableNodeProbeState()
+        return MobileProbeResultItem(
+          nodeId = nodeId,
+          latencyMs = state.latencyMs,
+          realConnectMs = state.realConnectMs,
+          error = state.errorMessages.joinToString("；").trim().takeIf { it.isNotEmpty() },
+        )
       }
-      completedCount = resultByNodeId.size
-      Log.d(TAG, "taskId=$taskId final patch count=${finalUpdates.size} completed=$completedCount/$totalCount")
-      emitter?.onResultPatch(
+    }
+
+    fun emitNodePatch(
+      nodeId: String,
+      completedStages: List<String>,
+      finalized: Boolean,
+      latencyMs: Int? = null,
+      realConnectMs: Int? = null,
+    ) {
+      val payload = synchronized(resultLock) {
+        if (finalized) {
+          finalizedNodeIds += nodeId
+        }
         MobileProbeResultPatchPayload(
           taskId = taskId,
           groupId = request.groupId.trim().takeIf { it.isNotEmpty() },
-          updates = finalUpdates,
-          completedCount = completedCount,
-          totalCount = totalCount,
-          final = true,
-        ),
-      )
-      return MobileProbeResult(
-        request.configs.map { config ->
-          val nodeId = config.nodeId.trim()
-          resultByNodeId[nodeId]
-            ?: MobileProbeResultItem(
+          taskScopeKey = taskScopeKey,
+          runtimeGeneration = request.runtimeGeneration,
+          configDigest = request.configDigest,
+          updates = listOf(
+            buildResultPatch(
               nodeId = nodeId,
-              latencyMs = -1,
-              realConnectMs = if (normalizedProbeTypes.contains("real_connect")) -1 else null,
-              error = "运行中代理未返回该节点的 URLTest 结果",
-            )
+              completedStages = completedStages,
+              latencyMs = latencyMs,
+              realConnectMs = realConnectMs,
+              errorMessage = currentResult(nodeId).error,
+            ),
+          ),
+          completedCount = finalizedNodeIds.size,
+          totalCount = totalCount,
+          final = finalizedNodeIds.size >= totalCount,
+        )
+      }
+      emitter?.onResultPatch(payload)
+    }
+
+    fun failPlan(plan: NodeProbeExecutionPlan, errorMessage: String) {
+      val state = synchronized(resultLock) {
+        val current = resultStateByNodeId.getValue(plan.nodeId)
+        if (plan.requestedStages.contains("node_latency")) {
+          current.latencyMs = -1
+        }
+        if (plan.requestedStages.contains("real_connect")) {
+          current.realConnectMs = -1
+        }
+        current.errorMessages += errorMessage
+        current
+      }
+      emitNodePatch(
+        nodeId = plan.nodeId,
+        completedStages = plan.requestedStages,
+        finalized = true,
+        latencyMs = state.latencyMs,
+        realConnectMs = state.realConnectMs,
+      )
+    }
+
+    try {
+      Log.d(
+        TAG,
+        "runStreaming taskId=$taskId nodes=${executionPlans.size} probeTypes=${defaultProbeTypes.joinToString(",")}",
+      )
+      val normalizedLatencyUrl =
+        request.latencyUrl?.trim().takeUnless { it.isNullOrEmpty() } ?: defaultLatencyUrl
+      val normalizedRealConnectUrl =
+        request.realConnectUrl?.trim().takeUnless { it.isNullOrEmpty() } ?: defaultLatencyUrl
+      executionPlans.forEach { plan ->
+        probeCompletionService.submit(
+          Callable<Unit> {
+            cancellationSignal.throwIfCancelled()
+            val requestedStages = plan.requestedStages
+            val requiresLatency = requestedStages.contains("node_latency")
+            val requiresRealConnect = requestedStages.contains("real_connect")
+            try {
+              if (requiresLatency) {
+                val measuredLatency = MobileRuntimeController.probeOutboundDelayByTag(
+                  outboundTag = runtimeNodeTag(plan.nodeId),
+                  probeUrl = normalizedLatencyUrl,
+                  timeoutMs = normalizedTimeoutMs,
+                ).coerceAtLeast(1)
+                synchronized(resultLock) {
+                  val state = resultStateByNodeId.getValue(plan.nodeId)
+                  state.latencyMs = measuredLatency
+                  if (requiresRealConnect) {
+                    state.realConnectMs = 0
+                  }
+                }
+                emitNodePatch(
+                  nodeId = plan.nodeId,
+                  completedStages = listOf("node_latency"),
+                  finalized = !requiresRealConnect,
+                  latencyMs = measuredLatency,
+                  realConnectMs = if (requiresRealConnect) 0 else null,
+                )
+              }
+              if (!requiresRealConnect) {
+                return@Callable Unit
+              }
+              cancellationSignal.throwIfCancelled()
+              val measuredRealConnect = runCatching {
+                MobileRuntimeController.probeOutboundDelayByTag(
+                  outboundTag = runtimeNodeTag(plan.nodeId),
+                  probeUrl = normalizedRealConnectUrl,
+                  timeoutMs = normalizedTimeoutMs,
+                )
+              }.fold(
+                onSuccess = { it.coerceAtLeast(1) },
+                onFailure = { error ->
+                  synchronized(resultLock) {
+                    val state = resultStateByNodeId.getValue(plan.nodeId)
+                    state.realConnectMs = -1
+                    state.errorMessages += normalizeProbeErrorMessage(error)
+                  }
+                  -1
+                },
+              )
+              synchronized(resultLock) {
+                val state = resultStateByNodeId.getValue(plan.nodeId)
+                state.realConnectMs = measuredRealConnect
+              }
+              emitNodePatch(
+                nodeId = plan.nodeId,
+                completedStages = listOf("real_connect"),
+                finalized = true,
+                realConnectMs = measuredRealConnect,
+              )
+            } catch (error: Throwable) {
+              failPlan(plan, normalizeProbeErrorMessage(error))
+            }
+          },
+        )
+      }
+      var pendingProbeCount = executionPlans.size
+      while (pendingProbeCount > 0) {
+        cancellationSignal.throwIfCancelled()
+        val future = probeCompletionService.poll(250, TimeUnit.MILLISECONDS) ?: continue
+        pendingProbeCount -= 1
+        future.get()
+      }
+
+      return MobileProbeResult(
+        executionPlans.map { plan ->
+          currentResult(plan.nodeId)
         },
       )
     } finally {
-      runCatching { client.disconnect() }
+      probeExecutor.shutdownNow()
     }
   }
 
-  private fun buildResultItem(
-    nodeId: String,
-    probeTypes: List<String>,
-    snapshot: UrlTestSnapshot?,
-  ): MobileProbeResultItem {
-    if (snapshot == null || snapshot.testedAtMs <= 0L || snapshot.delayMs <= 0) {
-      return MobileProbeResultItem(
-        nodeId = nodeId,
-        latencyMs = -1,
-        realConnectMs = if (probeTypes.contains("real_connect")) -1 else null,
-        error = "运行中代理未返回该节点的 URLTest 结果",
-      )
+  private fun resolveProbeTypesForConfig(
+    config: MobileProbeConfig,
+    fallbackProbeTypes: List<String>,
+  ): List<String> {
+    return if (config.probeTypes.isNotEmpty()) {
+      normalizeProbeTypes(config.probeTypes)
+    } else {
+      fallbackProbeTypes
     }
-    val measured = snapshot.delayMs.coerceAtLeast(1)
-    return MobileProbeResultItem(
-      nodeId = nodeId,
-      latencyMs = measured,
-      realConnectMs = if (probeTypes.contains("real_connect")) measured else null,
-    )
+  }
+
+  private fun normalizeProbeErrorMessage(error: Throwable): String {
+    val message = error.message?.trim().orEmpty()
+    if (
+      message.contains("status=404", ignoreCase = true) ||
+        message.contains("status=400", ignoreCase = true) ||
+        message.contains("not found", ignoreCase = true)
+    ) {
+      return "当前运行中的代理实例未包含该节点，请先激活对应分组并重启代理"
+    }
+    return if (message.isNotEmpty()) {
+      message
+    } else {
+      "移动端节点探测失败"
+    }
   }
 
   private fun buildResultPatch(
     nodeId: String,
-    probeTypes: List<String>,
-    result: MobileProbeResultItem,
+    completedStages: List<String>,
+    latencyMs: Int?,
+    realConnectMs: Int?,
+    errorMessage: String?,
   ): MobileProbeNodeResultPatch {
-    val latencyMs = result.latencyMs
-    val realConnectMs = result.realConnectMs
     val probeScore = computeProbeScore(latencyMs, realConnectMs)
     val testedAtMs = System.currentTimeMillis()
     return MobileProbeNodeResultPatch(
       nodeId = nodeId,
-      completedStages = probeTypes,
+      completedStages = completedStages,
       latencyMs = latencyMs,
       realConnectMs = realConnectMs,
       probeScore = probeScore,
-      latencyProbedAtMs = testedAtMs,
-      realConnectProbedAtMs = if (probeTypes.contains("real_connect")) testedAtMs else null,
-      errorMessage = result.error?.trim()?.takeIf { it.isNotEmpty() },
+      latencyProbedAtMs =
+        if (completedStages.contains("node_latency") && latencyMs != null) testedAtMs else null,
+      realConnectProbedAtMs =
+        if (completedStages.contains("real_connect") && realConnectMs != null) testedAtMs else null,
+      errorMessage = errorMessage?.trim()?.takeIf { it.isNotEmpty() },
     )
   }
 
@@ -456,14 +359,8 @@ object MobileProbeRunner {
       probeScoreRealConnectGoodMs,
       probeScoreRealConnectBadMs,
     )
-    if (!hasLatency && !hasRealConnect) {
+    if (!hasLatency || !hasRealConnect) {
       return 0.0
-    }
-    if (hasLatency && !hasRealConnect) {
-      return roundProbeScore(min(probeScoreLatencyOnlyCap, latencyScore))
-    }
-    if (!hasLatency && hasRealConnect) {
-      return roundProbeScore(min(probeScoreRealOnlyCap, realConnectScore))
     }
     return roundProbeScore(
       latencyScore * probeScoreLatencyWeight +
@@ -510,12 +407,6 @@ object MobileProbeRunner {
       normalized > 20000 -> defaultTimeoutMs
       else -> normalized
     }
-  }
-
-  private fun resolveWaitTimeoutMs(timeoutMs: Int, nodeCount: Int): Int {
-    val batches = max(1, ceil(max(1, nodeCount).toDouble() / assumedProbeConcurrency).toInt())
-    val estimatedMs = batches * timeoutMs + 2000
-    return min(maxWaitMs, max(minWaitMs, estimatedMs))
   }
 
   private fun runtimeNodeTag(nodeId: String): String {

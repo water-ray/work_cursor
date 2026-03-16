@@ -1,5 +1,6 @@
 import com.android.build.api.dsl.ApplicationExtension
 import org.gradle.api.DefaultTask
+import org.gradle.api.GradleException
 import org.gradle.api.Plugin
 import org.gradle.api.Project
 import org.gradle.kotlin.dsl.configure
@@ -17,13 +18,16 @@ open class RustPlugin : Plugin<Project> {
     override fun apply(project: Project) = with(project) {
         config = extensions.create("rust", Config::class.java)
 
-        val defaultAbiList = listOf("arm64-v8a", "armeabi-v7a", "x86", "x86_64");
+        val defaultAbiList = listOf("arm64-v8a", "x86_64");
         val abiList = (findProperty("abiList") as? String)?.split(',') ?: defaultAbiList
 
-        val defaultArchList = listOf("arm64", "arm", "x86", "x86_64");
+        val defaultArchList = listOf("arm64", "x86_64");
         val archList = (findProperty("archList") as? String)?.split(',') ?: defaultArchList
 
-        val targetsList = (findProperty("targetList") as? String)?.split(',') ?: listOf("aarch64", "armv7", "i686", "x86_64")
+        val targetsList = (findProperty("targetList") as? String)?.split(',') ?: listOf("aarch64", "x86_64")
+        if (abiList.size != archList.size || abiList.size != targetsList.size) {
+            throw GradleException("abiList/archList/targetList 数量必须一致")
+        }
 
         extensions.configure<ApplicationExtension> {
             @Suppress("UnstableApiUsage")

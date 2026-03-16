@@ -85,6 +85,13 @@ const maxVisibleNoticesByPlacement: Record<AppNoticePlacement, number> = {
 const maxRecentNoticeItems = 50;
 export const appExternalNoticeEventName = "wateray:app-external-notice";
 
+function resolveMaxVisibleNotices(placement: AppNoticePlacement): number {
+  if (placement === "top-center" && isMobileNoticeRuntime()) {
+    return 1;
+  }
+  return maxVisibleNoticesByPlacement[placement];
+}
+
 const AppNoticeContext = createContext<AppNoticeApi | null>(null);
 const AppNoticeHistoryContext = createContext<AppNoticeHistoryApi | null>(null);
 
@@ -162,6 +169,7 @@ function resolveNoticeOptions(
 
 export function AppNoticeProvider({ children }: AppNoticeProviderProps) {
   const portalRoot = typeof document === "undefined" ? null : document.body;
+  const mobileNoticeRuntime = isMobileNoticeRuntime();
   const [notices, setNotices] = useState<AppNoticeItem[]>([]);
   const [recentItems, setRecentItems] = useState<AppNoticeHistoryItem[]>([]);
   const [unreadCount, setUnreadCount] = useState(0);
@@ -294,7 +302,7 @@ export function AppNoticeProvider({ children }: AppNoticeProviderProps) {
           },
         ];
         const samePlacementItems = next.filter((item) => item.placement === resolved.placement);
-        const maxVisible = maxVisibleNoticesByPlacement[resolved.placement];
+        const maxVisible = resolveMaxVisibleNotices(resolved.placement);
         if (samePlacementItems.length <= maxVisible) {
           return next;
         }
@@ -377,11 +385,17 @@ export function AppNoticeProvider({ children }: AppNoticeProviderProps) {
           ? createPortal(
               <div className="app-notice-layer">
                 {noticesByPlacement.topRight.length > 0 ? (
-                  <div className="app-notice-viewport app-notice-viewport-top-right">
+                  <div
+                    className={`app-notice-viewport app-notice-viewport-top-right${
+                      mobileNoticeRuntime ? " app-notice-viewport-mobile" : ""
+                    }`}
+                  >
                     {noticesByPlacement.topRight.map((item) => (
                       <div
                         key={item.id}
-                        className={`app-notice-card app-notice-card-${item.level}`}
+                        className={`app-notice-card app-notice-card-${item.level}${
+                          mobileNoticeRuntime ? " app-notice-card-mobile" : ""
+                        }`}
                         role={item.level === "error" ? "alert" : "status"}
                         onMouseEnter={() => {
                           pauseNoticeTimer(item.id);
@@ -412,11 +426,17 @@ export function AppNoticeProvider({ children }: AppNoticeProviderProps) {
                   </div>
                 ) : null}
                 {noticesByPlacement.topCenter.length > 0 ? (
-                  <div className="app-notice-viewport app-notice-viewport-top-center">
+                  <div
+                    className={`app-notice-viewport app-notice-viewport-top-center${
+                      mobileNoticeRuntime ? " app-notice-viewport-mobile" : ""
+                    }`}
+                  >
                     {noticesByPlacement.topCenter.map((item) => (
                       <div
                         key={item.id}
-                        className={`app-notice-card app-notice-card-${item.level}`}
+                        className={`app-notice-card app-notice-card-${item.level}${
+                          mobileNoticeRuntime ? " app-notice-card-mobile" : ""
+                        }`}
                         role={item.level === "error" ? "alert" : "status"}
                         onMouseEnter={() => {
                           pauseNoticeTimer(item.id);

@@ -1,4 +1,76 @@
 export type DaemonMethod = "GET" | "POST" | "DELETE";
+export const loopbackTransportProtocolVersion = 1 as const;
+export const defaultLoopbackControlPortCandidates = [59500, 59501, 59502] as const;
+
+export interface LoopbackInternalPortBundle {
+  commandServerPort?: number;
+  clashApiControllerPort?: number;
+  probeSocksPort?: number;
+  dnsHealthProxySocksPort?: number;
+  dnsHealthDirectSocksPort?: number;
+}
+
+export interface LoopbackTransportBootstrap {
+  protocolVersion: number;
+  platformKind: "desktop" | "android" | "ios";
+  sessionId: string;
+  authToken: string;
+  expiresAtMs: number;
+  controlPortCandidates: number[];
+  activeControlPort: number;
+  wsPath?: string;
+  internalPorts?: LoopbackInternalPortBundle;
+}
+
+export interface LoopbackWSHelloMessage {
+  type: "hello";
+  protocolVersion: number;
+  sessionId: string;
+  authToken: string;
+}
+
+export interface LoopbackWSRequestMessage {
+  type: "request";
+  requestId: string;
+  command: string;
+  payload?: unknown;
+}
+
+export type LoopbackWSClientMessage = LoopbackWSHelloMessage | LoopbackWSRequestMessage;
+
+export interface LoopbackWSHelloAckMessage {
+  type: "hello_ack";
+  protocolVersion: number;
+  sessionId: string;
+  expiresAtMs: number;
+}
+
+export interface LoopbackWSResponseMessage {
+  type: "response";
+  requestId: string;
+  ok: boolean;
+  payload?: unknown;
+  error?: string;
+}
+
+export interface LoopbackWSEventMessage {
+  type: "event";
+  eventType: string;
+  payload: unknown;
+}
+
+export interface LoopbackWSErrorMessage {
+  type: "error";
+  code: string;
+  message: string;
+  requestId?: string;
+}
+
+export type LoopbackWSServerMessage =
+  | LoopbackWSHelloAckMessage
+  | LoopbackWSResponseMessage
+  | LoopbackWSEventMessage
+  | LoopbackWSErrorMessage;
 
 export type VpnConnectionStage =
   | "idle"
@@ -38,6 +110,8 @@ export type OperationType =
   | "start_connection"
   | "stop_connection"
   | "restart_connection"
+  | "set_settings"
+  | "set_rule_config"
   | "select_group"
   | "select_node"
   | "apply_settings"
@@ -88,6 +162,8 @@ export interface BackgroundTask {
   id: string;
   type: BackgroundTaskType;
   scopeKey?: string;
+  runtimeGeneration?: number;
+  configDigest?: string;
   title: string;
   status: BackgroundTaskStatus;
   progressText?: string;
@@ -101,12 +177,16 @@ export interface BackgroundTask {
 
 export interface TaskQueuePayload {
   tasks: BackgroundTask[];
+  probeTasks?: ProbeRuntimeTask[];
+  probeResultPatches?: ProbeResultPatchPayload[];
 }
 
 export interface OperationStatus {
   id: string;
   type: OperationType;
   scopeKey?: string;
+  runtimeGeneration?: number;
+  configDigest?: string;
   title: string;
   status: OperationStatusType;
   progressText?: string;
@@ -120,6 +200,8 @@ export interface TransportStatus {
   state: TransportState;
   daemonReachable: boolean;
   pushConnected: boolean;
+  runtimeGeneration?: number;
+  configDigest?: string;
   lastError?: string;
   consecutiveFailures?: number;
   lastSuccessAtMs?: number;
@@ -359,6 +441,9 @@ export interface ProbeRuntimeNodeState {
 export interface ProbeRuntimeTask {
   taskId: string;
   taskType: BackgroundTaskType;
+  scopeKey?: string;
+  runtimeGeneration?: number;
+  configDigest?: string;
   title: string;
   nodeStates?: ProbeRuntimeNodeState[];
 }
@@ -406,6 +491,9 @@ export interface ProbeNodeResultPatch {
 export interface ProbeResultPatchPayload {
   taskId: string;
   groupId?: string;
+  taskScopeKey?: string;
+  runtimeGeneration?: number;
+  configDigest?: string;
   updates: ProbeNodeResultPatch[];
   completedCount: number;
   totalCount: number;
@@ -569,6 +657,8 @@ export interface RuntimeApplyStatus {
   operation: RuntimeApplyOperation;
   strategy: RuntimeApplyStrategy;
   result: RuntimeApplyResult;
+  runtimeGeneration?: number;
+  configDigest?: string;
   changeSetSummary: string;
   success: boolean;
   rollbackApplied: boolean;
@@ -661,6 +751,7 @@ export interface DaemonSnapshot {
   localProxyPort: number;
   tunMtu: number;
   tunStack: ProxyTunStack;
+  strictRoute: boolean;
   allowExternalConnections: boolean;
   dns: DNSConfig;
   ruleProfiles: RuleProfile[];

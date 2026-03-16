@@ -9,6 +9,8 @@ data class MobileBackgroundTask(
   val id: String,
   val type: String,
   val scopeKey: String? = null,
+  val runtimeGeneration: Long? = null,
+  val configDigest: String? = null,
   val title: String,
   val status: String,
   val progressText: String? = null,
@@ -28,6 +30,9 @@ data class MobileProbeRuntimeNodeState(
 data class MobileProbeRuntimeTask(
   val taskId: String,
   val taskType: String,
+  val scopeKey: String? = null,
+  val runtimeGeneration: Long? = null,
+  val configDigest: String? = null,
   val title: String,
   val nodeStates: List<MobileProbeRuntimeNodeState> = emptyList(),
 )
@@ -52,6 +57,9 @@ data class MobileProbeNodeResultPatch(
 data class MobileProbeResultPatchPayload(
   val taskId: String,
   val groupId: String? = null,
+  val taskScopeKey: String? = null,
+  val runtimeGeneration: Long? = null,
+  val configDigest: String? = null,
   val updates: List<MobileProbeNodeResultPatch> = emptyList(),
   val completedCount: Int,
   val totalCount: Int,
@@ -62,6 +70,8 @@ data class MobileProbeTaskRequest(
   val groupId: String,
   val configs: List<MobileProbeConfig>,
   val probeTypes: List<String>,
+  val runtimeGeneration: Long = 0,
+  val configDigest: String? = null,
   val latencyUrl: String? = null,
   val realConnectUrl: String? = null,
   val timeoutMs: Int? = null,
@@ -108,6 +118,7 @@ object MobileTaskCenter {
   private const val TAG = "MobileTaskCenter"
   private const val maxTaskHistory = 24
   private const val probeTaskType = "node_probe"
+  private const val recentCompletedPatchRetentionMs = 2_000L
 
   private val lock = Any()
   private val executor = Executors.newCachedThreadPool()
@@ -126,12 +137,52 @@ object MobileTaskCenter {
     }
   }
 
+  fun invalidateRuntime(
+    reason: String,
+    runtimeGeneration: Long,
+    configDigest: String?,
+  ) {
+    val normalizedReason = reason.trim().ifEmpty { "移动端运行时已切换" }
+    val terminalPatches = mutableListOf<MobileProbeResultPatchPayload>()
+    val snapshot: MobileTaskQueueResult
+    synchronized(lock) {
+      scopeByKey.clear()
+      taskOrder.toList().forEach { taskId ->
+        val task = taskById[taskId] ?: return@forEach
+        when (task.status) {
+          "queued" -> {
+            buildTerminalPatchLocked(taskId, normalizedReason)?.let { terminalPatches += it }
+            finishTaskLocked(
+              taskId = taskId,
+              status = "cancelled",
+              progressText = normalizedReason,
+              errorMessage = null,
+            )
+          }
+          "running" -> {
+            cancellationSignalByTaskId[taskId]?.cancel(normalizedReason)
+            upsertTaskLocked(
+              task.copy(
+                runtimeGeneration = runtimeGeneration,
+                configDigest = configDigest,
+                progressText = normalizedReason,
+              ),
+            )
+          }
+        }
+      }
+      snapshot = snapshotLocked()
+    }
+    terminalPatches.forEach { MobileRuntimeCoordinator.emitProbeResultPatch(it) }
+    publishTaskQueue(snapshot)
+  }
+
   fun enqueueProbeTask(
     context: Context,
     request: MobileProbeTaskRequest,
   ): MobileProbeTaskStartResult {
     val normalizedRequest = normalizeProbeTaskRequest(request)
-    val scopeKey = buildProbeScopeKey(normalizedRequest.probeTypes)
+    val scopeKey = buildProbeScopeKey(normalizedRequest)
     val title = buildProbeTaskTitle(normalizedRequest.probeTypes)
     val signal = MobileTaskCancellationSignal()
     val startTaskId: String?
@@ -147,6 +198,8 @@ object MobileTaskCenter {
           id = taskId,
           type = probeTaskType,
           scopeKey = scopeKey,
+          runtimeGeneration = normalizedRequest.runtimeGeneration,
+          configDigest = normalizedRequest.configDigest,
           title = title,
           status = "running",
           progressText = buildProbeProgressText(0, normalizedRequest.configs.size),
@@ -157,6 +210,8 @@ object MobileTaskCenter {
           id = taskId,
           type = probeTaskType,
           scopeKey = scopeKey,
+          runtimeGeneration = normalizedRequest.runtimeGeneration,
+          configDigest = normalizedRequest.configDigest,
           title = title,
           status = "queued",
           progressText = "等待节点探测",
@@ -231,7 +286,7 @@ object MobileTaskCenter {
       }
       snapshot = snapshotLocked()
     }
-    patchPayload?.let { MobileHostBridge.emitProbeResultPatch(it) }
+    patchPayload?.let { MobileRuntimeCoordinator.emitProbeResultPatch(it) }
     publishTaskQueue(snapshot)
     Log.i(TAG, "cancel probe task id=$normalizedTaskId")
     return snapshot
@@ -243,6 +298,7 @@ object MobileTaskCenter {
         val request = synchronized(lock) {
           probeRequestByTaskId[taskId] ?: return@execute
         }
+        ensureRuntimeStillValid(request)
         val emitter = object : MobileProbeTaskEmitter {
           override fun onResultPatch(payload: MobileProbeResultPatchPayload) {
             val snapshot = synchronized(lock) {
@@ -269,7 +325,7 @@ object MobileTaskCenter {
               }
               snapshotLocked()
             }
-            MobileHostBridge.emitProbeResultPatch(payload)
+            MobileRuntimeCoordinator.emitProbeResultPatch(payload)
             publishTaskQueue(snapshot)
             Log.d(
               TAG,
@@ -324,7 +380,7 @@ object MobileTaskCenter {
           nextTaskId = startNextTaskLocked(scopeKey)
           snapshot = snapshotLocked()
         }
-        finalPatch?.let { MobileHostBridge.emitProbeResultPatch(it) }
+        finalPatch?.let { MobileRuntimeCoordinator.emitProbeResultPatch(it) }
         publishTaskQueue(snapshot)
         Log.w(TAG, "probe task ended with error id=$taskId message=$message")
         if (!nextTaskId.isNullOrBlank()) {
@@ -344,6 +400,11 @@ object MobileTaskCenter {
           MobileProbeConfig(
             nodeId = nodeId,
             configJson = config.configJson.trim(),
+            probeTypes = if (config.probeTypes.isNotEmpty()) {
+              normalizeProbeTypes(config.probeTypes)
+            } else {
+              emptyList()
+            },
           )
         }
       }
@@ -355,6 +416,8 @@ object MobileTaskCenter {
       groupId = request.groupId.trim(),
       configs = normalizedConfigs,
       probeTypes = normalizeProbeTypes(request.probeTypes),
+      runtimeGeneration = request.runtimeGeneration.coerceAtLeast(0),
+      configDigest = request.configDigest?.trim()?.takeIf { it.isNotEmpty() },
       latencyUrl = request.latencyUrl?.trim(),
       realConnectUrl = request.realConnectUrl?.trim(),
       timeoutMs = request.timeoutMs,
@@ -384,11 +447,28 @@ object MobileTaskCenter {
     return result
   }
 
-  private fun buildProbeScopeKey(probeTypes: List<String>): String {
-    return if (probeTypes.contains("real_connect")) {
-      "node_probe:real_connect"
+  private fun buildProbeScopeKey(request: MobileProbeTaskRequest): String {
+    val typeKey = if (request.probeTypes.contains("real_connect")) {
+      "real_connect"
     } else {
-      "node_probe:node_latency"
+      "node_latency"
+    }
+    val digest = request.configDigest?.trim()?.takeIf { it.isNotEmpty() } ?: "-"
+    return "node_probe:$typeKey:runtime:${request.runtimeGeneration}:digest:$digest"
+  }
+
+  private fun ensureRuntimeStillValid(request: MobileProbeTaskRequest) {
+    val status = MobileRuntimeCoordinator.snapshotStatus()
+    if (request.runtimeGeneration <= 0L) {
+      return
+    }
+    if (status.runtimeGeneration != request.runtimeGeneration) {
+      throw MobileTaskCancelledException("移动端运行时已切换，旧探测任务已失效")
+    }
+    val requestDigest = request.configDigest?.trim().orEmpty()
+    val currentDigest = status.configDigest?.trim().orEmpty()
+    if (requestDigest.isNotEmpty() && currentDigest.isNotEmpty() && requestDigest != currentDigest) {
+      throw MobileTaskCancelledException("移动端配置已切换，旧探测任务已失效")
     }
   }
 
@@ -427,28 +507,65 @@ object MobileTaskCenter {
   ): MobileProbeResultPatchPayload? {
     val request = probeRequestByTaskId[taskId] ?: return null
     val completedNodeIds = completedNodeIdsByTaskId[taskId].orEmpty()
-    val requestedStages = normalizeProbeTypes(request.probeTypes)
-    val remainingNodeIds = request.configs
-      .map { it.nodeId.trim() }
-      .filter { it.isNotEmpty() && !completedNodeIds.contains(it) }
-    val updates = remainingNodeIds.map { nodeId ->
-      MobileProbeNodeResultPatch(
-        nodeId = nodeId,
-        completedStages = requestedStages,
-        latencyMs = -1,
-        realConnectMs = if (requestedStages.contains("real_connect")) -1 else null,
-        probeScore = 0.0,
-        errorMessage = errorMessage,
-      )
+    val updates = request.configs
+      .mapNotNull { config ->
+        val nodeId = config.nodeId.trim()
+        if (nodeId.isEmpty() || completedNodeIds.contains(nodeId)) {
+          return@mapNotNull null
+        }
+        val requestedStages = resolveProbeTypesForConfig(config, request.probeTypes)
+        MobileProbeNodeResultPatch(
+          nodeId = nodeId,
+          completedStages = requestedStages,
+          latencyMs = -1,
+          realConnectMs = if (requestedStages.contains("real_connect")) -1 else null,
+          probeScore = 0.0,
+          errorMessage = errorMessage,
+        )
+      }
+    if (updates.isEmpty()) {
+      return null
     }
     return MobileProbeResultPatchPayload(
       taskId = taskId,
       groupId = request.groupId.takeIf { it.isNotEmpty() },
+      taskScopeKey = taskById[taskId]?.scopeKey,
+      runtimeGeneration = request.runtimeGeneration,
+      configDigest = request.configDigest,
       updates = updates,
       completedCount = request.configs.size,
       totalCount = request.configs.size,
       final = true,
     )
+  }
+
+  private fun resolveProbeTypesForConfig(
+    config: MobileProbeConfig,
+    fallbackProbeTypes: List<String>,
+  ): List<String> {
+    val normalizedConfigProbeTypes = normalizeProbeTypes(config.probeTypes)
+    return if (config.probeTypes.isNotEmpty()) {
+      normalizedConfigProbeTypes
+    } else {
+      normalizeProbeTypes(fallbackProbeTypes)
+    }
+  }
+
+  private fun buildNodeStatesForTaskRequest(
+    request: MobileProbeTaskRequest,
+    completedNodeIds: Set<String>,
+  ): List<MobileProbeRuntimeNodeState> {
+    return request.configs
+      .mapNotNull { config ->
+        val nodeId = config.nodeId.trim()
+        if (nodeId.isEmpty() || completedNodeIds.contains(nodeId)) {
+          return@mapNotNull null
+        }
+        MobileProbeRuntimeNodeState(
+          nodeId = nodeId,
+          pendingStages = resolveProbeTypesForConfig(config, request.probeTypes),
+        )
+      }
   }
 
   private fun startNextTaskLocked(scopeKey: String): String? {
@@ -523,6 +640,17 @@ object MobileTaskCenter {
   }
 
   private fun snapshotLocked(): MobileTaskQueueResult {
+    val currentNowMs = System.currentTimeMillis()
+    fun shouldIncludeProbePatches(task: MobileBackgroundTask): Boolean {
+      if (task.type != probeTaskType) {
+        return false
+      }
+      if (task.status == "running" || task.status == "queued") {
+        return true
+      }
+      val finishedAtMs = task.finishedAtMs ?: return false
+      return currentNowMs - finishedAtMs <= recentCompletedPatchRetentionMs
+    }
     return MobileTaskQueueResult(
       tasks = taskOrder
         .mapNotNull { taskById[it] }
@@ -534,22 +662,16 @@ object MobileTaskCenter {
         }
         val request = probeRequestByTaskId[taskId] ?: return@mapNotNull null
         val completedNodeIds = completedNodeIdsByTaskId[taskId].orEmpty()
-        val pendingStages = normalizeProbeTypes(request.probeTypes)
-        val nodeStates = request.configs
-          .map { it.nodeId.trim() }
-          .filter { it.isNotEmpty() && !completedNodeIds.contains(it) }
-          .map { nodeId ->
-            MobileProbeRuntimeNodeState(
-              nodeId = nodeId,
-              pendingStages = pendingStages,
-            )
-          }
+        val nodeStates = buildNodeStatesForTaskRequest(request, completedNodeIds)
         if (nodeStates.isEmpty()) {
           null
         } else {
           MobileProbeRuntimeTask(
             taskId = taskId,
             taskType = probeTaskType,
+              scopeKey = task.scopeKey,
+              runtimeGeneration = request.runtimeGeneration,
+              configDigest = request.configDigest,
             title = task.title,
             nodeStates = nodeStates,
           )
@@ -557,6 +679,9 @@ object MobileTaskCenter {
       },
       probeResultPatches = taskOrder.mapNotNull { taskId ->
         val task = taskById[taskId] ?: return@mapNotNull null
+        if (!shouldIncludeProbePatches(task)) {
+          return@mapNotNull null
+        }
         val request = probeRequestByTaskId[taskId] ?: return@mapNotNull null
         val updates = probePatchByTaskId[taskId]?.values?.toList().orEmpty()
         if (updates.isEmpty()) {
@@ -565,6 +690,9 @@ object MobileTaskCenter {
         MobileProbeResultPatchPayload(
           taskId = taskId,
           groupId = request.groupId.takeIf { it.isNotEmpty() },
+          taskScopeKey = task.scopeKey,
+          runtimeGeneration = request.runtimeGeneration,
+          configDigest = request.configDigest,
           updates = updates,
           completedCount = completedNodeIdsByTaskId[taskId]?.size ?: updates.size,
           totalCount = request.configs.size,
@@ -575,7 +703,7 @@ object MobileTaskCenter {
   }
 
   private fun publishTaskQueue(snapshot: MobileTaskQueueResult) {
-    MobileHostBridge.emitTaskQueueChanged(snapshot)
+    MobileRuntimeCoordinator.emitTaskQueueChanged(snapshot)
   }
 
   private fun scopeLocked(scopeKey: String): MobileTaskScopeState {
@@ -585,7 +713,10 @@ object MobileTaskCenter {
   }
 
   private fun upsertTaskLocked(task: MobileBackgroundTask) {
-    val normalized = task.copy(scopeKey = task.scopeKey?.trim()?.takeIf { it.isNotEmpty() })
+    val normalized = task.copy(
+      scopeKey = task.scopeKey?.trim()?.takeIf { it.isNotEmpty() },
+      configDigest = task.configDigest?.trim()?.takeIf { it.isNotEmpty() },
+    )
     taskById[normalized.id] = normalized
     taskOrder.removeAll { it == normalized.id }
     taskOrder.add(0, normalized.id)

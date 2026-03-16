@@ -43,6 +43,12 @@ func TestAllowTrustedLocalRequest(t *testing.T) {
 			wantOK: true,
 		},
 		{
+			name:   "allow loopback rpc candidate origin",
+			host:   "127.0.0.1:59501",
+			origin: "http://127.0.0.1:59501",
+			wantOK: true,
+		},
+		{
 			name:       "reject unexpected origin",
 			host:       "127.0.0.1:39080",
 			origin:     "https://evil.example",

@@ -231,6 +231,10 @@ function resolveTunStack(value: ProxyTunStack | null | undefined): ProxyTunStack
   return "system";
 }
 
+function resolveStrictRoute(value: boolean | null | undefined): boolean {
+  return value !== false;
+}
+
 function parseTunMtuInputValue(value: string): number | null {
   const text = value.trim();
   if (text === "") {
@@ -376,6 +380,7 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
   const [tunMtu, setTunMtu] = useState<number>(defaultTunMtu);
   const [tunMtuInput, setTunMtuInput] = useState<string>(String(defaultTunMtu));
   const [tunStack, setTunStack] = useState<ProxyTunStack>("system");
+  const [strictRoute, setStrictRoute] = useState<boolean>(true);
   const [allowExternalConnections, setAllowExternalConnections] =
     useState<boolean>(false);
   const [sniffEnabled, setSniffEnabled] = useState<boolean>(true);
@@ -467,6 +472,7 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
     setTunMtu(nextTunMtu);
     setTunMtuInput(String(nextTunMtu));
     setTunStack(resolveTunStack(snapshot.tunStack));
+    setStrictRoute(resolveStrictRoute(snapshot.strictRoute));
     setAllowExternalConnections(snapshot.allowExternalConnections);
     setSniffEnabled(snapshot.sniffEnabled ?? true);
     setSniffOverrideDestination(snapshot.sniffOverrideDestination ?? true);
@@ -1261,6 +1267,7 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
     }
     const snapshotTunMtu = resolveTunMtu(snapshot.tunMtu);
     const snapshotTunStack = resolveTunStack(snapshot.tunStack);
+    const snapshotStrictRoute = resolveStrictRoute(snapshot.strictRoute);
     const snapshotTrafficMonitorIntervalSec = resolveTrafficMonitorIntervalSec(
       snapshot.trafficMonitorIntervalSec,
     );
@@ -1281,6 +1288,10 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
     }
     if (tunStack !== snapshotTunStack) {
       settingsInput.tunStack = tunStack;
+      settingsChanged = true;
+    }
+    if (strictRoute !== snapshotStrictRoute) {
+      settingsInput.strictRoute = strictRoute;
       settingsChanged = true;
     }
     if (sniffEnabled !== (snapshot.sniffEnabled ?? true)) {
@@ -1346,6 +1357,7 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
     setTunMtu(nextTunMtu);
     setTunMtuInput(String(nextTunMtu));
     setTunStack(resolveTunStack(snapshot.tunStack));
+    setStrictRoute(resolveStrictRoute(snapshot.strictRoute));
     setAllowExternalConnections(snapshot.allowExternalConnections);
     setSniffEnabled(snapshot.sniffEnabled ?? true);
     setSniffOverrideDestination(snapshot.sniffOverrideDestination ?? true);
@@ -1512,6 +1524,20 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
             }}
           />
         </Space>
+        <SwitchWithLabel
+          checked={strictRoute}
+          disabled={applyingProxyDraft}
+          onChange={(checked) => {
+            setStrictRoute(checked);
+            setProxyDraftDirty(true);
+          }}
+          label="严格路由（strict_route）"
+          helpContent={{
+            scene: "虚拟网卡模式下，希望严格由 tun 接管流量路由。",
+            effect: "写入 tun.strict_route=true/false，减少部分流量绕过或回流异常。",
+            recommendation: "默认开启；仅在特定网络环境兼容性异常时再尝试关闭。",
+          }}
+        />
       </Space>
 
       <Space

@@ -24,11 +24,16 @@ import (
 )
 
 const defaultUnifiedVersion = "0.1.0"
-const daemonListenAddr = "127.0.0.1:39080"
 
 var trustedDesktopOrigins = map[string]struct{}{
 	"http://127.0.0.1:39080":  {},
 	"http://localhost:39080":  {},
+	"http://127.0.0.1:59500":  {},
+	"http://localhost:59500":  {},
+	"http://127.0.0.1:59501":  {},
+	"http://localhost:59501":  {},
+	"http://127.0.0.1:59502":  {},
+	"http://localhost:59502":  {},
 	"http://127.0.0.1:1420":   {},
 	"http://localhost:1420":   {},
 	"tauri://localhost":       {},
@@ -42,7 +47,12 @@ var (
 )
 
 func main() {
-	const addr = daemonListenAddr
+	listener, listenPort, err := bindDesktopLoopbackListener()
+	if err != nil {
+		log.Fatalf("waterayd bind loopback listener failed: %v", err)
+	}
+	addr := listener.Addr().String()
+	loopbackAuth := newLoopbackAuthManager()
 
 	lock, err := acquireDaemonInstanceLock()
 	if err != nil {
@@ -69,7 +79,7 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	registerHandlers(mux, store, requestShutdown)
+	registerHandlers(mux, store, requestShutdown, listenPort, loopbackAuth)
 
 	server := &http.Server{
 		Addr:              addr,
@@ -79,7 +89,7 @@ func main() {
 
 	go func() {
 		log.Printf("waterayd daemon started on %s", addr)
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("waterayd listen failed: %v", err)
 		}
 	}()
@@ -172,7 +182,26 @@ func registerHandlers(
 	mux *http.ServeMux,
 	store *control.RuntimeStore,
 	requestShutdown func(reason string),
+	listenPort int,
+	loopbackAuth *loopbackAuthManager,
 ) {
+	mux.HandleFunc(loopbackTransportBootstrapPath, func(w http.ResponseWriter, r *http.Request) {
+		if !allowMethod(w, r, http.MethodGet) {
+			return
+		}
+		bootstrap, err := buildLoopbackBootstrapPayload(loopbackAuth, listenPort)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, bootstrap)
+	})
+	mux.HandleFunc(loopbackTransportWSPath, func(w http.ResponseWriter, r *http.Request) {
+		if !allowMethod(w, r, http.MethodGet) {
+			return
+		}
+		serveLoopbackRPCWS(w, r, mux, store, loopbackAuth)
+	})
 	mux.HandleFunc("/v1/events/ws", func(w http.ResponseWriter, r *http.Request) {
 		if !allowMethod(w, r, http.MethodGet) {
 			return

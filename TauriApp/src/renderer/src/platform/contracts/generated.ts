@@ -74,10 +74,20 @@ export const mobileHostContract = {
   androidPluginIdentifier: "com.wateray.desktop.mobilehost",
   androidPluginClass: "MobileHostPlugin",
   commands: {
+    bootstrap: {
+      invokeCommand: "mobile_host_bootstrap",
+      pluginCommand: "bootstrap",
+      permission: "mobile-host:allow-bootstrap",
+    },
     getStatus: {
       invokeCommand: "mobile_host_get_status",
       pluginCommand: "getStatus",
       permission: "mobile-host:allow-getStatus",
+    },
+    getVersions: {
+      invokeCommand: "mobile_host_get_versions",
+      pluginCommand: "getVersions",
+      permission: "mobile-host:allow-getVersions",
     },
     prepare: {
       invokeCommand: "mobile_host_prepare",

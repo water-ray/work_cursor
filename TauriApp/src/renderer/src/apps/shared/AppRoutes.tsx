@@ -47,7 +47,6 @@ type MobileRouteKey =
   | "subscriptions"
   | "dns"
   | "rules"
-  | "logs"
   | "airport"
   | "settings";
 
@@ -61,7 +60,6 @@ const CachedSubscriptionsPage = memo(function CachedSubscriptionsPage(
 
 function resolveMobileRouteKey(
   pathname: string,
-  allowMobileLogs: boolean,
 ): MobileRouteKey | "redirect_subscriptions" | "redirect_default" {
   if (pathname.startsWith("/subscriptions")) {
     return "subscriptions";
@@ -74,9 +72,6 @@ function resolveMobileRouteKey(
   }
   if (pathname.startsWith("/rules")) {
     return "rules";
-  }
-  if (pathname.startsWith("/logs")) {
-    return allowMobileLogs ? "logs" : "redirect_default";
   }
   if (pathname.startsWith("/airport")) {
     return "airport";
@@ -117,12 +112,10 @@ export function AppRoutes({
   daemonState,
   defaultRoutePath,
   mode,
-  allowMobileLogs,
 }: {
   daemonState: AppRouteProps;
   defaultRoutePath: string;
   mode: "desktop" | "mobile";
-  allowMobileLogs: boolean;
 }) {
   const isMobile = mode === "mobile";
   const location = useLocation();
@@ -139,7 +132,7 @@ export function AppRoutes({
   }, [isMobile, location.pathname]);
 
   if (isMobile) {
-    const mobileRouteKey = resolveMobileRouteKey(location.pathname, allowMobileLogs);
+    const mobileRouteKey = resolveMobileRouteKey(location.pathname);
     if (mobileRouteKey === "redirect_subscriptions") {
       return <Navigate to="/subscriptions" replace />;
     }
@@ -160,7 +153,6 @@ export function AppRoutes({
           ) : null}
           {mobileRouteKey === "dns" ? <DnsPage {...daemonState} /> : null}
           {mobileRouteKey === "rules" ? <RulesPage {...daemonState} /> : null}
-          {mobileRouteKey === "logs" ? <LogsPage {...daemonState} /> : null}
           {mobileRouteKey === "airport" ? <AirportPage command={null} /> : null}
           {mobileRouteKey === "settings" ? <SettingsPage {...daemonState} /> : null}
         </>
@@ -180,16 +172,7 @@ export function AppRoutes({
         />
         <Route path="/dns" element={<DnsPage {...daemonState} />} />
         <Route path="/rules" element={<RulesPage {...daemonState} />} />
-        <Route
-          path="/logs"
-          element={
-            isMobile && !allowMobileLogs ? (
-              <Navigate to={defaultRoutePath} replace />
-            ) : (
-              <LogsPage {...daemonState} />
-            )
-          }
-        />
+        <Route path="/logs" element={<LogsPage {...daemonState} />} />
         <Route path="/airport" element={<AirportPage command={null} />} />
         <Route path="/settings" element={<SettingsPage {...daemonState} />} />
         <Route path="*" element={<Navigate to={defaultRoutePath} replace />} />

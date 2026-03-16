@@ -1,4 +1,10 @@
-import type { DaemonSnapshot, ProxyMode, StartPrecheckResult, VpnNode } from "../../../shared/daemon";
+import type {
+  DaemonSnapshot,
+  ProbeType,
+  ProxyMode,
+  StartPrecheckResult,
+  VpnNode,
+} from "../../../shared/daemon";
 
 import { normalizeCountryCode } from "../app/data/countryMetadata";
 import type { ProxyStartupSmartOptimizePreference } from "../app/settings/uiPreferences";
@@ -25,6 +31,7 @@ const defaultSmartOptimizeProbeConcurrency = 8;
 const smartOptimizeProbePollIntervalMs = 250;
 const minimumSmartOptimizeProbeWaitMs = 5000;
 const maximumSmartOptimizeProbeWaitMs = 45000;
+const smartOptimizeScoreProbeTypes: ProbeType[] = ["node_latency", "real_connect"];
 let mobileSmartOptimizeSessionSeq = 0;
 
 function normalizeCountryValue(value: string | undefined): string {
@@ -353,6 +360,7 @@ async function runMobileBackgroundSmartOptimize(params: {
   groupId: string;
   allowedNodeIDs: Set<string>;
   runAction: (action: () => Promise<DaemonSnapshot>) => Promise<DaemonSnapshot>;
+  notice: NoticeApiLike;
 }): Promise<void> {
   let currentSnapshot = await params.runAction(() => daemonApi.getState(false));
   while (mobileSmartOptimizeSessionSeq === params.sessionToken) {
@@ -361,38 +369,53 @@ async function runMobileBackgroundSmartOptimize(params: {
     if (activeGroupId !== params.groupId || currentMode === "off") {
       return;
     }
+    const backgroundTask = (currentSnapshot.backgroundTasks ?? []).find((task) => task.id === params.taskId);
+    const runtimeTask = (currentSnapshot.probeRuntimeTasks ?? []).find(
+      (task) => task.taskId === params.taskId,
+    );
+    if (runtimeTask || !backgroundTask || ["queued", "running"].includes(backgroundTask.status)) {
+      await delay(smartOptimizeProbePollIntervalMs);
+      if (mobileSmartOptimizeSessionSeq !== params.sessionToken) {
+        return;
+      }
+      try {
+        currentSnapshot = await params.runAction(() => daemonApi.getState(false));
+      } catch {
+        // Keep the background smart optimize loop best-effort.
+      }
+      continue;
+    }
+    if (backgroundTask.status !== "success") {
+      return;
+    }
     const bestNode = resolveBestSmartOptimizeNode({
       snapshot: currentSnapshot,
       groupId: params.groupId,
       allowedNodeIDs: params.allowedNodeIDs,
     });
-    if (bestNode && bestNode.id !== currentSnapshot.selectedNodeId) {
-      try {
-        currentSnapshot = await params.runAction(() => daemonApi.selectNode(bestNode.id, params.groupId));
-      } catch {
-        return;
-      }
-      continue;
-    }
-    const backgroundTask = (currentSnapshot.backgroundTasks ?? []).find((task) => task.id === params.taskId);
-    const runtimeTask = (currentSnapshot.probeRuntimeTasks ?? []).find(
-      (task) => task.taskId === params.taskId,
-    );
-    if (
-      (!backgroundTask || ["success", "failed", "cancelled"].includes(backgroundTask.status)) &&
-      !runtimeTask
-    ) {
+    if (!bestNode) {
+      params.notice.warning("智能优选完成，但未找到可用候选节点，继续保持当前节点。", {
+        title: "后台任务",
+      });
       return;
     }
-    await delay(smartOptimizeProbePollIntervalMs);
-    if (mobileSmartOptimizeSessionSeq !== params.sessionToken) {
+    if (bestNode.id === currentSnapshot.selectedNodeId) {
+      params.notice.success(`智能优选完成：当前节点已是最高分 ${bestNode.name}`, {
+        title: "后台任务",
+      });
       return;
     }
     try {
-      currentSnapshot = await params.runAction(() => daemonApi.getState(false));
+      await params.runAction(() => daemonApi.selectNode(bestNode.id, params.groupId));
+      params.notice.success(`智能优选完成：已切换到最高分节点 ${bestNode.name}`, {
+        title: "后台任务",
+      });
     } catch {
-      // Keep the background smart optimize loop best-effort.
+      params.notice.warning(`智能优选完成，但切换到最高分节点 ${bestNode.name} 失败，已保持当前节点。`, {
+        title: "后台任务",
+      });
     }
+    return;
   }
 }
 
@@ -427,77 +450,94 @@ async function resolveMobilePostStartSmartOptimize(params: {
     (node) => !hasFreshSmartOptimizeProbeCache(node, snapshot),
   );
   let currentSnapshot = snapshot;
-  let selectedNodeName = "";
-  let switchedNode = false;
-  try {
-    const selection = await maybeSwitchToBestSmartOptimizeNode({
-      snapshot: currentSnapshot,
-      groupId: resolution.currentGroup.id,
-      allowedNodeIDs,
-      runAction,
-    });
-    currentSnapshot = selection.snapshot;
-    selectedNodeName = selection.selectedNodeName;
-    switchedNode = selection.switchedNode;
-  } catch {
-    return {
-      selectedNodeName: "",
-      fallbackWarning: "智能优选切换节点失败，已回退当前激活节点继续启动。",
-      switchedNode: false,
-      backgroundProbeNodeIds: [],
-    };
-  }
   if (staleNodes.length <= 0) {
     onStageChange?.("probe", "沿用最近节点评分缓存，跳过重复探测...");
-    if (selectedNodeName !== "") {
-      return {
-        selectedNodeName,
-        fallbackWarning: "",
-        switchedNode,
-        backgroundProbeNodeIds: [],
-      };
-    }
     const bestNode = resolveBestSmartOptimizeNode({
       snapshot: currentSnapshot,
       groupId: resolution.currentGroup.id,
       allowedNodeIDs,
     });
-    return {
-      selectedNodeName: bestNode?.name ?? "",
-      fallbackWarning:
-        bestNode == null ? "智能优选未找到可用候选节点，已回退当前激活节点继续启动。" : "",
-      switchedNode,
-      backgroundProbeNodeIds: [],
-    };
+    if (!bestNode) {
+      return {
+        selectedNodeName: "",
+        fallbackWarning: "智能优选未找到可用候选节点，已回退当前激活节点继续启动。",
+        switchedNode: false,
+        backgroundProbeNodeIds: [],
+      };
+    }
+    try {
+      const selection = await maybeSwitchToBestSmartOptimizeNode({
+        snapshot: currentSnapshot,
+        groupId: resolution.currentGroup.id,
+        allowedNodeIDs,
+        runAction,
+      });
+      return {
+        selectedNodeName: selection.selectedNodeName,
+        fallbackWarning: "",
+        switchedNode: selection.switchedNode,
+        backgroundProbeNodeIds: [],
+      };
+    } catch {
+      return {
+        selectedNodeName: "",
+        fallbackWarning: "智能优选切换节点失败，已回退当前激活节点继续启动。",
+        switchedNode: false,
+        backgroundProbeNodeIds: [],
+      };
+    }
   }
   onStageChange?.(
     "probe",
     startupSmartOptimize === startupSmartOptimizeBest
-      ? `服务已启动，正在后台为当前激活订阅分组评分（补测 ${staleNodes.length}/${resolution.probeTargetNodes.length} 个）...`
-      : `服务已启动，正在后台为目标国家候选节点评分（补测 ${staleNodes.length}/${resolution.probeTargetNodes.length} 个）...`,
+      ? `服务已启动，正在后台为当前激活订阅分组执行完整评分（补测 ${staleNodes.length}/${resolution.probeTargetNodes.length} 个）...`
+      : `服务已启动，正在后台为目标国家候选节点执行完整评分（补测 ${staleNodes.length}/${resolution.probeTargetNodes.length} 个）...`,
   );
   try {
     ensureStartupNotCancelled(isCancelled);
     const probeResult = await daemonApi.probeNodesWithSummary({
       groupId: resolution.currentGroup.id,
-      nodeIds: staleNodes.map((node) => node.id),
-      probeTypes: ["real_connect"],
+      nodeIds: resolution.probeTargetNodes.map((node) => node.id),
+      probeTypes: smartOptimizeScoreProbeTypes,
       background: true,
     });
     currentSnapshot = await runAction(async () => probeResult.snapshot);
     if (!probeResult.task) {
+      const latestSnapshot = await runAction(() => daemonApi.getState(false));
       const bestNode = resolveBestSmartOptimizeNode({
-        snapshot: currentSnapshot,
+        snapshot: latestSnapshot,
         groupId: resolution.currentGroup.id,
         allowedNodeIDs,
       });
-      return {
-        selectedNodeName: bestNode?.name ?? selectedNodeName,
-        fallbackWarning:
-          bestNode == null ? "智能优选未找到可用候选节点，已回退当前激活节点继续启动。" : "",
-        switchedNode,
-        backgroundProbeNodeIds: [],
-      };
+      if (!bestNode) {
+        return {
+          selectedNodeName: "",
+          fallbackWarning: "智能优选未找到可用候选节点，已回退当前激活节点继续启动。",
+          switchedNode: false,
+          backgroundProbeNodeIds: [],
+        };
+      }
+      try {
+        const selection = await maybeSwitchToBestSmartOptimizeNode({
+          snapshot: latestSnapshot,
+          groupId: resolution.currentGroup.id,
+          allowedNodeIDs,
+          runAction,
+        });
+        return {
+          selectedNodeName: selection.selectedNodeName,
+          fallbackWarning: "",
+          switchedNode: selection.switchedNode,
+          backgroundProbeNodeIds: [],
+        };
+      } catch {
+        return {
+          selectedNodeName: "",
+          fallbackWarning: "智能优选切换节点失败，已回退当前激活节点继续启动。",
+          switchedNode: false,
+          backgroundProbeNodeIds: [],
+        };
+      }
     }
     const sessionToken = invalidateMobileSmartOptimizeSession();
     void runMobileBackgroundSmartOptimize({
@@ -506,14 +546,15 @@ async function resolveMobilePostStartSmartOptimize(params: {
       groupId: resolution.currentGroup.id,
       allowedNodeIDs,
       runAction,
+      notice,
     });
-    notice.info("智能优选已在后台评分，将按评分结果自动切换到当前最高分节点。", {
+    notice.info("智能优选已在后台执行完整评分，待全部候选节点结果完成后将自动切换到最高分节点。", {
       title: "后台任务",
     });
     return {
-      selectedNodeName,
+      selectedNodeName: "",
       fallbackWarning: "",
-      switchedNode,
+      switchedNode: false,
       backgroundProbeNodeIds: staleNodes.map((node) => node.id),
     };
   } catch (error) {
@@ -560,16 +601,16 @@ async function resolveSmartOptimizeTargetNode(params: {
     onStageChange?.(
       "probe",
       startupSmartOptimize === startupSmartOptimizeBest
-        ? `正在为当前激活订阅分组节点执行评分（补测 ${staleNodes.length}/${probeTargetNodes.length} 个）...`
-        : `正在为目标国家候选节点执行评分（补测 ${staleNodes.length}/${probeTargetNodes.length} 个）...`,
+        ? `正在为当前激活订阅分组节点执行完整评分（补测 ${staleNodes.length}/${probeTargetNodes.length} 个）...`
+        : `正在为目标国家候选节点执行完整评分（补测 ${staleNodes.length}/${probeTargetNodes.length} 个）...`,
     );
     try {
       ensureStartupNotCancelled(isCancelled);
       probeSnapshot = await runAction(async () => {
         const result = await daemonApi.probeNodesWithSummary({
           groupId: currentGroup.id,
-          nodeIds: staleNodes.map((node) => node.id),
-          probeTypes: ["real_connect"],
+          nodeIds: probeTargetNodes.map((node) => node.id),
+          probeTypes: smartOptimizeScoreProbeTypes,
         });
         return result.snapshot;
       });

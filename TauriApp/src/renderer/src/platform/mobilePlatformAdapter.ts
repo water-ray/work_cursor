@@ -1,6 +1,6 @@
 import type { WaterayPlatformAdapter, PlatformUpdateState } from "./adapterTypes";
 import type { WaterayPlatformApi } from "./runtimeTypes";
-import { createMobileDaemonBridge } from "./mobileDaemon";
+import { createMobileGateway } from "./mobileGateway";
 
 interface UnsupportedUpdateState extends PlatformUpdateState {
   currentPlatform: "android" | "ios" | "unknown";
@@ -44,7 +44,7 @@ export function createMobilePlatformAdapter(platform: WaterayPlatformApi): Water
       isMaximized: async () => false,
       onMaximizedChanged: () => () => {},
     },
-    daemon: createMobileDaemonBridge(platform.mobileHost),
+    daemon: createMobileGateway(platform.mobileHost),
     system: {
       openImportFileDialog: () => rejectUnsupported("文件导入"),
       openExportSaveDialog: () => rejectUnsupported("文件导出"),

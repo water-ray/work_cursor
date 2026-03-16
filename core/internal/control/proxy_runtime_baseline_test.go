@@ -17,6 +17,9 @@ func TestBuildTunInboundConfigLinuxEnablesAutoRedirect(t *testing.T) {
 	if mtu, ok := linuxInbound["mtu"].(int); !ok || mtu != defaultTunMTU {
 		t.Fatalf("expected default tun mtu to be %d, got %v", defaultTunMTU, linuxInbound["mtu"])
 	}
+	if strictRoute, ok := linuxInbound["strict_route"].(bool); !ok || !strictRoute {
+		t.Fatalf("expected default strict_route enabled, got %v", linuxInbound["strict_route"])
+	}
 
 	windowsInbound := buildTunInboundConfig("windows", snapshot)
 	if _, ok := windowsInbound["auto_redirect"]; ok {
@@ -28,12 +31,16 @@ func TestBuildTunInboundConfigUsesSnapshotTunSettings(t *testing.T) {
 	snapshot := defaultSnapshot("test-runtime", "test-core")
 	snapshot.TunMTU = 1420
 	snapshot.TunStack = ProxyTunStackSystem
+	snapshot.StrictRoute = false
 	inbound := buildTunInboundConfig("windows", snapshot)
 	if mtu, ok := inbound["mtu"].(int); !ok || mtu != 1420 {
 		t.Fatalf("expected tun mtu from snapshot, got %v", inbound["mtu"])
 	}
 	if stack, ok := inbound["stack"].(string); !ok || stack != string(ProxyTunStackSystem) {
 		t.Fatalf("expected tun stack from snapshot, got %v", inbound["stack"])
+	}
+	if strictRoute, ok := inbound["strict_route"].(bool); !ok || strictRoute {
+		t.Fatalf("expected strict_route from snapshot false, got %v", inbound["strict_route"])
 	}
 }
 
@@ -206,7 +213,7 @@ func TestBuildRuntimeConfigAddsInternalHelperInbound(t *testing.T) {
 
 	rawConfig, err := buildRuntimeConfigWithControllerOptions(
 		snapshot,
-		defaultClashAPIController,
+		resolveDefaultClashAPIController(),
 		false,
 		false,
 		19527,
@@ -575,7 +582,7 @@ func TestBuildRuntimeConfigWithMinimalProbeSnapshotUsesOnlyHelperInbound(t *test
 	minimal := buildMinimalProbeRuntimeSnapshot(snapshot)
 	rawConfig, err := buildRuntimeConfigWithControllerOptions(
 		minimal,
-		defaultClashAPIController,
+		resolveDefaultClashAPIController(),
 		true,
 		false,
 		39091,

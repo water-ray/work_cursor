@@ -9,12 +9,12 @@ import {
   Radio,
   Select,
   Space,
+  Tag,
   Typography,
 } from "antd";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { DraftActionBar } from "../../components/draft/DraftActionBar";
 import { BiIcon } from "../../components/icons/BiIcon";
-import { SwitchWithLabel } from "../../components/form/SwitchWithLabel";
 import { HelpLabel } from "../../components/form/HelpLabel";
 import { useAppNotice } from "../../components/notify/AppNoticeProvider";
 import { useDraftNavLock } from "../../hooks/useDraftNavLock";
@@ -25,13 +25,13 @@ import type { DaemonPageProps } from "../../app/types";
 import {
   type CloseBehavior,
   readCloseBehavior,
-  readDragScrollEnabled,
-  readMobileLogsNavVisible,
   writeCloseBehavior,
-  writeDragScrollEnabled,
-  writeMobileLogsNavVisible,
 } from "../../app/settings/uiPreferences";
-import { isMobileRuntime } from "../../platform/runtimeStore";
+import {
+  bundledSingBoxVersion,
+  bundledWaterayVersion,
+} from "../../app/version/generatedKernelVersions";
+import { getRuntimePlatform, isMobileRuntime } from "../../platform/runtimeStore";
 import { daemonApi } from "../../services/daemonApi";
 import type { DaemonSnapshot, RuleSetLocalStatus } from "../../../../shared/daemon";
 import type { AppUpdateCandidate, AppUpdateStage } from "../../updates/types";
@@ -139,20 +139,30 @@ function describeUpdateStage(stage: AppUpdateStage): string {
   }
 }
 
+function normalizeKernelVersionLabel(value: string | null | undefined): string {
+  const normalized = String(value ?? "").trim();
+  if (normalized === "" || /^(unknown|unlinked|libbox|daemon)$/i.test(normalized)) {
+    return "-";
+  }
+  return normalized;
+}
+
+function resolveKernelVersionLabel(
+  runtimeValue: string | null | undefined,
+  fallbackValue: string | null | undefined,
+): string {
+  const runtimeLabel = normalizeKernelVersionLabel(runtimeValue);
+  if (runtimeLabel !== "-") {
+    return runtimeLabel;
+  }
+  return normalizeKernelVersionLabel(fallbackValue);
+}
+
 export function SettingsPage({ snapshot, loading, runAction }: DaemonPageProps) {
   const isMobile = isMobileRuntime();
   const notice = useAppNotice();
   const draftNotice = useDraftNotice();
   const appUpdate = useAppUpdate();
-  const [appliedDragScrollEnabled, setAppliedDragScrollEnabled] = useState<boolean>(() =>
-    readDragScrollEnabled(),
-  );
-  const [dragScrollEnabled, setDragScrollEnabled] = useState<boolean>(() =>
-    readDragScrollEnabled(),
-  );
-  const [showMobileLogsNav, setShowMobileLogsNav] = useState<boolean>(() =>
-    readMobileLogsNavVisible(),
-  );
   const [appliedCloseBehavior, setAppliedCloseBehavior] = useState<CloseBehavior>(() =>
     readCloseBehavior(),
   );
@@ -178,16 +188,15 @@ export function SettingsPage({ snapshot, loading, runAction }: DaemonPageProps) 
   const [loadingRuleSetStatuses, setLoadingRuleSetStatuses] = useState(false);
   const [updatingRuleSets, setUpdatingRuleSets] = useState(false);
   const [exemptingLoopback, setExemptingLoopback] = useState(false);
+  const [mobileVersionLabels, setMobileVersionLabels] = useState<{
+    wateray: string;
+    singbox: string;
+  } | null>(null);
 
-  const settingsDraftDirty =
-    dragScrollEnabled !== appliedDragScrollEnabled ||
-    closeBehavior !== appliedCloseBehavior;
+  const settingsDraftDirty = !isMobile && closeBehavior !== appliedCloseBehavior;
 
   useEffect(() => {
-    const initialDragScroll = readDragScrollEnabled();
     const initialCloseBehavior = readCloseBehavior();
-    setAppliedDragScrollEnabled(initialDragScroll);
-    setDragScrollEnabled(initialDragScroll);
     setAppliedCloseBehavior(initialCloseBehavior);
     setCloseBehavior(initialCloseBehavior);
   }, []);
@@ -196,10 +205,7 @@ export function SettingsPage({ snapshot, loading, runAction }: DaemonPageProps) 
     if (!snapshot || settingsDraftTouched) {
       return;
     }
-    const currentDragScroll = readDragScrollEnabled();
     const currentCloseBehavior = readCloseBehavior();
-    setAppliedDragScrollEnabled(currentDragScroll);
-    setDragScrollEnabled(currentDragScroll);
     setAppliedCloseBehavior(currentCloseBehavior);
     setCloseBehavior(currentCloseBehavior);
   }, [snapshot, settingsDraftTouched]);
@@ -214,6 +220,39 @@ export function SettingsPage({ snapshot, loading, runAction }: DaemonPageProps) 
       setSettingsDraftTouched(false);
     }
   }, [settingsDraftDirty, settingsDraftTouched]);
+
+  useEffect(() => {
+    if (!isMobile) {
+      setMobileVersionLabels(null);
+      return;
+    }
+    let cancelled = false;
+    const mobileHost = getRuntimePlatform().mobileHost;
+    if (!mobileHost) {
+      setMobileVersionLabels(null);
+      return;
+    }
+    void mobileHost
+      .getVersions()
+      .then((versions) => {
+        if (cancelled) {
+          return;
+        }
+        setMobileVersionLabels({
+          wateray: versions.waterayVersion,
+          singbox: versions.singBoxVersion,
+        });
+      })
+      .catch(() => {
+        if (cancelled) {
+          return;
+        }
+        setMobileVersionLabels(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isMobile]);
 
   const canApplySettingsDraft = useMemo(
     () => settingsDraftDirty && !applyingSettingsDraft,
@@ -270,6 +309,24 @@ export function SettingsPage({ snapshot, loading, runAction }: DaemonPageProps) 
     () => Math.min(100, Math.max(0, Math.round(updateState.downloadProgressPercent ?? 0))),
     [updateState.downloadProgressPercent],
   );
+  const waterayKernelVersionLabel = useMemo(() => {
+    if (isMobile) {
+      return resolveKernelVersionLabel(
+        mobileVersionLabels?.wateray ?? snapshot?.coreVersion,
+        bundledWaterayVersion,
+      );
+    }
+    return resolveKernelVersionLabel(snapshot?.coreVersion, bundledWaterayVersion);
+  }, [isMobile, mobileVersionLabels?.wateray, snapshot?.coreVersion]);
+  const singboxKernelVersionLabel = useMemo(() => {
+    if (isMobile) {
+      return resolveKernelVersionLabel(
+        mobileVersionLabels?.singbox ?? snapshot?.proxyVersion,
+        bundledSingBoxVersion,
+      );
+    }
+    return resolveKernelVersionLabel(snapshot?.proxyVersion, bundledSingBoxVersion);
+  }, [isMobile, mobileVersionLabels?.singbox, snapshot?.proxyVersion]);
 
   const applySettingsDraft = async () => {
     if (!settingsDraftDirty) {
@@ -277,10 +334,6 @@ export function SettingsPage({ snapshot, loading, runAction }: DaemonPageProps) 
     }
     setApplyingSettingsDraft(true);
     try {
-      if (dragScrollEnabled !== appliedDragScrollEnabled) {
-        writeDragScrollEnabled(dragScrollEnabled);
-        setAppliedDragScrollEnabled(dragScrollEnabled);
-      }
       if (closeBehavior !== appliedCloseBehavior) {
         writeCloseBehavior(closeBehavior);
         setAppliedCloseBehavior(closeBehavior);
@@ -295,10 +348,7 @@ export function SettingsPage({ snapshot, loading, runAction }: DaemonPageProps) 
   };
 
   const revertSettingsDraft = () => {
-    const currentDragScroll = readDragScrollEnabled();
     const currentCloseBehavior = readCloseBehavior();
-    setAppliedDragScrollEnabled(currentDragScroll);
-    setDragScrollEnabled(currentDragScroll);
     setAppliedCloseBehavior(currentCloseBehavior);
     setCloseBehavior(currentCloseBehavior);
     setSettingsDraftTouched(false);
@@ -709,18 +759,6 @@ export function SettingsPage({ snapshot, loading, runAction }: DaemonPageProps) 
         {isMobile ? (
           <Card size="small">
             <Space direction="vertical" size={12} style={{ width: "100%" }}>
-              <SwitchWithLabel
-                checked={showMobileLogsNav}
-                onChange={(checked) => {
-                  setShowMobileLogsNav(checked);
-                  writeMobileLogsNavVisible(checked);
-                }}
-                label="显示日志菜单"
-                helpContent={{
-                  effect: "关闭时隐藏移动端底部导航中的“日志”；打开后重新显示并允许进入日志页。",
-                  recommendation: "默认关闭，排障时再临时打开。",
-                }}
-              />
               <Collapse
                 className="proxy-settings-collapse"
                 defaultActiveKey={[]}
@@ -730,12 +768,7 @@ export function SettingsPage({ snapshot, loading, runAction }: DaemonPageProps) 
                     label: "代理设置",
                     children: (
                       <div className="proxy-settings-panel-body">
-                        <ProxySettingsPanel
-                          snapshot={snapshot}
-                          loading={loading}
-                          runAction={runAction}
-                          showKernelVersion
-                        />
+                        <ProxySettingsPanel snapshot={snapshot} loading={loading} runAction={runAction} />
                       </div>
                     ),
                   },
@@ -744,33 +777,21 @@ export function SettingsPage({ snapshot, loading, runAction }: DaemonPageProps) 
             </Space>
           </Card>
         ) : null}
-        <Typography.Text strong>系统</Typography.Text>
-        <Space
-          direction="vertical"
-          size={8}
-          style={{ width: "100%" }}
-        >
-          <Space
-            size={8}
-            align="center"
-          >
-            <SwitchWithLabel
-              checked={dragScrollEnabled}
-              onChange={(checked) => {
-                setDragScrollEnabled(checked);
-                setSettingsDraftTouched(true);
-              }}
-              label="移动端手势"
-              helpContent={{
-                scene: "节点表较长、需要快速上下浏览时。",
-                effect: "支持在主内容区按住鼠标左键拖动滚动，获得接近移动端的滑动体验。",
-                caution: "仅影响面板交互，不影响代理链路与内核配置。",
-              }}
-            />
+        <Space direction="vertical" size={8} style={{ width: "100%" }}>
+          <Typography.Text strong>内核版本</Typography.Text>
+          <Space size={8} wrap>
+            <Tag color="blue">Wateray: {waterayKernelVersionLabel}</Tag>
+            <Tag color="geekblue">sing-box: {singboxKernelVersionLabel}</Tag>
           </Space>
-          {!isMobile ? (
-            <>
-              <Divider style={{ margin: "4px 0 2px" }} />
+        </Space>
+        {!isMobile ? (
+          <>
+            <Typography.Text strong>系统</Typography.Text>
+            <Space
+              direction="vertical"
+              size={8}
+              style={{ width: "100%" }}
+            >
               <HelpLabel
                 label="关闭按钮行为"
                 helpContent={{
@@ -793,34 +814,32 @@ export function SettingsPage({ snapshot, loading, runAction }: DaemonPageProps) 
                   <Radio value="exit_all">完全退出（关闭面板程序 + 内核程序）</Radio>
                 </Space>
               </Radio.Group>
-            </>
-          ) : null}
-        </Space>
-        {!isMobile ? (
-          <Space
-            size={10}
-            align="center"
-            wrap
-          >
-            <Button
-              type="primary"
-              loading={exemptingLoopback}
-              disabled={!canExemptLoopback}
-              onClick={() => {
-                void exemptWindowsLoopback();
-              }}
+            </Space>
+            <Space
+              size={10}
+              align="center"
+              wrap
             >
-              解除回环限制
-            </Button>
-            <HelpLabel
-              label="回环豁免说明"
-              helpContent={{
-                scene: "UWP/商店应用在代理场景中出现回环受限时。",
-                effect: "调用系统能力为 AppContainer SID 配置回环豁免。",
-                caution: "仅 Windows 且内核进程具备管理员权限时可执行；其他平台或权限不足时按钮会禁用。",
-              }}
-            />
-          </Space>
+              <Button
+                type="primary"
+                loading={exemptingLoopback}
+                disabled={!canExemptLoopback}
+                onClick={() => {
+                  void exemptWindowsLoopback();
+                }}
+              >
+                解除回环限制
+              </Button>
+              <HelpLabel
+                label="回环豁免说明"
+                helpContent={{
+                  scene: "UWP/商店应用在代理场景中出现回环受限时。",
+                  effect: "调用系统能力为 AppContainer SID 配置回环豁免。",
+                  caution: "仅 Windows 且内核进程具备管理员权限时可执行；其他平台或权限不足时按钮会禁用。",
+                }}
+              />
+            </Space>
+          </>
         ) : null}
         <Divider style={{ margin: "4px 0 2px" }} />
         <HelpLabel

@@ -6,6 +6,52 @@ import type {
   VpnNode,
 } from "../../../shared/daemon";
 
+const probeScoreLatencyGoodMs = 80;
+const probeScoreLatencyBadMs = 600;
+const probeScoreRealConnectGoodMs = 250;
+const probeScoreRealConnectBadMs = 2000;
+const probeScoreLatencyWeight = 0.35;
+const probeScoreRealConnectWeight = 0.65;
+
+function normalizeProbeLatencyDimensionScore(ms: number, goodMs: number, badMs: number): number {
+  if (ms <= 0 || badMs <= goodMs) {
+    return 0;
+  }
+  if (ms <= goodMs) {
+    return 100;
+  }
+  if (ms >= badMs) {
+    return 0;
+  }
+  return ((badMs - ms) / (badMs - goodMs)) * 100;
+}
+
+function roundProbeScore(value: number): number {
+  return Math.max(0, Math.min(100, Math.round(value * 10) / 10));
+}
+
+function computeNodeProbeScore(node: VpnNode): number {
+  const latencyValue = Number(node.latencyMs ?? 0);
+  const realConnectValue = Number(node.probeRealConnectMs ?? 0);
+  if (latencyValue <= 0 || realConnectValue <= 0) {
+    return 0;
+  }
+  const latencyScore = normalizeProbeLatencyDimensionScore(
+    latencyValue,
+    probeScoreLatencyGoodMs,
+    probeScoreLatencyBadMs,
+  );
+  const realConnectScore = normalizeProbeLatencyDimensionScore(
+    realConnectValue,
+    probeScoreRealConnectGoodMs,
+    probeScoreRealConnectBadMs,
+  );
+  return roundProbeScore(
+    latencyScore * probeScoreLatencyWeight +
+      realConnectScore * probeScoreRealConnectWeight,
+  );
+}
+
 function applyNodeResultPatch(node: VpnNode, patch: ProbeNodeResultPatch): VpnNode {
   let changed = false;
   const nextNode: VpnNode = { ...node };
@@ -34,8 +80,9 @@ function applyNodeResultPatch(node: VpnNode, patch: ProbeNodeResultPatch): VpnNo
     nextNode.realConnectProbedAtMs = patch.realConnectProbedAtMs;
     changed = true;
   }
-  if (typeof patch.probeScore === "number" && patch.probeScore !== node.probeScore) {
-    nextNode.probeScore = patch.probeScore;
+  const nextProbeScore = computeNodeProbeScore(nextNode);
+  if (nextProbeScore !== Number(node.probeScore ?? 0)) {
+    nextNode.probeScore = nextProbeScore;
     changed = true;
   }
   return changed ? nextNode : node;

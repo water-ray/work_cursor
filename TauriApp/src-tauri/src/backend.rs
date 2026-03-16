@@ -15,7 +15,7 @@ use std::process::Stdio;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 use tauri::menu::MenuBuilder;
 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
@@ -41,8 +41,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MessageBoxW, SW_HIDE, MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
 };
 
-const DEFAULT_DAEMON_BASE_URL: &str = "http://127.0.0.1:39080";
-const DAEMON_PROBE_PATH: &str = "/v1/state?withLogs=0";
+const DEFAULT_DAEMON_BASE_URL: &str = "http://127.0.0.1:59500";
+const DEFAULT_DAEMON_CONTROL_PORT_CANDIDATES: &[u16] = &[59500, 59501, 59502];
+const DAEMON_TRANSPORT_BOOTSTRAP_PATH: &str = "/v1/transport/bootstrap";
 const DAEMON_PROBE_TIMEOUT_MS: u64 = 1200;
 const DAEMON_READY_TIMEOUT_MS: u64 = 12_000;
 const DAEMON_READY_POLL_INTERVAL_MS: u64 = 300;
@@ -133,6 +134,30 @@ pub struct RuntimePlatformInfo {
     pub supports_in_app_updates: bool,
     pub supports_mobile_vpn_host: bool,
     pub requires_sandbox_data_root: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoopbackInternalPortBundle {
+    pub command_server_port: Option<u16>,
+    pub clash_api_controller_port: Option<u16>,
+    pub probe_socks_port: Option<u16>,
+    pub dns_health_proxy_socks_port: Option<u16>,
+    pub dns_health_direct_socks_port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoopbackTransportBootstrap {
+    pub protocol_version: u16,
+    pub platform_kind: String,
+    pub session_id: String,
+    pub auth_token: String,
+    pub expires_at_ms: i64,
+    pub control_port_candidates: Vec<u16>,
+    pub active_control_port: u16,
+    pub ws_path: Option<String>,
+    pub internal_ports: Option<LoopbackInternalPortBundle>,
 }
 
 #[cfg(target_os = "linux")]
@@ -462,11 +487,62 @@ fn ensure_text_file(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn daemon_base_url() -> String {
-    std::env::var("WATERAY_DAEMON_URL")
-        .unwrap_or_else(|_| DEFAULT_DAEMON_BASE_URL.to_string())
-        .trim()
-        .to_string()
+fn resolve_daemon_candidate_base_urls() -> Vec<String> {
+    if let Ok(raw_url) = std::env::var("WATERAY_DAEMON_URL") {
+        let normalized = raw_url.trim().trim_end_matches('/').to_string();
+        if !normalized.is_empty() {
+            return vec![normalized];
+        }
+    }
+    DEFAULT_DAEMON_CONTROL_PORT_CANDIDATES
+        .iter()
+        .map(|port| format!("http://127.0.0.1:{port}"))
+        .collect()
+}
+
+async fn build_local_reqwest_client(timeout_ms: u64) -> Option<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_millis(timeout_ms))
+        .build()
+        .ok()
+}
+
+async fn find_reachable_daemon_base_url() -> Option<String> {
+    let client = build_local_reqwest_client(DAEMON_PROBE_TIMEOUT_MS).await?;
+    for base_url in resolve_daemon_candidate_base_urls() {
+        let url = format!("{}{}", base_url, DAEMON_TRANSPORT_BOOTSTRAP_PATH);
+        if let Ok(response) = client.get(url).send().await {
+            if response.status().is_success() {
+                return Some(base_url);
+            }
+        }
+    }
+    None
+}
+
+async fn read_daemon_transport_bootstrap(base_url: &str) -> Result<LoopbackTransportBootstrap, String> {
+    let client = build_local_reqwest_client(DAEMON_PROBE_TIMEOUT_MS)
+        .await
+        .ok_or_else(|| "无法创建本地 loopback 客户端".to_string())?;
+    let url = format!("{base_url}{DAEMON_TRANSPORT_BOOTSTRAP_PATH}");
+    let response = client
+        .get(url)
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .map_err(|error| format!("读取 loopback bootstrap 失败：{error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "读取 loopback bootstrap 失败：HTTP {}",
+            response.status()
+        ));
+    }
+    let payload = response
+        .text()
+        .await
+        .map_err(|error| format!("读取 loopback bootstrap 响应体失败：{error}"))?;
+    serde_json::from_str::<LoopbackTransportBootstrap>(&payload)
+        .map_err(|error| format!("解析 loopback bootstrap 失败：{error}"))
 }
 
 fn is_dev_mode() -> bool {
@@ -963,19 +1039,7 @@ fn spawn_daemon_elevated_via_uac(_daemon_executable_path: &Path) -> bool {
 }
 
 async fn is_daemon_reachable() -> bool {
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_millis(DAEMON_PROBE_TIMEOUT_MS))
-        .build()
-    {
-        Ok(client) => client,
-        Err(_) => return false,
-    };
-
-    let url = format!("{}{}", daemon_base_url(), DAEMON_PROBE_PATH);
-    match client.get(url).send().await {
-        Ok(response) => response.status().is_success(),
-        Err(_) => false,
-    }
+    find_reachable_daemon_base_url().await.is_some()
 }
 
 async fn wait_daemon_ready() -> bool {
@@ -990,15 +1054,13 @@ async fn wait_daemon_ready() -> bool {
 }
 
 async fn shutdown_daemon_best_effort() {
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_millis(DAEMON_SHUTDOWN_TIMEOUT_MS))
-        .build()
-    {
-        Ok(client) => client,
-        Err(_) => return,
+    let Some(base_url) = find_reachable_daemon_base_url().await else {
+        return;
     };
-
-    let url = format!("{}/v1/system/shutdown", daemon_base_url());
+    let Some(client) = build_local_reqwest_client(DAEMON_SHUTDOWN_TIMEOUT_MS).await else {
+        return;
+    };
+    let url = format!("{}/v1/system/shutdown", base_url);
     let _ = client
         .post(url)
         .header("Accept", "application/json")
@@ -1067,6 +1129,15 @@ pub async fn ensure_packaged_daemon_running_impl() -> Result<(), String> {
 #[tauri::command]
 pub async fn ensure_packaged_daemon_running() -> Result<(), String> {
     ensure_packaged_daemon_running_impl().await
+}
+
+#[tauri::command]
+pub async fn daemon_transport_bootstrap() -> Result<LoopbackTransportBootstrap, String> {
+    ensure_packaged_daemon_running_impl().await?;
+    let base_url = find_reachable_daemon_base_url()
+        .await
+        .ok_or_else(|| "桌面端 loopback 控制面未就绪".to_string())?;
+    read_daemon_transport_bootstrap(&base_url).await
 }
 
 #[cfg(target_os = "linux")]

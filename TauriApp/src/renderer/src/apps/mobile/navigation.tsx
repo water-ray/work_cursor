@@ -27,14 +27,6 @@ const mobileNavRouteCatalog: NavRoute[] = [
     icon: <BiIcon name="diagram-3" />,
   },
   {
-    key: "logs",
-    path: "/logs",
-    title: "日志",
-    tip: "查看运行日志",
-    label: "日志",
-    icon: <BiIcon name="journal-text" />,
-  },
-  {
     key: "airport",
     path: "/airport",
     title: "机场",
@@ -52,24 +44,12 @@ const mobileNavRouteCatalog: NavRoute[] = [
   },
 ];
 
-const mobileLogsRoute: NavRoute = {
-  key: "logs",
-  path: "/logs",
-  title: "日志",
-  tip: "查看运行日志",
-  label: "日志",
-  icon: <BiIcon name="journal-text" />,
-};
-
-export function buildMobileNavRoutes(showLogs: boolean): NavRoute[] {
-  if (!showLogs) {
-    return mobileNavRouteCatalog.filter((route) => route.key !== "logs");
-  }
-  return mobileNavRouteCatalog.map((route) => (route.key === "logs" ? mobileLogsRoute : route));
+export function buildMobileNavRoutes(): NavRoute[] {
+  return mobileNavRouteCatalog;
 }
 
 export function resolveMobileTitle(pathname: string): string {
-  const route = [...mobileNavRouteCatalog, mobileLogsRoute].find((item) =>
+  const route = mobileNavRouteCatalog.find((item) =>
     pathname.startsWith(item.path),
   );
   return route?.title ?? "wateray";

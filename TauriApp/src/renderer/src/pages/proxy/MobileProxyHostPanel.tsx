@@ -43,7 +43,7 @@ const defaultDebugConfig = `{
         "fdfe:dcba:9876::1/126"
       ],
       "auto_route": true,
-      "strict_route": false,
+      "strict_route": true,
       "stack": "system",
       "sniff": true
     }
@@ -67,6 +67,7 @@ const defaultDebugConfig = `{
 const emptyStatus: WaterayMobileHostStatus = {
   state: "idle",
   runtimeMode: "off",
+  runtimeGeneration: 0,
   permissionGranted: false,
   systemDnsServers: [],
   serviceRunning: false,

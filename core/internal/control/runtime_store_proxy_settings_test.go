@@ -36,6 +36,9 @@ func TestEnsureValidLockedMigratesTransportGuardsAndMuxDefaults(t *testing.T) {
 	if store.state.TunStack != ProxyTunStackSystem {
 		t.Fatalf("expected default tun stack system, got %s", store.state.TunStack)
 	}
+	if !store.state.StrictRoute {
+		t.Fatalf("expected strict route enabled after migration")
+	}
 	if store.state.ProbeSettings.Concurrency != defaultProbeConcurrency {
 		t.Fatalf("expected default probe concurrency %d, got %d", defaultProbeConcurrency, store.state.ProbeSettings.Concurrency)
 	}
@@ -112,12 +115,24 @@ func TestShouldReloadRuntimeForSettingsOnTunSettingChange(t *testing.T) {
 		t.Fatalf("expected reload when tun stack changed in tun mode")
 	}
 
+	after = cloneSnapshot(before)
+	after.StrictRoute = !before.StrictRoute
+	if !shouldReloadRuntimeForSettings(before, after) {
+		t.Fatalf("expected reload when strict route changed in tun mode")
+	}
+
 	systemBefore := cloneSnapshot(before)
 	applyProxyModeToState(&systemBefore, ProxyModeSystem)
 	systemAfter := cloneSnapshot(systemBefore)
 	systemAfter.TunStack = ProxyTunStackGVisor
 	if shouldReloadRuntimeForSettings(systemBefore, systemAfter) {
 		t.Fatalf("did not expect reload when only tun stack changed in system mode")
+	}
+
+	systemAfter = cloneSnapshot(systemBefore)
+	systemAfter.StrictRoute = !systemBefore.StrictRoute
+	if shouldReloadRuntimeForSettings(systemBefore, systemAfter) {
+		t.Fatalf("did not expect reload when only strict route changed in system mode")
 	}
 }
 

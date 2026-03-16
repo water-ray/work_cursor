@@ -25,7 +25,7 @@ import (
 const maxRuntimeLogEntries = 4000
 const maxRuntimeLogMemoryBytes = 1 * 1024 * 1024
 const maxPushSubscriberQueue = 256
-const currentSnapshotSchemaVersion = 20
+const currentSnapshotSchemaVersion = 21
 const defaultUnifiedSemVerVersion = "0.1.0"
 
 var strictSemVerPattern = regexp.MustCompile(`^\d+\.\d+\.\d+$`)
@@ -154,7 +154,7 @@ func NewRuntimeStore(runtimeLabel string, coreVersion string) *RuntimeStore {
 	_ = store.saveLocked()
 	bootstrapPrepared, prepareErr := store.runtime.PrepareRuntimeConfigWithControllerOptions(
 		bootstrapSnapshot,
-		defaultClashAPIController,
+		resolveDefaultClashAPIController(),
 		true,
 		false,
 		store.taskProxyPort,
@@ -277,7 +277,7 @@ func (s *RuntimeStore) ensureMinimalProbeRuntimeReady(reason string, snapshot St
 			}
 			prepared, err := runtime.PrepareRuntimeConfigWithControllerOptions(
 				minimalSnapshot,
-				defaultClashAPIController,
+				resolveDefaultClashAPIController(),
 				true,
 				false,
 				taskProxyPort,
@@ -343,6 +343,7 @@ func defaultSnapshot(runtimeLabel string, coreVersion string) StateSnapshot {
 		LocalProxyPort:            59527,
 		TunMTU:                    defaultTunMTU,
 		TunStack:                  ProxyTunStackSystem,
+		StrictRoute:               true,
 		AllowExternal:             false,
 		DNS:                       defaultDNSConfig(),
 		RuleProfiles: []RuleProfile{
@@ -3396,6 +3397,9 @@ func (s *RuntimeStore) SetSettings(_ context.Context, req SetSettingsRequest) (S
 		}
 		s.state.TunStack = stack
 	}
+	if req.StrictRoute != nil {
+		s.state.StrictRoute = *req.StrictRoute
+	}
 	if req.AllowExternal != nil {
 		s.state.AllowExternal = *req.AllowExternal
 	}
@@ -3509,7 +3513,7 @@ func (s *RuntimeStore) SetSettings(_ context.Context, req SetSettingsRequest) (S
 		s.appendCoreLogLocked(
 			LogLevelInfo,
 			fmt.Sprintf(
-				"apply settings: runtimeProxyMode=%s configuredProxyMode=%s applyRuntime=%t listen=%d external=%t tun(mtu=%d stack=%s) sniff(enabled=%t override=%t timeout=%dms) guards(quic=%t udp=%t) clearDNSCacheOnRestart=%t mux(enabled=%t protocol=%s max_conn=%d min_streams=%d max_streams=%d padding=%t brutal=%t up=%d down=%d) levels(proxy=%s core=%s ui=%s) recordLogsToFile(global=%t proxy=%t core=%t ui=%t)",
+				"apply settings: runtimeProxyMode=%s configuredProxyMode=%s applyRuntime=%t listen=%d external=%t tun(mtu=%d stack=%s strict_route=%t) sniff(enabled=%t override=%t timeout=%dms) guards(quic=%t udp=%t) clearDNSCacheOnRestart=%t mux(enabled=%t protocol=%s max_conn=%d min_streams=%d max_streams=%d padding=%t brutal=%t up=%d down=%d) levels(proxy=%s core=%s ui=%s) recordLogsToFile(global=%t proxy=%t core=%t ui=%t)",
 				s.state.ProxyMode,
 				s.state.ConfiguredProxyMode,
 				applyRuntime,
@@ -3517,6 +3521,7 @@ func (s *RuntimeStore) SetSettings(_ context.Context, req SetSettingsRequest) (S
 				s.state.AllowExternal,
 				s.state.TunMTU,
 				s.state.TunStack,
+				s.state.StrictRoute,
 				s.state.SniffEnabled,
 				s.state.SniffOverrideDest,
 				s.state.SniffTimeoutMS,
@@ -5452,6 +5457,11 @@ func (s *RuntimeStore) ensureValidLocked() {
 		s.state.TrafficMonitorIntervalSec = normalizeTrafficMonitorIntervalSec(s.state.TrafficMonitorIntervalSec)
 		s.state.SchemaVersion = 18
 	}
+	if s.state.SchemaVersion < 21 {
+		s.state.StrictRoute = true
+		s.state.ClearDNSCacheOnRestart = false
+		s.state.SchemaVersion = 21
+	}
 	if s.state.SchemaVersion < currentSnapshotSchemaVersion {
 		s.state.ClearDNSCacheOnRestart = false
 		s.state.SchemaVersion = currentSnapshotSchemaVersion
@@ -7107,6 +7117,9 @@ func shouldReloadRuntimeForSettings(previous StateSnapshot, current StateSnapsho
 			return true
 		}
 		if normalizeProxyTunStack(previous.TunStack) != normalizeProxyTunStack(current.TunStack) {
+			return true
+		}
+		if previous.StrictRoute != current.StrictRoute {
 			return true
 		}
 	}

@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 20,
+  "schemaVersion": 21,
   "stateRevision": 1710,
   "connectionStage": "connected",
   "lastRuntimeApply": {
@@ -62,6 +62,7 @@
   "localProxyPort": 59527,
   "tunMtu": 1320,
   "tunStack": "system",
+  "strictRoute": true,
   "allowExternalConnections": false,
   "dns": {
     "version": 2,

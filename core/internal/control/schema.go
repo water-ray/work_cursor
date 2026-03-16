@@ -557,6 +557,7 @@ type StateSnapshot struct {
 	LocalProxyPort            int                  `json:"localProxyPort"`
 	TunMTU                    int                  `json:"tunMtu"`
 	TunStack                  ProxyTunStack        `json:"tunStack"`
+	StrictRoute               bool                 `json:"strictRoute"`
 	AllowExternal             bool                 `json:"allowExternalConnections"`
 	DNS                       DNSConfig            `json:"dns"`
 	RuleProfiles              []RuleProfile        `json:"ruleProfiles"`
@@ -852,6 +853,7 @@ type SetSettingsRequest struct {
 	LocalProxyPort            *int            `json:"localProxyPort,omitempty"`
 	TunMTU                    *int            `json:"tunMtu,omitempty"`
 	TunStack                  *ProxyTunStack  `json:"tunStack,omitempty"`
+	StrictRoute               *bool           `json:"strictRoute,omitempty"`
 	AllowExternal             *bool           `json:"allowExternalConnections,omitempty"`
 	DNS                       *DNSConfig      `json:"dns,omitempty"`
 }

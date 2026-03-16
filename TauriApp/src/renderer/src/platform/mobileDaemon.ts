@@ -40,7 +40,11 @@ import type {
   WaterayMobileTaskQueueResult,
 } from "./mobileHost";
 import {
-  buildMobileProbeConfig,
+  getLatestMobileHostBootstrap,
+  getLatestMobileHostTransportStatus,
+  subscribeMobileHostTransportStatus,
+} from "./mobileHost";
+import {
   buildMobileRuntimeConfig,
   buildMobileSelectorSelections,
   resolveNodePoolRefsToNodeIds,
@@ -85,7 +89,7 @@ const defaultProbeLatencyUrl = "https://www.gstatic.com/generate_204";
 const defaultProbeRealConnectUrl = "https://www.google.com/generate_204";
 const requestBaseUrl = "http://mobile.wateray.local";
 const defaultMobileMixedProxyPort = 1088;
-const defaultMobileClashApiControllerUrl = "http://127.0.0.1:39081";
+const activeTaskQueueFallbackPollIntervalMs = 2000;
 
 const probeScoreLatencyGoodMs = 80;
 const probeScoreLatencyBadMs = 600;
@@ -93,8 +97,6 @@ const probeScoreRealConnectGoodMs = 250;
 const probeScoreRealConnectBadMs = 2000;
 const probeScoreLatencyWeight = 0.35;
 const probeScoreRealConnectWeight = 0.65;
-const probeScoreLatencyOnlyCap = 55;
-const probeScoreRealOnlyCap = 80;
 const maxBackgroundTaskHistory = 24;
 const probeConfigBuildYieldInterval = 8;
 const mobileVpnPermissionConfirmTimeoutMs = 3000;
@@ -303,12 +305,14 @@ async function ensureMobileDnsCacheFilePath(): Promise<string | undefined> {
 async function createMobileResolverContext(
   status: WaterayMobileHostStatus | null | undefined,
 ): Promise<MobileResolverContext> {
+  const bootstrap = getLatestMobileHostBootstrap();
   return {
     systemDnsServers: Array.isArray(status?.systemDnsServers)
       ? status.systemDnsServers
       : [],
     builtInRuleSetPaths: Object.fromEntries(mobileBuiltInRuleSetLocalPathByTag.entries()),
     dnsCacheFilePath: await ensureMobileDnsCacheFilePath(),
+    internalPorts: bootstrap?.internalPorts,
   };
 }
 
@@ -408,6 +412,10 @@ function createDefaultMobileSnapshot(): DaemonSnapshot {
     tunEnabled: false,
     systemProxyEnabled: false,
     allowExternalConnections: false,
+    strictRoute: snapshot.strictRoute !== false,
+    proxyLogLevel: "none",
+    coreLogLevel: "none",
+    uiLogLevel: "none",
     recordLogsToFile: false,
     proxyRecordLogsToFile: false,
     coreRecordLogsToFile: false,
@@ -449,9 +457,16 @@ function normalizeSnapshot(input: MobilePersistedSnapshot | null | undefined): D
     configuredProxyMode: normalizeModeForMobile(input.configuredProxyMode),
     subscriptions: Array.isArray(input.subscriptions) ? input.subscriptions : base.subscriptions,
     groups: Array.isArray(input.groups) ? input.groups : base.groups,
-    proxyLogs: Array.isArray(input.proxyLogs) ? input.proxyLogs : [],
-    coreLogs: Array.isArray(input.coreLogs) ? input.coreLogs : [],
-    uiLogs: Array.isArray(input.uiLogs) ? input.uiLogs : [],
+    proxyLogLevel: "none",
+    coreLogLevel: "none",
+    uiLogLevel: "none",
+    recordLogsToFile: false,
+    proxyRecordLogsToFile: false,
+    coreRecordLogsToFile: false,
+    uiRecordLogsToFile: false,
+    proxyLogs: [],
+    coreLogs: [],
+    uiLogs: [],
     dns: normalizeDnsConfig(input.dns ?? base.dns),
     probeSettings: {
       ...base.probeSettings,
@@ -485,7 +500,20 @@ function loadPersistedSnapshot(): DaemonSnapshot {
 
 function persistSnapshot(snapshot: DaemonSnapshot): void {
   try {
-    window.localStorage.setItem(mobileStateStorageKey, JSON.stringify(snapshot));
+    const persistedSnapshot: MobilePersistedSnapshot = {
+      ...snapshot,
+      proxyLogLevel: "none",
+      coreLogLevel: "none",
+      uiLogLevel: "none",
+      recordLogsToFile: false,
+      proxyRecordLogsToFile: false,
+      coreRecordLogsToFile: false,
+      uiRecordLogsToFile: false,
+      proxyLogs: [],
+      coreLogs: [],
+      uiLogs: [],
+    };
+    window.localStorage.setItem(mobileStateStorageKey, JSON.stringify(persistedSnapshot));
   } catch {
     // Ignore persistence failures.
   }
@@ -537,19 +565,44 @@ function computeNodeProbeScore(node: VpnNode): number {
     probeScoreRealConnectGoodMs,
     probeScoreRealConnectBadMs,
   );
-  if (!hasLatencyMeasurement && !hasRealConnectMeasurement) {
+  if (!hasLatencyMeasurement || !hasRealConnectMeasurement) {
     return 0;
-  }
-  if (hasLatencyMeasurement && !hasRealConnectMeasurement) {
-    return roundProbeScore(Math.min(probeScoreLatencyOnlyCap, latencyScore));
-  }
-  if (!hasLatencyMeasurement && hasRealConnectMeasurement) {
-    return roundProbeScore(Math.min(probeScoreRealOnlyCap, realConnectScore));
   }
   return roundProbeScore(
     latencyScore * probeScoreLatencyWeight +
       realConnectScore * probeScoreRealConnectWeight,
   );
+}
+
+type ProbeCacheNormalization = {
+  nodeId: string;
+  probeScore?: number;
+  realConnectMs?: number;
+  realConnectProbedAtMs?: number;
+};
+
+type FreshProbePlan = {
+  node: VpnNode;
+  probeTypes: ProbeType[];
+};
+
+type ProbeCacheResolution = {
+  freshProbePlans: FreshProbePlan[];
+  freshTargetNodes: VpnNode[];
+  cachedTargetNodes: VpnNode[];
+  summary: ProbeNodesSummary;
+  cacheNormalizations: ProbeCacheNormalization[];
+};
+
+function isScoreProbeRequest(probeTypes: ProbeType[]): boolean {
+  return probeTypes.includes("real_connect");
+}
+
+function resolveNodeProbeMetricValue(node: VpnNode, probeType: ProbeType): number {
+  if (probeType === "real_connect") {
+    return Number(node.probeRealConnectMs ?? 0);
+  }
+  return Number(node.latencyMs ?? 0);
 }
 
 function resolveNodeProbeTimestampMs(node: VpnNode, probeType: ProbeType): number {
@@ -565,8 +618,9 @@ function shouldExecuteProbeByInterval(
   intervalMin: number,
   nowMsValue: number,
 ): boolean {
+  const currentValue = resolveNodeProbeMetricValue(node, probeType);
   const lastProbeAtMs = resolveNodeProbeTimestampMs(node, probeType);
-  if (lastProbeAtMs <= 0) {
+  if (lastProbeAtMs <= 0 || currentValue === 0) {
     return true;
   }
   const safeIntervalMin = Math.max(1, Number(intervalMin) || 180);
@@ -598,15 +652,151 @@ function probeNodeResultSucceeded(node: VpnNode, probeTypes: ProbeType[]): boole
   return true;
 }
 
+function probeResultItemSucceeded(
+  item: {
+    latencyMs?: number;
+    realConnectMs?: number;
+  },
+  probeTypes: ProbeType[],
+): boolean {
+  for (const probeType of probeTypes) {
+    if (probeType === "real_connect") {
+      if (Number(item.realConnectMs ?? 0) <= 0) {
+        return false;
+      }
+      continue;
+    }
+    if (Number(item.latencyMs ?? 0) <= 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function buildScoreFailureNormalization(node: VpnNode): ProbeCacheNormalization | null {
+  const targetRealConnectProbedAtMs = Math.max(0, Number(node.latencyProbedAtMs ?? 0));
+  const normalizedNode: VpnNode = {
+    ...node,
+    probeRealConnectMs: -1,
+    realConnectProbedAtMs: targetRealConnectProbedAtMs,
+  };
+  const nextScore = computeNodeProbeScore(normalizedNode);
+  if (
+    Number(node.probeRealConnectMs ?? 0) === -1 &&
+    Math.max(0, Number(node.realConnectProbedAtMs ?? 0)) === targetRealConnectProbedAtMs &&
+    Number(node.probeScore ?? 0) === nextScore
+  ) {
+    return null;
+  }
+  return {
+    nodeId: node.id,
+    realConnectMs: -1,
+    realConnectProbedAtMs: targetRealConnectProbedAtMs,
+    probeScore: nextScore,
+  };
+}
+
+function buildProbeScoreNormalization(node: VpnNode): ProbeCacheNormalization | null {
+  const nextScore = computeNodeProbeScore(node);
+  if (Number(node.probeScore ?? 0) === nextScore) {
+    return null;
+  }
+  return {
+    nodeId: node.id,
+    probeScore: nextScore,
+  };
+}
+
+function splitScoreProbeTargetsByCache(
+  sourceSnapshot: DaemonSnapshot,
+  targetNodes: VpnNode[],
+): ProbeCacheResolution {
+  const freshProbePlans: FreshProbePlan[] = [];
+  const freshTargetNodes: VpnNode[] = [];
+  const cachedTargetNodes: VpnNode[] = [];
+  const cacheNormalizations: ProbeCacheNormalization[] = [];
+  const probeIntervalMin = normalizeProbeSettings(sourceSnapshot).probeIntervalMin;
+  const currentNowMs = nowMs();
+  let cachedSucceeded = 0;
+  let cachedFailed = 0;
+  let cachedSkippedDueToLatency = 0;
+  for (const node of targetNodes) {
+    const latencyNeedsRefresh = shouldExecuteProbeByInterval(
+      node,
+      "node_latency",
+      probeIntervalMin,
+      currentNowMs,
+    );
+    if (latencyNeedsRefresh) {
+      freshProbePlans.push({
+        node,
+        probeTypes: ["node_latency", "real_connect"],
+      });
+      freshTargetNodes.push(node);
+      continue;
+    }
+    const latencyMs = Number(node.latencyMs ?? 0);
+    if (latencyMs <= 0) {
+      cachedTargetNodes.push(node);
+      cachedFailed += 1;
+      cachedSkippedDueToLatency += 1;
+      const failureNormalization = buildScoreFailureNormalization(node);
+      if (failureNormalization) {
+        cacheNormalizations.push(failureNormalization);
+      }
+      continue;
+    }
+    const realConnectNeedsRefresh = shouldExecuteProbeByInterval(
+      node,
+      "real_connect",
+      probeIntervalMin,
+      currentNowMs,
+    );
+    if (realConnectNeedsRefresh) {
+      freshProbePlans.push({
+        node,
+        probeTypes: ["real_connect"],
+      });
+      freshTargetNodes.push(node);
+      continue;
+    }
+    cachedTargetNodes.push(node);
+    if (Number(node.probeRealConnectMs ?? 0) > 0) {
+      cachedSucceeded += 1;
+    } else {
+      cachedFailed += 1;
+    }
+    const scoreNormalization = buildProbeScoreNormalization(node);
+    if (scoreNormalization) {
+      cacheNormalizations.push(scoreNormalization);
+    }
+  }
+  return {
+    freshProbePlans,
+    freshTargetNodes,
+    cachedTargetNodes,
+    summary: {
+      requested: targetNodes.length,
+      succeeded: cachedSucceeded,
+      failed: cachedFailed,
+      cachedResultCount: cachedTargetNodes.length,
+      freshProbeCount: freshTargetNodes.length,
+      skippedRealConnectDueToLatency: cachedSkippedDueToLatency,
+      reprobedLatencyBeforeRealConnect: 0,
+    },
+    cacheNormalizations,
+  };
+}
+
 function splitProbeTargetsByCache(
   sourceSnapshot: DaemonSnapshot,
   targetNodes: VpnNode[],
   probeTypes: ProbeType[],
-): {
-  freshTargetNodes: VpnNode[];
-  cachedTargetNodes: VpnNode[];
-  summary: ProbeNodesSummary;
-} {
+): ProbeCacheResolution {
+  if (isScoreProbeRequest(probeTypes)) {
+    return splitScoreProbeTargetsByCache(sourceSnapshot, targetNodes);
+  }
+  const freshProbePlans: FreshProbePlan[] = [];
   const freshTargetNodes: VpnNode[] = [];
   const cachedTargetNodes: VpnNode[] = [];
   const probeIntervalMin = normalizeProbeSettings(sourceSnapshot).probeIntervalMin;
@@ -618,6 +808,10 @@ function splitProbeTargetsByCache(
       shouldExecuteProbeByInterval(node, probeType, probeIntervalMin, currentNowMs),
     );
     if (requiresFreshProbe) {
+      freshProbePlans.push({
+        node,
+        probeTypes,
+      });
       freshTargetNodes.push(node);
       continue;
     }
@@ -629,6 +823,7 @@ function splitProbeTargetsByCache(
     }
   }
   return {
+    freshProbePlans,
     freshTargetNodes,
     cachedTargetNodes,
     summary: {
@@ -640,6 +835,70 @@ function splitProbeTargetsByCache(
       skippedRealConnectDueToLatency: 0,
       reprobedLatencyBeforeRealConnect: 0,
     },
+    cacheNormalizations: [],
+  };
+}
+
+function applyProbeCacheNormalizationsToSnapshot(
+  baseSnapshot: DaemonSnapshot,
+  normalizations: ProbeCacheNormalization[],
+): DaemonSnapshot {
+  if (normalizations.length <= 0) {
+    return baseSnapshot;
+  }
+  const normalizationByNodeId = new Map(normalizations.map((item) => [item.nodeId, item]));
+  let groupsChanged = false;
+  const nextGroups = baseSnapshot.groups.map((group) => {
+    let nodesChanged = false;
+    const nextNodes = group.nodes.map((node) => {
+      const normalization = normalizationByNodeId.get(node.id);
+      if (!normalization) {
+        return node;
+      }
+      let changed = false;
+      const nextNode: VpnNode = { ...node };
+      if (
+        typeof normalization.realConnectMs === "number" &&
+        normalization.realConnectMs !== node.probeRealConnectMs
+      ) {
+        nextNode.probeRealConnectMs = normalization.realConnectMs;
+        changed = true;
+      }
+      if (
+        typeof normalization.realConnectProbedAtMs === "number" &&
+        normalization.realConnectProbedAtMs !== node.realConnectProbedAtMs
+      ) {
+        nextNode.realConnectProbedAtMs = normalization.realConnectProbedAtMs;
+        changed = true;
+      }
+      if (
+        typeof normalization.probeScore === "number" &&
+        normalization.probeScore !== node.probeScore
+      ) {
+        nextNode.probeScore = normalization.probeScore;
+        changed = true;
+      }
+      if (!changed) {
+        return node;
+      }
+      nodesChanged = true;
+      return nextNode;
+    });
+    if (!nodesChanged) {
+      return group;
+    }
+    groupsChanged = true;
+    return {
+      ...group,
+      nodes: nextNodes,
+    };
+  });
+  if (!groupsChanged) {
+    return baseSnapshot;
+  }
+  return {
+    ...baseSnapshot,
+    groups: nextGroups,
   };
 }
 
@@ -861,43 +1120,43 @@ function refreshReferencedRulePoolAvailableNodeIds(snapshot: DaemonSnapshot): nu
 }
 
 function createTransportStatus(hostStatus: WaterayMobileHostStatus | null): TransportStatus {
+  const loopbackStatus = getLatestMobileHostTransportStatus();
   if (!hostStatus) {
     return {
-      state: "degraded",
-      daemonReachable: true,
-      pushConnected: true,
-      consecutiveFailures: 0,
+      ...loopbackStatus,
+      state: loopbackStatus.pushConnected ? loopbackStatus.state : "degraded",
+      daemonReachable: loopbackStatus.daemonReachable,
+      pushConnected: loopbackStatus.pushConnected,
       timestampMs: nowMs(),
-      lastError: "移动端代理宿主未就绪",
+      lastError: loopbackStatus.lastError || "移动端代理宿主未就绪",
     };
   }
   if (hostStatus.state === "error") {
     return {
-      state: "degraded",
+      ...loopbackStatus,
+      state: loopbackStatus.pushConnected ? "degraded" : loopbackStatus.state,
       daemonReachable: true,
-      pushConnected: true,
-      consecutiveFailures: 0,
       timestampMs: nowMs(),
-      lastError: hostStatus.lastError ?? "移动端代理宿主异常",
+      lastError: hostStatus.lastError ?? loopbackStatus.lastError ?? "移动端代理宿主异常",
     };
   }
   if (hostStatus.state === "starting" || hostStatus.state === "stopping") {
     return {
+      ...loopbackStatus,
       state: "restarting",
       daemonReachable: true,
-      pushConnected: true,
-      consecutiveFailures: 0,
+      pushConnected: loopbackStatus.pushConnected,
       timestampMs: nowMs(),
-      lastError: hostStatus.lastError ?? undefined,
+      lastError: hostStatus.lastError ?? loopbackStatus.lastError ?? undefined,
     };
   }
   return {
+    ...loopbackStatus,
     state: "online",
     daemonReachable: true,
-    pushConnected: true,
-    consecutiveFailures: 0,
+    pushConnected: loopbackStatus.pushConnected,
     timestampMs: nowMs(),
-    lastError: hostStatus.lastError ?? undefined,
+    lastError: hostStatus.lastError ?? loopbackStatus.lastError ?? undefined,
   };
 }
 
@@ -968,234 +1227,17 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
   let revision = Math.max(1, Number(snapshot.stateRevision ?? 1) || 1);
   let transportStatus = createTransportStatus(null);
   let statusSubscriptionDispose: (() => void) | null = null;
-  let taskQueueSubscriptionDispose: (() => void) | null = null;
-  let probePatchSubscriptionDispose: (() => void) | null = null;
+  let pushSubscriptionDispose: (() => void) | null = null;
+  let transportSubscriptionDispose: (() => void) | null = null;
+  let taskQueuePollTimer: number | null = null;
+  let taskQueuePollInFlight = false;
   let latestHostStatus: WaterayMobileHostStatus | null = null;
   let nativeNodeProbeTaskStatusById = new Map<string, string>();
-  let trafficMonitorTimer: number | null = null;
-  let trafficMonitorGeneration = 0;
-  let trafficMonitorIntervalSec = 0;
-  let trafficMonitorEnabled = false;
-  let trafficMonitorPolling = false;
-  let trafficSampleState: MobileTrafficSampleState | null = null;
 
   const emit = (event: DaemonPushEvent) => {
     listeners.forEach((listener) => {
       listener(event);
     });
-  };
-
-  const emitTrafficTickEvent = (traffic: TrafficTickPayload) => {
-    emit({
-      kind: "traffic_tick",
-      timestampMs: nowMs(),
-      revision,
-      payload: {
-        traffic,
-      },
-    });
-  };
-
-  const emitZeroTrafficTick = (sampleIntervalSec = 0) => {
-    emitTrafficTickEvent({
-      sampleIntervalSec,
-      uploadBytes: 0,
-      downloadBytes: 0,
-      uploadDeltaBytes: 0,
-      downloadDeltaBytes: 0,
-      uploadRateBps: 0,
-      downloadRateBps: 0,
-      nodeUploadRateBps: 0,
-      nodeDownloadRateBps: 0,
-      totalConnections: 0,
-      tcpConnections: 0,
-      udpConnections: 0,
-      activeNodeCount: 0,
-      nodes: [],
-    });
-  };
-
-  const buildTrafficTickPayload = (
-    current: MobileTrafficSnapshot,
-    sampleIntervalSec: number,
-  ): TrafficTickPayload => {
-    const sampledAtMs = nowMs();
-    const previous = trafficSampleState;
-    const nextNodeCounters = new Map<string, MobileTrafficNodeCounter>();
-    const nextNodeTotals = new Map(previous?.nodeTotals ?? []);
-    const payload: TrafficTickPayload = {
-      sampleIntervalSec,
-      uploadBytes: current.uploadBytes,
-      downloadBytes: current.downloadBytes,
-      totalConnections: current.totalConnections,
-      tcpConnections: current.tcpConnections,
-      udpConnections: current.udpConnections,
-      activeNodeCount: current.activeNodeCount,
-      nodes: [],
-    };
-    let elapsedSec = sampleIntervalSec;
-    if (previous) {
-      const deltaMs = sampledAtMs - previous.sampledAtMs;
-      if (deltaMs > 0) {
-        elapsedSec = deltaMs / 1000;
-      }
-    }
-    if (!Number.isFinite(elapsedSec) || elapsedSec <= 0) {
-      elapsedSec = sampleIntervalSec > 0 ? sampleIntervalSec : 1;
-    }
-    if (previous) {
-      payload.uploadDeltaBytes = Math.max(0, current.uploadBytes - previous.uploadBytes);
-      payload.downloadDeltaBytes = Math.max(0, current.downloadBytes - previous.downloadBytes);
-      payload.uploadRateBps = Math.max(0, Math.trunc(payload.uploadDeltaBytes / elapsedSec));
-      payload.downloadRateBps = Math.max(0, Math.trunc(payload.downloadDeltaBytes / elapsedSec));
-    } else {
-      payload.uploadDeltaBytes = 0;
-      payload.downloadDeltaBytes = 0;
-      payload.uploadRateBps = 0;
-      payload.downloadRateBps = 0;
-    }
-    let nodeUploadRateTotal = 0;
-    let nodeDownloadRateTotal = 0;
-    payload.nodes = current.nodes.map((node) => {
-      nextNodeCounters.set(node.nodeId, {
-        uploadBytes: node.uploadBytes,
-        downloadBytes: node.downloadBytes,
-      });
-      const previousCounter = previous?.nodeCounters.get(node.nodeId);
-      const uploadDeltaBytes = previousCounter
-        ? Math.max(0, node.uploadBytes - previousCounter.uploadBytes)
-        : 0;
-      const downloadDeltaBytes = previousCounter
-        ? Math.max(0, node.downloadBytes - previousCounter.downloadBytes)
-        : 0;
-      const uploadRateBps = Math.max(0, Math.trunc(uploadDeltaBytes / elapsedSec));
-      const downloadRateBps = Math.max(0, Math.trunc(downloadDeltaBytes / elapsedSec));
-      nodeUploadRateTotal += uploadRateBps;
-      nodeDownloadRateTotal += downloadRateBps;
-      const previousTotals = nextNodeTotals.get(node.nodeId) ?? {
-        uploadBytes: 0,
-        downloadBytes: 0,
-      };
-      const nextTotals = {
-        uploadBytes: previousTotals.uploadBytes + uploadDeltaBytes,
-        downloadBytes: previousTotals.downloadBytes + downloadDeltaBytes,
-      };
-      nextNodeTotals.set(node.nodeId, nextTotals);
-      return {
-        nodeId: node.nodeId,
-        connections: node.connections,
-        uploadBytes: node.uploadBytes,
-        downloadBytes: node.downloadBytes,
-        uploadDeltaBytes,
-        downloadDeltaBytes,
-        uploadRateBps,
-        downloadRateBps,
-        totalUploadBytes: nextTotals.uploadBytes,
-        totalDownloadBytes: nextTotals.downloadBytes,
-      };
-    });
-    payload.nodeUploadRateBps = nodeUploadRateTotal;
-    payload.nodeDownloadRateBps = nodeDownloadRateTotal;
-    trafficSampleState = {
-      sampledAtMs,
-      uploadBytes: current.uploadBytes,
-      downloadBytes: current.downloadBytes,
-      nodeCounters: nextNodeCounters,
-      nodeTotals: nextNodeTotals,
-    };
-    return payload;
-  };
-
-  const fetchTrafficSnapshot = async (): Promise<MobileTrafficSnapshot> => {
-    const controller = new AbortController();
-    pendingControllers.add(controller);
-    try {
-      const response = await tauriFetch(`${defaultMobileClashApiControllerUrl}/connections`, {
-        method: "GET",
-        headers: {
-          Accept: "application/json",
-        },
-        signal: controller.signal,
-      });
-      if (!response.ok) {
-        throw new Error(`流量监控采样失败：HTTP ${response.status}`);
-      }
-      const body = await response.text();
-      return buildTrafficSnapshotFromConnectionsPayload(JSON.parse(body));
-    } finally {
-      pendingControllers.delete(controller);
-    }
-  };
-
-  const pollTrafficMonitor = async (generation: number): Promise<void> => {
-    if (trafficMonitorPolling || generation !== trafficMonitorGeneration) {
-      return;
-    }
-    if (!trafficMonitorEnabled || trafficMonitorIntervalSec <= 0) {
-      return;
-    }
-    if (latestHostStatus?.serviceRunning !== true || latestHostStatus.state !== "running") {
-      return;
-    }
-    trafficMonitorPolling = true;
-    try {
-      const trafficSnapshot = await fetchTrafficSnapshot();
-      if (generation !== trafficMonitorGeneration || !trafficMonitorEnabled) {
-        return;
-      }
-      emitTrafficTickEvent(buildTrafficTickPayload(trafficSnapshot, trafficMonitorIntervalSec));
-    } catch {
-      // Ignore transient controller read failures and wait for the next interval.
-    } finally {
-      trafficMonitorPolling = false;
-    }
-  };
-
-  const refreshTrafficMonitorState = (options?: {
-    immediate?: boolean;
-  }) => {
-    const intervalSec = Math.max(0, Math.trunc(Number(snapshot.trafficMonitorIntervalSec ?? 0)));
-    const shouldEnable =
-      intervalSec > 0 &&
-      latestHostStatus?.serviceRunning === true &&
-      latestHostStatus.state === "running";
-    if (!shouldEnable) {
-      const wasEnabled = trafficMonitorEnabled || trafficSampleState !== null;
-      trafficMonitorEnabled = false;
-      trafficMonitorIntervalSec = 0;
-      trafficMonitorGeneration += 1;
-      if (trafficMonitorTimer !== null) {
-        window.clearInterval(trafficMonitorTimer);
-        trafficMonitorTimer = null;
-      }
-      trafficSampleState = null;
-      if (wasEnabled) {
-        emitZeroTrafficTick(intervalSec);
-      }
-      return;
-    }
-    const shouldRestartTimer =
-      !trafficMonitorEnabled || trafficMonitorTimer === null || trafficMonitorIntervalSec !== intervalSec;
-    trafficMonitorEnabled = true;
-    trafficMonitorIntervalSec = intervalSec;
-    if (shouldRestartTimer) {
-      trafficMonitorGeneration += 1;
-      const generation = trafficMonitorGeneration;
-      trafficSampleState = null;
-      if (trafficMonitorTimer !== null) {
-        window.clearInterval(trafficMonitorTimer);
-      }
-      trafficMonitorTimer = window.setInterval(() => {
-        void pollTrafficMonitor(generation);
-      }, intervalSec * 1000);
-      if (options?.immediate !== false) {
-        void pollTrafficMonitor(generation);
-      }
-      return;
-    }
-    if (options?.immediate === true) {
-      void pollTrafficMonitor(trafficMonitorGeneration);
-    }
   };
 
   const persistCurrentSnapshot = () => {
@@ -1231,7 +1273,6 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
     snapshot.stateRevision = revision;
     snapshot.activePushSubscribers = listeners.size;
     persistCurrentSnapshot();
-    refreshTrafficMonitorState();
     if (emitChange) {
       emitSnapshot();
     }
@@ -1397,18 +1438,16 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
     draft: DaemonSnapshot,
     taskId: string,
     title: string,
-    nodeIds: string[],
-    probeTypes: ProbeType[],
+    nodePlans: FreshProbePlan[],
   ): void => {
-    const pendingStages = Array.from(new Set(probeTypes));
     draft.probeRuntimeTasks = [
       {
         taskId,
         taskType: "node_probe",
         title,
-        nodeStates: nodeIds.map((nodeId) => ({
-          nodeId,
-          pendingStages,
+        nodeStates: nodePlans.map((plan) => ({
+          nodeId: plan.node.id,
+          pendingStages: Array.from(new Set(plan.probeTypes)),
         })),
       },
       ...((draft.probeRuntimeTasks ?? []).filter((item) => item.taskId !== taskId)),
@@ -1428,6 +1467,9 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
   };
 
   const serializeProbeRuntimeTasks = (tasks: ProbeRuntimeTask[] | undefined): string =>
+    JSON.stringify(tasks ?? []);
+
+  const serializeBackgroundTasks = (tasks: BackgroundTask[] | undefined): string =>
     JSON.stringify(tasks ?? []);
 
   const emitTaskQueueEvent = (tasks: BackgroundTask[]) => {
@@ -1475,22 +1517,25 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
   };
 
   const syncHostStatus = (status: WaterayMobileHostStatus) => {
-    const wasRunning = latestHostStatus?.serviceRunning === true && latestHostStatus.state === "running";
     latestHostStatus = status;
     transportStatus = createTransportStatus(status);
     updateSnapshot((draft) => {
       applyHostStatusToDraft(draft, status);
     });
-    refreshTrafficMonitorState({
-      immediate: !wasRunning && status.serviceRunning === true && status.state === "running",
-    });
-    emitTransport();
   };
 
-  const applyNativeProbeResultPatch = (payload: ProbeResultPatchPayload) => {
+  const applyNativeProbeResultPatch = (
+    payload: ProbeResultPatchPayload,
+    options?: {
+      emitEvent?: boolean;
+    },
+  ) => {
     const nextSnapshot = applyProbeResultPatchToSnapshot(snapshot, payload);
     if (nextSnapshot !== snapshot) {
       commitSnapshot(nextSnapshot, false);
+    }
+    if (options?.emitEvent === false) {
+      return;
     }
     emit({
       kind: "probe_result_patch",
@@ -1510,23 +1555,46 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
       processCompletions?: boolean;
     } = {},
   ) => {
+    const previousBackgroundTaskSignature = serializeBackgroundTasks(snapshot.backgroundTasks);
     const previousProbeTaskSignature = serializeProbeRuntimeTasks(snapshot.probeRuntimeTasks);
     const previousTaskStatusById = nativeNodeProbeTaskStatusById;
     const nextTasks = mergeNativeProbeTasks(snapshot.backgroundTasks, result.tasks);
     const nextProbeTasks = result.probeTasks ?? [];
+    const activeTaskStatusById = new Map(
+      result.tasks.map((task) => [task.id, String(task.status ?? "").trim().toLowerCase()]),
+    );
     let nextSnapshot = snapshot;
     for (const patch of result.probeResultPatches ?? []) {
+      const taskStatus = activeTaskStatusById.get(patch.taskId) ?? "";
+      const previousTaskStatus = String(previousTaskStatusById.get(patch.taskId) ?? "")
+        .trim()
+        .toLowerCase();
+      const newlyCompletedTask =
+        patch.final === true &&
+        (taskStatus === "success" || taskStatus === "failed" || taskStatus === "cancelled") &&
+        previousTaskStatus !== taskStatus;
+      if (taskStatus !== "running" && taskStatus !== "queued" && !newlyCompletedTask) {
+        continue;
+      }
       nextSnapshot = applyProbeResultPatchToSnapshot(nextSnapshot, patch);
     }
     const patchChanged = nextSnapshot !== snapshot;
-    updateSnapshot((draft) => {
-      if (nextSnapshot !== snapshot) {
-        draft.groups = nextSnapshot.groups;
-        draft.probeRuntimeTasks = nextSnapshot.probeRuntimeTasks;
-      }
-      draft.backgroundTasks = nextTasks;
-      draft.probeRuntimeTasks = nextProbeTasks;
-    }, false);
+    const mergedProbeTasks = patchChanged ? nextSnapshot.probeRuntimeTasks : nextProbeTasks;
+    const nextBackgroundTaskSignature = serializeBackgroundTasks(nextTasks);
+    const nextProbeTaskSignature = serializeProbeRuntimeTasks(mergedProbeTasks);
+    if (
+      patchChanged ||
+      previousBackgroundTaskSignature !== nextBackgroundTaskSignature ||
+      previousProbeTaskSignature !== nextProbeTaskSignature
+    ) {
+      updateSnapshot((draft) => {
+        if (patchChanged) {
+          draft.groups = nextSnapshot.groups;
+        }
+        draft.backgroundTasks = nextTasks;
+        draft.probeRuntimeTasks = mergedProbeTasks;
+      }, false);
+    }
     nativeNodeProbeTaskStatusById = new Map(
       result.tasks.map((task) => [task.id, String(task.status ?? "")]),
     );
@@ -1542,6 +1610,152 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
     if (options.processCompletions !== false) {
       void maybeApplyProbeTaskCompletionRuntimeUpdate(previousTaskStatusById, result.tasks);
     }
+    ensureActiveTaskQueuePolling();
+  };
+
+  const hasActiveNativeProbeWork = (currentSnapshot: DaemonSnapshot = snapshot): boolean =>
+    (currentSnapshot.backgroundTasks ?? []).some((task) => {
+      if (task.type !== "node_probe") {
+        return false;
+      }
+      const status = String(task.status ?? "").trim().toLowerCase();
+      return status === "running" || status === "queued";
+    }) || (currentSnapshot.probeRuntimeTasks ?? []).length > 0;
+
+  const stopActiveTaskQueuePolling = () => {
+    if (taskQueuePollTimer != null) {
+      window.clearInterval(taskQueuePollTimer);
+      taskQueuePollTimer = null;
+    }
+  };
+
+  const pollActiveTaskQueueOnce = async () => {
+    if (!mobileHost || taskQueuePollInFlight) {
+      return;
+    }
+    if (!hasActiveNativeProbeWork()) {
+      stopActiveTaskQueuePolling();
+      return;
+    }
+    taskQueuePollInFlight = true;
+    try {
+      syncNativeTaskQueue(await mobileHost.getTaskQueue(), {
+        emitTaskQueue: false,
+        emitSnapshotForProbeTasks: false,
+        processCompletions: true,
+      });
+    } catch {
+      // Keep background probe polling best-effort.
+    } finally {
+      taskQueuePollInFlight = false;
+      if (!hasActiveNativeProbeWork()) {
+        stopActiveTaskQueuePolling();
+      }
+    }
+  };
+
+  const ensureActiveTaskQueuePolling = () => {
+    if (!mobileHost) {
+      return;
+    }
+    if (!hasActiveNativeProbeWork()) {
+      stopActiveTaskQueuePolling();
+      return;
+    }
+    if (getLatestMobileHostTransportStatus().pushConnected) {
+      stopActiveTaskQueuePolling();
+      return;
+    }
+    if (taskQueuePollTimer != null) {
+      return;
+    }
+    taskQueuePollTimer = window.setInterval(() => {
+      if (getLatestMobileHostTransportStatus().pushConnected) {
+        stopActiveTaskQueuePolling();
+        return;
+      }
+      void pollActiveTaskQueueOnce();
+    }, activeTaskQueueFallbackPollIntervalMs);
+    void pollActiveTaskQueueOnce();
+  };
+
+  const applyTrafficTickToSnapshot = (traffic: TrafficTickPayload) => {
+    updateSnapshot((draft) => {
+      draft.sampleIntervalSec = traffic.sampleIntervalSec;
+      draft.uploadBytes = traffic.uploadBytes;
+      draft.downloadBytes = traffic.downloadBytes;
+      draft.uploadDeltaBytes = traffic.uploadDeltaBytes;
+      draft.downloadDeltaBytes = traffic.downloadDeltaBytes;
+      draft.uploadRateBps = traffic.uploadRateBps;
+      draft.downloadRateBps = traffic.downloadRateBps;
+      draft.nodeUploadRateBps = traffic.nodeUploadRateBps;
+      draft.nodeDownloadRateBps = traffic.nodeDownloadRateBps;
+      draft.totalConnections = traffic.totalConnections;
+      draft.tcpConnections = traffic.tcpConnections;
+      draft.udpConnections = traffic.udpConnections;
+      draft.activeNodeCount = traffic.activeNodeCount;
+      draft.activeConnectionNodes = traffic.nodes;
+    }, false);
+  };
+
+  const applyOperationStatusToSnapshot = (operation: NonNullable<DaemonPushEvent["payload"]["operation"]>) => {
+    updateSnapshot((draft) => {
+      const existing = draft.operations ?? [];
+      draft.operations = [operation, ...existing.filter((item) => item.id !== operation.id)].slice(0, 24);
+    }, false);
+  };
+
+  const applyHostPushEvent = (event: DaemonPushEvent) => {
+    switch (event.kind) {
+      case "task_queue": {
+        const taskQueue = event.payload.taskQueue;
+        if (taskQueue) {
+          syncNativeTaskQueue(
+            {
+              tasks: taskQueue.tasks ?? [],
+              probeTasks: taskQueue.probeTasks ?? [],
+              probeResultPatches: taskQueue.probeResultPatches ?? [],
+            },
+            {
+              emitTaskQueue: false,
+              emitSnapshotForProbeTasks: false,
+              processCompletions: true,
+            },
+          );
+        }
+        break;
+      }
+      case "probe_result_patch":
+        if (event.payload.probeResultPatch) {
+          applyNativeProbeResultPatch(event.payload.probeResultPatch, { emitEvent: false });
+        }
+        break;
+      case "runtime_apply":
+        if (event.payload.runtimeApply) {
+          updateSnapshot((draft) => {
+            draft.lastRuntimeApply = event.payload.runtimeApply;
+          }, false);
+        }
+        break;
+      case "operation_status":
+        if (event.payload.operation) {
+          applyOperationStatusToSnapshot(event.payload.operation);
+        }
+        break;
+      case "traffic_tick":
+        if (event.payload.traffic) {
+          applyTrafficTickToSnapshot(event.payload.traffic);
+        }
+        break;
+      case "transport_status":
+        if (event.payload.transport) {
+          transportStatus = event.payload.transport;
+        }
+        break;
+      default:
+        break;
+    }
+    emit(event);
   };
 
   const ensureStatusSubscription = async () => {
@@ -1553,24 +1767,28 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
         syncHostStatus(status);
       });
     }
-    if (!taskQueueSubscriptionDispose) {
-      let initializingTaskQueue = true;
-      taskQueueSubscriptionDispose = await mobileHost.onTaskQueueChanged((result) => {
-        syncNativeTaskQueue(result, {
-          emitTaskQueue: !initializingTaskQueue,
-          emitSnapshotForProbeTasks: !initializingTaskQueue,
-          processCompletions: !initializingTaskQueue,
-        });
+    if (!transportSubscriptionDispose) {
+      transportSubscriptionDispose = subscribeMobileHostTransportStatus(() => {
+        transportStatus = createTransportStatus(latestHostStatus);
+        emitTransport();
       });
-      initializingTaskQueue = false;
     }
-    if (!probePatchSubscriptionDispose) {
-      probePatchSubscriptionDispose = await mobileHost.onProbeResultPatch((payload) => {
-        applyNativeProbeResultPatch(payload);
+    if (!pushSubscriptionDispose) {
+      pushSubscriptionDispose = await mobileHost.onDaemonPushEvent((event) => {
+        applyHostPushEvent(event);
       });
     }
     const currentStatus = await mobileHost.getStatus();
     syncHostStatus(currentStatus);
+    try {
+      syncNativeTaskQueue(await mobileHost.getTaskQueue(), {
+        emitTaskQueue: false,
+        emitSnapshotForProbeTasks: false,
+        processCompletions: false,
+      });
+    } catch {
+      // Keep runtime initialization resilient when task queue bootstrap fails.
+    }
   };
 
   void ensureStatusSubscription();
@@ -1602,6 +1820,11 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
     status?: WaterayMobileHostStatus | null,
     options: {
       commit?: boolean;
+      runtimeApplyRequest?: {
+        operation: RuntimeApplyOperation;
+        strategy: RuntimeApplyStrategy;
+        changeSetSummary: string;
+      };
     } = {},
   ): Promise<DaemonSnapshot> => {
     const host = requireMobileHost();
@@ -1625,6 +1848,10 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
       configJson: runtimeConfig.configJson,
       profileName: runtimeConfig.profileName,
       mode: targetMode,
+      trafficMonitorIntervalSec: nextSnapshot.trafficMonitorIntervalSec,
+      runtimeApplyOperation: options.runtimeApplyRequest?.operation,
+      runtimeApplyStrategy: options.runtimeApplyRequest?.strategy,
+      changeSetSummary: options.runtimeApplyRequest?.changeSetSummary,
     });
     const startupStatus = await waitForHostStartupResult(host);
     syncHostStatus(startupStatus);
@@ -1660,19 +1887,16 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
     const switchResult = await host.switchSelectors({
       selections,
       closeConnections: options.closeConnections === true,
+      runtimeApplyOperation:
+        options.markRuntimeApply === false ? undefined : options.operation,
+      runtimeApplyStrategy:
+        options.markRuntimeApply === false ? undefined : "hot_patch",
+      changeSetSummary:
+        options.markRuntimeApply === false ? undefined : options.changeSetSummary,
     });
     latestHostStatus = switchResult.status;
     transportStatus = createTransportStatus(switchResult.status);
     applyHostStatusToDraft(nextSnapshot, switchResult.status);
-    if (options.markRuntimeApply !== false) {
-      nextSnapshot.lastRuntimeApply = buildRuntimeApplyStatus({
-        operation: options.operation,
-        strategy: "hot_patch",
-        result: "hot_applied",
-        changeSetSummary: options.changeSetSummary,
-        success: true,
-      });
-    }
     return options.commit === false ? nextSnapshot : commitSnapshot(nextSnapshot);
   };
 
@@ -1734,13 +1958,11 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
     try {
       const appliedSnapshot = await reloadRunningSnapshot(nextSnapshot, status, {
         commit: false,
-      });
-      appliedSnapshot.lastRuntimeApply = buildRuntimeApplyStatus({
-        operation: "set_rule_config",
-        strategy: "fast_restart",
-        result: "hot_applied",
-        changeSetSummary: options.changeSetSummary,
-        success: true,
+        runtimeApplyRequest: {
+          operation: "set_rule_config",
+          strategy: "fast_restart",
+          changeSetSummary: options.changeSetSummary,
+        },
       });
       return commitSnapshot(appliedSnapshot);
     } catch (error) {
@@ -1787,7 +2009,6 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
       changeSetSummary: "mobile_rule_pool_probe_refresh",
       failureMessage: "移动端节点探测后自动热更失败",
     });
-    emitTransport();
   }
 
   const refreshReferencedNodePoolsInBackground = async (input?: {
@@ -2227,6 +2448,9 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
       const clearLatency = !payload.probeTypes || payload.probeTypes.includes("node_latency");
       const clearRealConnect =
         !payload.probeTypes || payload.probeTypes.includes("real_connect");
+      const clearScoreBundle =
+        !payload.probeTypes ||
+        (payload.probeTypes.includes("node_latency") && payload.probeTypes.includes("real_connect"));
       draft.groups.forEach((group) => {
         if (targetGroupIds && !targetGroupIds.has(group.id)) {
           return;
@@ -2235,15 +2459,15 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
           if (targetNodeIds.size > 0 && !targetNodeIds.has(node.id)) {
             return;
           }
-          if (clearLatency) {
+          if (clearScoreBundle || clearLatency) {
             node.latencyMs = 0;
             node.latencyProbedAtMs = 0;
           }
-          if (clearRealConnect) {
+          if (clearScoreBundle || clearRealConnect) {
             node.probeRealConnectMs = 0;
             node.realConnectProbedAtMs = 0;
           }
-          node.probeScore = computeNodeProbeScore(node);
+          node.probeScore = clearScoreBundle ? 0 : computeNodeProbeScore(node);
         });
       });
     });
@@ -2348,15 +2572,23 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
       throw new Error("没有需要探测的节点");
     }
     const cacheResolution = splitProbeTargetsByCache(snapshot, targetNodes, probeTypes);
+    const normalizedSnapshot = applyProbeCacheNormalizationsToSnapshot(
+      snapshot,
+      cacheResolution.cacheNormalizations,
+    );
     return {
       host,
       currentStatus,
-      sourceSnapshot: snapshot,
+      sourceSnapshot: normalizedSnapshot,
+      normalizedSnapshot,
       probeTypes,
+      summaryProbeTypes:
+        isScoreProbeRequest(probeTypes) ? (["node_latency", "real_connect"] as ProbeType[]) : probeTypes,
       timeoutMs,
       latencyUrl,
       realConnectUrl,
       targetNodes,
+      freshProbePlans: cacheResolution.freshProbePlans,
       freshTargetNodes: cacheResolution.freshTargetNodes,
       cachedTargetNodes: cacheResolution.cachedTargetNodes,
       cachedSummary: cacheResolution.summary,
@@ -2366,16 +2598,15 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
   const executeProbeNodes = async (
     resolved: Awaited<ReturnType<typeof resolveProbeRequest>>,
   ) => {
-    const configs = [];
-    for (let index = 0; index < resolved.freshTargetNodes.length; index += 1) {
-      const node = resolved.freshTargetNodes[index];
+    const configs: Array<{ nodeId: string; configJson: string; probeTypes: ProbeType[] }> = [];
+    const requestedProbeTypesByNodeId = new Map<string, ProbeType[]>();
+    for (let index = 0; index < resolved.freshProbePlans.length; index += 1) {
+      const plan = resolved.freshProbePlans[index];
+      requestedProbeTypesByNodeId.set(plan.node.id, [...plan.probeTypes]);
       configs.push({
-        nodeId: node.id,
-        configJson: buildMobileProbeConfig(
-          resolved.sourceSnapshot,
-          node,
-          await createMobileResolverContext(resolved.currentStatus),
-        ),
+        nodeId: plan.node.id,
+        configJson: "",
+        probeTypes: plan.probeTypes,
       });
       if ((index + 1) % probeConfigBuildYieldInterval === 0) {
         await delay(0);
@@ -2390,6 +2621,7 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
     });
     return {
       resolved,
+      requestedProbeTypesByNodeId,
       resultByNodeId: new Map(result.results.map((item) => [item.nodeId, item])),
     };
   };
@@ -2399,6 +2631,8 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
     execution: Awaited<ReturnType<typeof executeProbeNodes>>,
   ): ProbeNodesSummary => {
     let succeeded = 0;
+    let skippedRealConnectDueToLatency = 0;
+    let reprobedLatencyBeforeRealConnect = 0;
     const currentNow = nowMs();
     draft.groups.forEach((group) => {
       group.nodes.forEach((node) => {
@@ -2406,30 +2640,41 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
         if (!item) {
           return;
         }
+        const requestedProbeTypes =
+          execution.requestedProbeTypesByNodeId.get(node.id) ?? execution.resolved.summaryProbeTypes;
         if (
-          Number.isFinite(Number(item.latencyMs)) &&
-          (execution.resolved.probeTypes.includes("node_latency") ||
-            execution.resolved.probeTypes.includes("real_connect"))
+          typeof item.latencyMs === "number" &&
+          Number.isFinite(item.latencyMs) &&
+          (requestedProbeTypes.includes("node_latency") ||
+            requestedProbeTypes.includes("real_connect"))
         ) {
           node.latencyMs = Number(item.latencyMs ?? -1);
           node.latencyProbedAtMs = currentNow;
         }
-        if (execution.resolved.probeTypes.includes("real_connect")) {
+        if (requestedProbeTypes.includes("real_connect")) {
           node.probeRealConnectMs = Number(item.realConnectMs ?? -1);
           node.realConnectProbedAtMs = currentNow;
         }
         node.probeScore = computeNodeProbeScore(node);
         if (
-          (execution.resolved.probeTypes.includes("node_latency") &&
-            Number(item.latencyMs ?? -1) > 0) ||
-          (execution.resolved.probeTypes.includes("real_connect") &&
-            Number(item.realConnectMs ?? -1) > 0)
+          requestedProbeTypes.includes("node_latency") &&
+          requestedProbeTypes.includes("real_connect")
         ) {
+          reprobedLatencyBeforeRealConnect += 1;
+          if (Number(item.latencyMs ?? -1) <= 0) {
+            skippedRealConnectDueToLatency += 1;
+          }
+        }
+        if (probeResultItemSucceeded(item, requestedProbeTypes)) {
           succeeded += 1;
         }
       });
     });
-    return buildProbeSummary(execution.resolved.freshTargetNodes.length, succeeded);
+    return {
+      ...buildProbeSummary(execution.resolved.freshTargetNodes.length, succeeded),
+      skippedRealConnectDueToLatency,
+      reprobedLatencyBeforeRealConnect,
+    };
   };
 
   const buildProbeResultSnapshot = (
@@ -2480,18 +2725,30 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
     payload: MobileProbeNodesRequestPayload,
   ): Promise<{ snapshot: DaemonSnapshot; task?: BackgroundTask; summary: ProbeNodesSummary }> => {
     const resolved = await resolveProbeRequest(payload);
+    if (resolved.normalizedSnapshot !== snapshot) {
+      commitSnapshot(resolved.normalizedSnapshot, false);
+    }
     if (resolved.freshTargetNodes.length <= 0) {
       return {
-        snapshot,
+        snapshot: resolved.normalizedSnapshot,
         summary: resolved.cachedSummary,
       };
     }
-    const startResult = await resolved.host.probeStart({
-      groupId: String(payload.groupId ?? snapshot.activeGroupId ?? "").trim(),
-      configs: resolved.freshTargetNodes.map((node) => ({
-        nodeId: node.id,
+    const configs: Array<{ nodeId: string; configJson: string; probeTypes: ProbeType[] }> = [];
+    for (let index = 0; index < resolved.freshProbePlans.length; index += 1) {
+      const plan = resolved.freshProbePlans[index];
+      configs.push({
+        nodeId: plan.node.id,
         configJson: "",
-      })),
+        probeTypes: plan.probeTypes,
+      });
+      if ((index + 1) % probeConfigBuildYieldInterval === 0) {
+        await delay(0);
+      }
+    }
+    const startResult = await resolved.host.probeStart({
+      groupId: String(payload.groupId ?? resolved.normalizedSnapshot.activeGroupId ?? "").trim(),
+      configs,
       probeTypes: resolved.probeTypes,
       latencyUrl: resolved.latencyUrl,
       realConnectUrl: resolved.realConnectUrl,
@@ -2507,10 +2764,10 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
         draft,
         task.id,
         task.title,
-        resolved.freshTargetNodes.map((node) => node.id),
-        resolved.probeTypes,
+        resolved.freshProbePlans,
       );
     }, false);
+    ensureActiveTaskQueuePolling();
     return {
       snapshot: nextSnapshot,
       task,
@@ -2522,9 +2779,12 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
     payload: MobileProbeNodesRequestPayload,
   ): Promise<{ snapshot: DaemonSnapshot; summary: ProbeNodesSummary }> => {
     const resolved = await resolveProbeRequest(payload);
+    if (resolved.normalizedSnapshot !== snapshot) {
+      commitSnapshot(resolved.normalizedSnapshot, false);
+    }
     if (resolved.freshTargetNodes.length <= 0) {
       return {
-        snapshot,
+        snapshot: resolved.normalizedSnapshot,
         summary: resolved.cachedSummary,
       };
     }
@@ -2547,7 +2807,6 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
             : "mobile_probe_runtime_refresh",
         failureMessage: "移动端节点探测后自动热更失败",
       });
-    emitTransport();
     return {
       snapshot: nextSnapshot,
       summary: mergeProbeSummaryWithCache(resolved.cachedSummary, prepared.summary),
@@ -2589,15 +2848,6 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
       if (payload.mux) {
         draft.mux = deepClone(payload.mux);
       }
-      if (payload.proxyLogLevel) {
-        draft.proxyLogLevel = payload.proxyLogLevel;
-      }
-      if (payload.coreLogLevel) {
-        draft.coreLogLevel = payload.coreLogLevel;
-      }
-      if (payload.uiLogLevel) {
-        draft.uiLogLevel = payload.uiLogLevel;
-      }
       if (typeof payload.trafficMonitorIntervalSec === "number") {
         draft.trafficMonitorIntervalSec = payload.trafficMonitorIntervalSec;
       }
@@ -2612,6 +2862,9 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
       }
       if (payload.tunStack) {
         draft.tunStack = payload.tunStack;
+      }
+      if (typeof payload.strictRoute === "boolean") {
+        draft.strictRoute = payload.strictRoute;
       }
       if (payload.dns) {
         draft.dns = deepClone(payload.dns);
@@ -2639,13 +2892,11 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
     try {
       const appliedSnapshot = await reloadRunningSnapshot(nextSnapshot, currentRuntimeStatus, {
         commit: false,
-      });
-      appliedSnapshot.lastRuntimeApply = buildRuntimeApplyStatus({
-        operation: "set_settings",
-        strategy: "fast_restart",
-        result: "hot_applied",
-        changeSetSummary: "mobile_settings",
-        success: true,
+        runtimeApplyRequest: {
+          operation: "set_settings",
+          strategy: "fast_restart",
+          changeSetSummary: "mobile_settings",
+        },
       });
       return commitSnapshot(appliedSnapshot);
     } catch (error) {
@@ -2688,13 +2939,11 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
     try {
       const appliedSnapshot = await reloadRunningSnapshot(nextSnapshot, currentRuntimeStatus, {
         commit: false,
-      });
-      appliedSnapshot.lastRuntimeApply = buildRuntimeApplyStatus({
-        operation: "set_rule_config",
-        strategy: "fast_restart",
-        result: "hot_applied",
-        changeSetSummary: "mobile_rule_config",
-        success: true,
+        runtimeApplyRequest: {
+          operation: "set_rule_config",
+          strategy: "fast_restart",
+          changeSetSummary: "mobile_rule_config",
+        },
       });
       const committedSnapshot = commitSnapshot(appliedSnapshot);
       return await refreshReferencedNodePoolsInBackground({
@@ -2773,6 +3022,10 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
       configJson: runtimeConfig.configJson,
       profileName: runtimeConfig.profileName,
       mode: targetMode,
+      trafficMonitorIntervalSec: snapshot.trafficMonitorIntervalSec,
+      runtimeApplyOperation: "start_connection",
+      runtimeApplyStrategy: "fast_restart",
+      changeSetSummary: "mobile_start",
     });
     const startupStatus = await waitForHostStartupResult(host);
     return updateSnapshot((draft) => {
@@ -2783,34 +3036,20 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
           : "idle";
       draft.proxyStartedAtMs = startupStatus.startedAtMs ?? nowMs();
       draft.selectedNodeId = runtimeConfig.selectedNodeId;
-      draft.lastRuntimeApply = {
-        operation: "start_connection",
-        strategy: "fast_restart",
-        result: "saved_only",
-        changeSetSummary: "mobile_start",
-        success: true,
-        rollbackApplied: false,
-        timestampMs: nowMs(),
-      };
     });
   };
 
   const stopConnection = async (): Promise<DaemonSnapshot> => {
     requireMobileHost();
-    await mobileHost?.stop();
+    await mobileHost?.stop({
+      runtimeApplyOperation: "stop_connection",
+      runtimeApplyStrategy: "fast_restart",
+      changeSetSummary: "mobile_stop",
+    });
     return updateSnapshot((draft) => {
       draft.proxyMode = "off";
       draft.connectionStage = "disconnecting";
       draft.proxyStartedAtMs = undefined;
-      draft.lastRuntimeApply = {
-        operation: "stop_connection",
-        strategy: "fast_restart",
-        result: "saved_only",
-        changeSetSummary: "mobile_stop",
-        success: true,
-        rollbackApplied: false,
-        timestampMs: nowMs(),
-      };
     });
   };
 
@@ -2880,6 +3119,10 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
       configJson: runtimeConfig.configJson,
       profileName: runtimeConfig.profileName,
       mode: targetMode,
+      trafficMonitorIntervalSec: snapshot.trafficMonitorIntervalSec,
+      runtimeApplyOperation: "restart_connection",
+      runtimeApplyStrategy: "fast_restart",
+      changeSetSummary: "mobile_restart",
     });
     const startupStatus = await waitForHostStartupResult(host);
     return updateSnapshot((draft) => {
@@ -2890,15 +3133,6 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
           : "idle";
       draft.proxyStartedAtMs = startupStatus.startedAtMs ?? nowMs();
       draft.selectedNodeId = runtimeConfig.selectedNodeId;
-      draft.lastRuntimeApply = {
-        operation: "restart_connection",
-        strategy: "fast_restart",
-        result: "saved_only",
-        changeSetSummary: "mobile_restart",
-        success: true,
-        rollbackApplied: false,
-        timestampMs: nowMs(),
-      };
     });
   };
 
@@ -3056,12 +3290,6 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
             return createSnapshotResponse(await stopConnection(), transportStatus);
           case "POST /v1/connection/restart":
             return createSnapshotResponse(await restartConnection(), transportStatus);
-          case "POST /v1/logs/stream":
-          case "POST /v1/logs/ui":
-            return {
-              ok: true,
-              transport: transportStatus,
-            };
           case "POST /v1/session/heartbeat":
             return {
               ok: true,

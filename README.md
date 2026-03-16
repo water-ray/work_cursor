@@ -71,7 +71,7 @@ docs/            # 架构、测试与设计文档
   - `git tag sb-libs-v0.1.0`
   - `git push origin sb-libs-v0.1.0`
 - 方式 2：在 GitHub Actions 页面手动运行 `Build sing-box Libraries`
-  - 可指定 `sing_box_ref`（例如 `dev-next` 或某个 tag）
+  - 可指定 `sing_box_ref`（例如 `v1.13.2` 或某个 tag）
 
 ### 下载到本地
 

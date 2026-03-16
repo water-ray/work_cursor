@@ -5,6 +5,7 @@ import { readProxyStartupSmartOptimizePreference } from "../settings/uiPreferenc
 import { CountryFlag } from "../../components/flag/CountryFlag";
 import { BiIcon } from "../../components/icons/BiIcon";
 import { useAppNotice } from "../../components/notify/AppNoticeProvider";
+import { emitSubscriptionsExternalFocus } from "../../services/subscriptionsExternalFocus";
 import {
   beginSharedServiceAction,
   finishSharedServiceAction,
@@ -21,9 +22,15 @@ interface MobileProxyControlBarProps {
   snapshot: DaemonSnapshot | null;
   loading: boolean;
   runAction: (action: () => Promise<DaemonSnapshot>) => Promise<DaemonSnapshot>;
+  activeNodeJumpEnabled?: boolean;
 }
 
-function resolveActiveNode(snapshot: DaemonSnapshot | null): VpnNode | null {
+interface ActiveNodeMatch {
+  groupId: string;
+  node: VpnNode;
+}
+
+function resolveActiveNode(snapshot: DaemonSnapshot | null): ActiveNodeMatch | null {
   if (!snapshot) {
     return null;
   }
@@ -34,7 +41,10 @@ function resolveActiveNode(snapshot: DaemonSnapshot | null): VpnNode | null {
   for (const group of snapshot.groups ?? []) {
     const node = (group.nodes ?? []).find((item) => (item.id ?? "").trim() === activeNodeId);
     if (node) {
-      return node;
+      return {
+        groupId: String(group.id ?? "").trim(),
+        node,
+      };
     }
   }
   return null;
@@ -68,6 +78,7 @@ export function MobileProxyControlBar({
   snapshot,
   loading,
   runAction,
+  activeNodeJumpEnabled = false,
 }: MobileProxyControlBarProps) {
   const notice = useAppNotice();
   const sharedServiceAction = useSharedServiceActionState();
@@ -81,8 +92,8 @@ export function MobileProxyControlBar({
   const activeNodeTitle = useMemo(
     () =>
       cleanDisplayNameByCountry(
-        activeNode?.name ?? "",
-        activeNode?.country || activeNode?.region || "",
+        activeNode?.node.name ?? "",
+        activeNode?.node.country || activeNode?.node.region || "",
       ) || "未选择节点",
     [activeNode],
   );
@@ -216,14 +227,28 @@ export function MobileProxyControlBar({
     }
   };
 
+  const handleJumpToActiveNode = () => {
+    if (!activeNodeJumpEnabled || !activeNode) {
+      return;
+    }
+    const nodeId = String(activeNode.node.id ?? "").trim();
+    if (!activeNode.groupId || !nodeId) {
+      return;
+    }
+    emitSubscriptionsExternalFocus({
+      groupId: activeNode.groupId,
+      nodeId,
+    });
+  };
+
   return (
     <div className="mobile-proxy-control-bar">
       <div className="mobile-proxy-control-bar-node">
         <span className="mobile-proxy-control-bar-node-flag">
-          {activeNode?.country || activeNode?.region ? (
+          {activeNode?.node.country || activeNode?.node.region ? (
             <CountryFlag
-              code={activeNode.country || activeNode.region}
-              ariaLabel={activeNode.name || "节点"}
+              code={activeNode.node.country || activeNode.node.region}
+              ariaLabel={activeNode.node.name || "节点"}
             />
           ) : (
             <BiIcon name="globe2" />
@@ -233,6 +258,17 @@ export function MobileProxyControlBar({
           <Typography.Text className="mobile-proxy-control-bar-node-title">
             {activeNodeTitle}
           </Typography.Text>
+          {activeNodeJumpEnabled ? (
+            <Button
+              type="text"
+              size="small"
+              className="mobile-proxy-control-bar-locate-btn"
+              icon={<BiIcon name="geo-alt" />}
+              title={activeNode ? "定位当前节点" : "当前没有可定位节点"}
+              onClick={handleJumpToActiveNode}
+              disabled={!activeNode}
+            />
+          ) : null}
         </div>
       </div>
       <div className="mobile-proxy-control-bar-actions">

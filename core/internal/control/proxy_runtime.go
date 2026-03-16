@@ -39,7 +39,7 @@ const (
 	defaultTunMTU                   = 1420
 	minTunMTU                       = 576
 	maxTunMTU                       = 9000
-	defaultClashAPIController       = "127.0.0.1:39081"
+	defaultClashAPIControllerHost   = "127.0.0.1"
 	bootstrapDNSServerTag           = "bootstrap"
 	localDNSServerTag               = "local-resolver"
 	dnsHostsOverrideServerTag       = "hosts-overrides"
@@ -65,6 +65,8 @@ const (
 	geoIPRuleSetURLTemplate         = "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-%s.srs"
 	geoSiteRuleSetURLTemplate       = "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-%s.srs"
 )
+
+var defaultClashAPIControllerCandidates = []int{59520, 59521, 59522}
 
 type proxyRuntime struct {
 	mu                  sync.RWMutex
@@ -113,7 +115,7 @@ type clashConnectionMetadata struct {
 func newProxyRuntime(onLog func(level LogLevel, message string)) *proxyRuntime {
 	return &proxyRuntime{
 		onLog:             onLog,
-		defaultController: defaultClashAPIController,
+		defaultController: resolveDefaultClashAPIController(),
 	}
 }
 
@@ -128,14 +130,27 @@ func currentProxyCoreVersion() string {
 func resolveClashAPIController(controller string) string {
 	controller = strings.TrimSpace(controller)
 	if controller == "" {
-		return defaultClashAPIController
+		return resolveDefaultClashAPIController()
 	}
 	return controller
 }
 
+func resolveDefaultClashAPIController() string {
+	for _, port := range defaultClashAPIControllerCandidates {
+		address := fmt.Sprintf("%s:%d", defaultClashAPIControllerHost, port)
+		listener, err := net.Listen("tcp", address)
+		if err != nil {
+			continue
+		}
+		_ = listener.Close()
+		return address
+	}
+	return fmt.Sprintf("%s:%d", defaultClashAPIControllerHost, defaultClashAPIControllerCandidates[0])
+}
+
 func (r *proxyRuntime) clashAPIControllerOrDefault() string {
 	if r == nil {
-		return defaultClashAPIController
+		return resolveDefaultClashAPIController()
 	}
 	r.mu.RLock()
 	controller := resolveClashAPIController(r.clashAPIController)
@@ -1069,7 +1084,7 @@ func (r *proxyRuntime) stopLocked() error {
 }
 
 func buildRuntimeConfig(snapshot StateSnapshot) (string, error) {
-	return buildRuntimeConfigWithController(snapshot, defaultClashAPIController)
+	return buildRuntimeConfigWithController(snapshot, resolveDefaultClashAPIController())
 }
 
 func buildRuntimeConfigWithController(snapshot StateSnapshot, externalController string) (string, error) {
@@ -1302,7 +1317,7 @@ func buildTunInboundConfig(goos string, snapshot StateSnapshot) map[string]any {
 			"fdfe:dcba:9876::1/126",
 		},
 		"auto_route":   true,
-		"strict_route": true,
+		"strict_route": snapshot.StrictRoute,
 		"mtu":          normalizeProxyTunMTU(snapshot.TunMTU),
 		"stack":        string(stack),
 	}
@@ -2199,7 +2214,7 @@ func buildExperimentalConfig(snapshot StateSnapshot, externalController string, 
 	}
 	controller := strings.TrimSpace(externalController)
 	if controller == "" {
-		controller = defaultClashAPIController
+		controller = resolveDefaultClashAPIController()
 	}
 	experimental := map[string]any{
 		"clash_api": map[string]any{

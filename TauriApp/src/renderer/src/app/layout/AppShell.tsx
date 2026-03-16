@@ -11,11 +11,6 @@ import { useTaskCenter } from "../../hooks/useTaskCenter";
 import { useAppNotice } from "../../components/notify/AppNoticeProvider";
 import { TaskCenterPanel } from "../../components/task/TaskCenterPanel";
 import { WindowTitleBar } from "../../components/titlebar/WindowTitleBar";
-import {
-  readDragScrollEnabled,
-  uiPreferenceChangedEventName,
-  type UIPreferenceChangedEventDetail,
-} from "../settings/uiPreferences";
 import { daemonApi } from "../../services/daemonApi";
 import { MobileQuickPanels } from "./MobileQuickPanels";
 import { MobileProxyControlBar } from "./MobileProxyControlBar";
@@ -53,14 +48,11 @@ export function AppShell({
   const notice = useAppNotice();
   const mobileTopBarWrapRef = useRef<HTMLDivElement | null>(null);
   const daemonState = useDaemonSnapshot({
-    includeLogs: location.pathname.startsWith("/logs"),
+    includeLogs: isDesktopShell && location.pathname.startsWith("/logs"),
   });
   const navigate = useNavigate();
   const contentScrollRef = useRef<HTMLDivElement | null>(null);
   const lastRuntimeApplyNoticeTSRef = useRef<number>(0);
-  const [dragScrollEnabled, setDragScrollEnabled] = useState<boolean>(() =>
-    readDragScrollEnabled(),
-  );
   const [removingTaskID, setRemovingTaskID] = useState("");
   const taskCenter = useTaskCenter(
     daemonState.snapshot,
@@ -75,7 +67,6 @@ export function AppShell({
   });
   const defaultRoutePath = navRoutes[0]?.path ?? "/subscriptions";
   const airportRouteActive = location.pathname.startsWith("/airport");
-  const allowMobileLogs = navRoutes.some((route) => route.key === "logs");
   const mobileSubscriptionsRouteActive =
     !isDesktopShell && location.pathname.startsWith("/subscriptions");
   const mobileRulesRouteActive =
@@ -99,33 +90,6 @@ export function AppShell({
     ),
     title: route.tip,
   }));
-
-  useEffect(() => {
-    const onPreferenceChanged = (event: Event) => {
-      const customEvent = event as CustomEvent<UIPreferenceChangedEventDetail>;
-      if (customEvent.detail?.key !== "dragScrollEnabled") {
-        return;
-      }
-      setDragScrollEnabled(Boolean(customEvent.detail.value));
-    };
-
-    const onStorage = (event: StorageEvent) => {
-      if (event.key == null || !event.key.includes("wateray.ui.dragScrollEnabled")) {
-        return;
-      }
-      setDragScrollEnabled(readDragScrollEnabled());
-    };
-
-    window.addEventListener(uiPreferenceChangedEventName, onPreferenceChanged as EventListener);
-    window.addEventListener("storage", onStorage);
-    return () => {
-      window.removeEventListener(
-        uiPreferenceChangedEventName,
-        onPreferenceChanged as EventListener,
-      );
-      window.removeEventListener("storage", onStorage);
-    };
-  }, []);
 
   useEffect(() => {
     if (isDesktopShell) {
@@ -288,97 +252,10 @@ export function AppShell({
 
     container.addEventListener("wheel", onWheel, { passive: false });
 
-    if (!dragScrollEnabled) {
-      return () => {
-        container.removeEventListener("wheel", onWheel);
-      };
-    }
-
-    let dragging = false;
-    let suppressClick = false;
-    let startY = 0;
-    let startScrollTop = 0;
-
-    const shouldIgnoreTarget = (target: HTMLElement | null): boolean => {
-      if (!target) {
-        return false;
-      }
-      return Boolean(
-        target.closest(
-          "input, textarea, button, select, option, [contenteditable='true'], [draggable='true'], .ant-btn, .ant-input, .ant-select-selector, .ant-switch, .ant-picker-input, .ant-input-number, .context-menu-anchor, .bi-question-circle, .help-popover-trigger, .help-popover-anchor, [data-help-popover='true'], .ant-popover-open",
-        ),
-      );
-    };
-
-    const onMouseDown = (event: MouseEvent) => {
-      if (event.button !== 0) {
-        return;
-      }
-      const target = event.target as HTMLElement | null;
-      if (shouldIgnoreTarget(target)) {
-        return;
-      }
-      event.preventDefault();
-      dragging = true;
-      suppressClick = false;
-      startY = event.clientY;
-      startScrollTop = container.scrollTop;
-      container.classList.add("drag-scrolling");
-    };
-
-    const onMouseMove = (event: MouseEvent) => {
-      if (!dragging) {
-        return;
-      }
-      const deltaY = event.clientY - startY;
-      if (!suppressClick && Math.abs(deltaY) > 3) {
-        suppressClick = true;
-      }
-      container.scrollTop = startScrollTop - deltaY;
-      if (suppressClick) {
-        event.preventDefault();
-      }
-    };
-
-    const endDragging = () => {
-      if (!dragging) {
-        return;
-      }
-      dragging = false;
-      container.classList.remove("drag-scrolling");
-      window.setTimeout(() => {
-        suppressClick = false;
-      }, 0);
-    };
-
-    const onClickCapture = (event: MouseEvent) => {
-      const target = event.target as HTMLElement | null;
-      if (target?.closest(".help-popover-anchor, [data-help-popover='true'], .help-popover-trigger")) {
-        return;
-      }
-      if (!suppressClick) {
-        return;
-      }
-      event.preventDefault();
-      event.stopPropagation();
-    };
-
-    container.addEventListener("mousedown", onMouseDown);
-    window.addEventListener("mousemove", onMouseMove);
-    window.addEventListener("mouseup", endDragging);
-    window.addEventListener("mouseleave", endDragging);
-    container.addEventListener("click", onClickCapture, true);
-
     return () => {
       container.removeEventListener("wheel", onWheel);
-      container.removeEventListener("mousedown", onMouseDown);
-      window.removeEventListener("mousemove", onMouseMove);
-      window.removeEventListener("mouseup", endDragging);
-      window.removeEventListener("mouseleave", endDragging);
-      container.removeEventListener("click", onClickCapture, true);
-      container.classList.remove("drag-scrolling");
     };
-  }, [dragScrollEnabled]);
+  }, []);
 
   return (
     <Layout className="app-shell" style={mobileShellStyle}>
@@ -437,6 +314,7 @@ export function AppShell({
             snapshot={daemonState.snapshot}
             loading={daemonState.loading}
             runAction={daemonState.runAction}
+            activeNodeJumpEnabled={mobileSubscriptionsRouteActive}
           />
           {mobileSubscriptionsRouteActive ? (
             <MobileSubscriptionsQuickBar
@@ -453,7 +331,7 @@ export function AppShell({
       <Layout.Content className="content-area">
         <div
           ref={contentScrollRef}
-          className={`content-scroll-view${!isDesktopShell ? " mobile-content-scroll-view" : ""}${mobileSecondaryRowActive ? " mobile-content-scroll-view-with-secondary-row" : ""}${dragScrollEnabled && !airportRouteActive ? " drag-scroll-enabled" : ""}${airportRouteActive ? " airport-web-content-mode" : ""}`}
+          className={`content-scroll-view${!isDesktopShell ? " mobile-content-scroll-view" : ""}${mobileSecondaryRowActive ? " mobile-content-scroll-view-with-secondary-row" : ""}${airportRouteActive ? " airport-web-content-mode" : ""}`}
           style={mobileContentStyle}
         >
           {daemonState.error && !airportRouteActive ? (
@@ -468,7 +346,6 @@ export function AppShell({
             daemonState={daemonState}
             defaultRoutePath={defaultRoutePath}
             mode={mode}
-            allowMobileLogs={allowMobileLogs}
           />
         </div>
       </Layout.Content>

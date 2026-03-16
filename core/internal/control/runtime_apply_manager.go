@@ -23,15 +23,19 @@ var muxVerifyProbeURLs = []string{
 	"https://cp.cloudflare.com/generate_204",
 }
 
-// Runtime capability matrix for sing-box v1.12.22.
+// Runtime capability matrix for sing-box v1.13.2.
 // NOTE: clash API PATCH /configs only handles mode in this version.
 type runtimeCapabilityMatrix struct {
 	ProxyLogLevelHotPatch bool
 }
 
-var singBoxRuntimeCapabilitiesV11222 = runtimeCapabilityMatrix{
+var singBoxRuntimeCapabilitiesV1132 = runtimeCapabilityMatrix{
 	ProxyLogLevelHotPatch: false,
 }
+
+// Keep the legacy symbol name so older tests and transitional code
+// continue to compile after the 1.13.2 capability rename.
+var singBoxRuntimeCapabilitiesV11222 = singBoxRuntimeCapabilitiesV1132
 
 type RuntimeChangeSet struct {
 	ProxyModeChanged        bool
@@ -121,7 +125,8 @@ func buildSettingsRuntimeChangeSet(previous StateSnapshot, current StateSnapshot
 	}
 	if current.ProxyMode == ProxyModeTun {
 		if previous.TunMTU != current.TunMTU ||
-			normalizeProxyTunStack(previous.TunStack) != normalizeProxyTunStack(current.TunStack) {
+			normalizeProxyTunStack(previous.TunStack) != normalizeProxyTunStack(current.TunStack) ||
+			previous.StrictRoute != current.StrictRoute {
 			set.ListenSettingsChanged = true
 		}
 	}
@@ -261,7 +266,7 @@ type selectedNodeSwitcher interface {
 func newRuntimeApplyManager(runtime *proxyRuntime) *runtimeApplyManager {
 	return &runtimeApplyManager{
 		runtime:           runtime,
-		capability:        singBoxRuntimeCapabilitiesV11222,
+		capability:        singBoxRuntimeCapabilitiesV1132,
 		syncSystemProxyFn: syncSystemProxy,
 		muxProbeURLs:      append([]string{}, muxVerifyProbeURLs...),
 		muxProbeTimeoutMS: muxVerifyTimeoutMS,

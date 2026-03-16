@@ -61,7 +61,6 @@ class WaterayVpnService : VpnService(), CommandServerHandler, PlatformInterface 
     private const val NOTIFICATION_CHANNEL_ID = "wateray-mobile-vpn"
     private const val NOTIFICATION_CHANNEL_NAME = "Wateray Mobile VPN"
     private const val NOTIFICATION_ID = 40021
-    private const val COMMAND_SERVER_PORT = 39081
     private const val COMMAND_SERVER_SECRET = "wateray-mobile-host"
 
     private val setupLock = Any()
@@ -132,7 +131,7 @@ class WaterayVpnService : VpnService(), CommandServerHandler, PlatformInterface 
     fun ensureLibboxSetup(context: Context) {
       synchronized(setupLock) {
         if (setupComplete) {
-          MobileHostBridge.markNativeReady()
+          MobileRuntimeCoordinator.markNativeReady()
           return
         }
 
@@ -150,14 +149,14 @@ class WaterayVpnService : VpnService(), CommandServerHandler, PlatformInterface 
           workingPath = workDir.absolutePath
           tempPath = tempDir.absolutePath
           fixAndroidStack = true
-          commandServerListenPort = COMMAND_SERVER_PORT
+          commandServerListenPort = MobileLoopbackPorts.current().commandServerPort
           commandServerSecret = COMMAND_SERVER_SECRET
           logMaxLines = 4000
           debug = BuildConfig.DEBUG
         }
         Libbox.setup(options)
         setupComplete = true
-        MobileHostBridge.markNativeReady()
+        MobileRuntimeCoordinator.markNativeReady()
       }
     }
   }
@@ -199,7 +198,7 @@ class WaterayVpnService : VpnService(), CommandServerHandler, PlatformInterface 
     activeService = this
     Log.d(TAG, "service created")
     createNotificationChannel()
-    MobileHostBridge.refreshPermission(this)
+    MobileRuntimeCoordinator.refreshPermission(this)
   }
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -215,7 +214,7 @@ class WaterayVpnService : VpnService(), CommandServerHandler, PlatformInterface 
       else -> {
         val configJson = intent?.getStringExtra(EXTRA_CONFIG_JSON)?.trim().orEmpty()
         if (configJson.isEmpty()) {
-          MobileHostBridge.setError("移动端配置不能为空")
+          MobileRuntimeCoordinator.setError("移动端配置不能为空")
           stopSelf()
           return START_NOT_STICKY
         }
@@ -226,7 +225,6 @@ class WaterayVpnService : VpnService(), CommandServerHandler, PlatformInterface 
         currentRuntimeMode = normalizeRuntimeMode(intent?.getStringExtra(EXTRA_RUNTIME_MODE))
         lastConfigJson = configJson
         enterForeground(foregroundNotificationText())
-        MobileHostBridge.setStarting(currentProfileName, configJson, currentRuntimeMode)
         Thread {
           startNative(configJson, currentProfileName, currentRuntimeMode)
         }.start()
@@ -243,10 +241,10 @@ class WaterayVpnService : VpnService(), CommandServerHandler, PlatformInterface 
   override fun onDestroy() {
     Log.d(TAG, "service destroyed")
     cleanupNative(closeService = false)
-    if (MobileHostBridge.snapshot().serviceRunning) {
-      MobileHostBridge.setStopped("移动端原生宿主已销毁")
+    if (MobileRuntimeCoordinator.snapshotStatus().serviceRunning) {
+      MobileRuntimeCoordinator.setStopped("移动端原生宿主已销毁")
     }
-    MobileHostBridge.refreshPermission(this)
+    MobileRuntimeCoordinator.refreshPermission(this)
     if (activeService === this) {
       activeService = null
     }
@@ -264,8 +262,8 @@ class WaterayVpnService : VpnService(), CommandServerHandler, PlatformInterface 
         lastConfigJson = configJson
       }
       server.startOrReloadService(configJson, OverrideOptions())
-      MobileHostBridge.setRunning(profileName, configJson, tunConnection != null, runtimeMode)
-      MobileHostBridge.refreshPermission(this)
+      MobileRuntimeCoordinator.setRunning(profileName, configJson, tunConnection != null, runtimeMode)
+      MobileRuntimeCoordinator.refreshPermission(this)
       updateNotification(foregroundNotificationText())
       Log.i(TAG, "startNative success, mode=$runtimeMode, tunReady=${tunConnection != null}")
     } catch (ex: Exception) {
@@ -285,7 +283,7 @@ class WaterayVpnService : VpnService(), CommandServerHandler, PlatformInterface 
       Log.d(TAG, "creating libbox command server")
       server.start()
       commandServer = server
-      MobileHostBridge.markNativeReady()
+      MobileRuntimeCoordinator.markNativeReady()
       return server
     }
   }
@@ -313,8 +311,8 @@ class WaterayVpnService : VpnService(), CommandServerHandler, PlatformInterface 
   private fun stopNative(message: String?) {
     Log.i(TAG, "stopNative message=${message ?: "-"}")
     cleanupNative(closeService = true)
-    MobileHostBridge.setStopped(message)
-    MobileHostBridge.refreshPermission(this)
+    MobileRuntimeCoordinator.setStopped(message)
+    MobileRuntimeCoordinator.refreshPermission(this)
     try {
       stopForeground(STOP_FOREGROUND_REMOVE)
     } catch (_: Exception) {
@@ -330,7 +328,7 @@ class WaterayVpnService : VpnService(), CommandServerHandler, PlatformInterface 
       Log.w(TAG, "close tun fd failed", ex)
     } finally {
       tunConnection = null
-      MobileHostBridge.setTunReady(false)
+      MobileRuntimeCoordinator.setTunReady(false)
     }
   }
 
@@ -683,8 +681,8 @@ class WaterayVpnService : VpnService(), CommandServerHandler, PlatformInterface 
       val connection = builder.establish()
         ?: throw IllegalStateException("建立 Android VPN 隧道失败")
       tunConnection = connection
-      MobileHostBridge.setTunReady(true)
-      MobileHostBridge.refreshPermission(this)
+      MobileRuntimeCoordinator.setTunReady(true)
+      MobileRuntimeCoordinator.refreshPermission(this)
       updateNotification(foregroundNotificationText())
       Log.i(TAG, "Android VPN tunnel established")
       return connection.fd

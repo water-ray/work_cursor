@@ -53,6 +53,9 @@ function shouldSkipUILog(path: string): boolean {
 }
 
 async function appendUILog(level: LogLevel, message: string): Promise<void> {
+  if (isMobileRuntime()) {
+    return;
+  }
   try {
     await window.waterayDesktop.daemon.request({
       method: "POST",
@@ -669,6 +672,7 @@ export const daemonApi = {
     localProxyPort?: number;
     tunMtu?: number;
     tunStack?: ProxyTunStack;
+    strictRoute?: boolean;
     allowExternalConnections?: boolean;
     dns?: DNSConfig;
     probeSettings?: ProbeSettings;
@@ -767,6 +771,9 @@ export const daemonApi = {
     };
   },
   async setLogStreamEnabled(enabled: boolean): Promise<void> {
+    if (isMobileRuntime()) {
+      return;
+    }
     await requestWithoutSnapshot({
       method: "POST",
       path: "/v1/logs/stream",
@@ -793,6 +800,9 @@ export const daemonApi = {
     return Math.max(0, Number(result.activeSessions ?? 0));
   },
   async saveLogs(kind: "proxy" | "core" | "ui"): Promise<string> {
+    if (isMobileRuntime()) {
+      throw new Error("移动端已移除日志功能");
+    }
     const result = await requestWithoutSnapshot({
       method: "POST",
       path: "/v1/logs/save",

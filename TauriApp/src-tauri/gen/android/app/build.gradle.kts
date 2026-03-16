@@ -17,7 +17,8 @@ android {
     compileSdk = 36
     namespace = "com.wateray.desktop"
     defaultConfig {
-        manifestPlaceholders["usesCleartextTraffic"] = "false"
+        // Mobile host talks to the local Clash controller over HTTP loopback.
+        manifestPlaceholders["usesCleartextTraffic"] = "true"
         applicationId = "com.wateray.desktop"
         minSdk = 24
         targetSdk = 36
@@ -62,7 +63,9 @@ dependencies {
     implementation("androidx.appcompat:appcompat:1.7.1")
     implementation("androidx.activity:activity-ktx:1.10.1")
     implementation("com.google.android.material:material:1.12.0")
+    implementation("com.google.code.gson:gson:2.13.1")
     implementation(files("../../../../../core/prebuilt/wateray-core-android-so/libbox.aar"))
+    implementation("org.java-websocket:Java-WebSocket:1.6.0")
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.1.4")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.5.0")

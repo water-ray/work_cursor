@@ -7,7 +7,8 @@ import type {
   TransportStatus,
 } from "@shared/daemon";
 
-import { getDaemonWebSocketURL, requestDaemon } from "./daemonClient";
+import { LoopbackRpcClient } from "../platform/loopbackRpcClient";
+import { invokeDesktopTransportBootstrap, requestDaemon } from "./daemonClient";
 import { syncLinuxSystemProxyFromSnapshot } from "./linuxSystemProxySync";
 
 type PushListener = (event: DaemonPushEvent) => void;
@@ -16,31 +17,27 @@ const reconnectBaseDelayMs = 1000;
 const reconnectMaxDelayMs = 15000;
 const packagedRecoveryFailureThreshold = 3;
 
-function parsePushEvent(raw: string): DaemonPushEvent | null {
-  try {
-    const parsed = JSON.parse(raw) as Partial<DaemonPushEvent>;
-    if (!parsed || typeof parsed !== "object") {
-      return null;
-    }
-    if (typeof parsed.kind !== "string") {
-      return null;
-    }
-    if (typeof parsed.timestampMs !== "number") {
-      return null;
-    }
-    if (typeof parsed.revision !== "number") {
-      return null;
-    }
-    return {
-      kind: parsed.kind,
-      timestampMs: parsed.timestampMs,
-      revision: parsed.revision,
-      payload:
-        parsed.payload && typeof parsed.payload === "object" ? parsed.payload : {},
-    } as DaemonPushEvent;
-  } catch {
+function normalizePushEvent(raw: unknown): DaemonPushEvent | null {
+  if (!raw || typeof raw !== "object") {
     return null;
   }
+  const parsed = raw as Partial<DaemonPushEvent>;
+  if (typeof parsed.kind !== "string") {
+    return null;
+  }
+  if (typeof parsed.timestampMs !== "number") {
+    return null;
+  }
+  if (typeof parsed.revision !== "number") {
+    return null;
+  }
+  return {
+    kind: parsed.kind,
+    timestampMs: parsed.timestampMs,
+    revision: parsed.revision,
+    payload:
+      parsed.payload && typeof parsed.payload === "object" ? parsed.payload : {},
+  } as DaemonPushEvent;
 }
 
 function createTransportEvent(status: TransportStatus): DaemonPushEvent {
@@ -55,47 +52,61 @@ function createTransportEvent(status: TransportStatus): DaemonPushEvent {
 }
 
 class DaemonTransportManager {
-  private socket: WebSocket | null = null;
-
-  private reconnectTimer: number | null = null;
-
-  private shouldRun = false;
-
-  private reconnectAttempts = 0;
-
   private lastRevision = 0;
 
   private recoveryInFlight = false;
 
   private listeners = new Set<PushListener>();
 
-  private status: TransportStatus = {
-    state: "connecting",
-    daemonReachable: false,
-    pushConnected: false,
-    consecutiveFailures: 0,
-    timestampMs: Date.now(),
-  };
+  private client = new LoopbackRpcClient({
+    name: "desktop-daemon",
+    bootstrap: async () => invokeDesktopTransportBootstrap(),
+    reconnectBaseDelayMs,
+    reconnectMaxDelayMs,
+  });
+
+  constructor() {
+    this.client.subscribeEvent((eventType, payload) => {
+      if (eventType !== "daemonPush") {
+        return;
+      }
+      const pushEvent = normalizePushEvent(payload);
+      if (!pushEvent) {
+        return;
+      }
+      if (pushEvent.revision > 0 && pushEvent.revision < this.lastRevision) {
+        return;
+      }
+      if (
+        pushEvent.kind === "snapshot_changed" &&
+        pushEvent.revision > 0 &&
+        pushEvent.revision <= this.lastRevision
+      ) {
+        return;
+      }
+      if (pushEvent.revision > this.lastRevision) {
+        this.lastRevision = pushEvent.revision;
+      }
+      if (pushEvent.payload.snapshot) {
+        void syncLinuxSystemProxyFromSnapshot(pushEvent.payload.snapshot);
+      }
+      this.broadcast(pushEvent);
+    });
+    this.client.subscribeStatus((status) => {
+      this.broadcast(createTransportEvent(status));
+      const failureCount = Math.max(0, Number(status.consecutiveFailures ?? 0));
+      if (failureCount >= packagedRecoveryFailureThreshold) {
+        void this.maybeRecoverDaemon();
+      }
+    });
+  }
 
   start(): void {
-    if (this.shouldRun) {
-      return;
-    }
-    this.shouldRun = true;
-    this.updateStatus({
-      state: "connecting",
-      lastError: "",
-    });
-    this.connectPush();
+    this.client.start();
   }
 
   stop(): void {
-    this.shouldRun = false;
-    this.clearReconnectTimer();
-    if (this.socket) {
-      this.socket.close();
-      this.socket = null;
-    }
+    this.client.stop("桌面端内核连接已关闭");
   }
 
   subscribe(listener: PushListener): () => void {
@@ -106,148 +117,45 @@ class DaemonTransportManager {
   }
 
   getStatus(): TransportStatus {
-    return { ...this.status };
+    return this.client.getStatus();
   }
 
   async request(payload: DaemonRequestPayload): Promise<DaemonResponsePayload> {
-    const response = await requestDaemon(payload);
-    if (response.snapshot) {
-      void syncLinuxSystemProxyFromSnapshot(response.snapshot);
-    }
-    if (response.ok) {
-      this.markRequestSuccess();
+    this.start();
+    try {
+      const response = await this.client.call<DaemonResponsePayload>("daemon.request", payload);
+      if (response.snapshot) {
+        void syncLinuxSystemProxyFromSnapshot(response.snapshot);
+      }
       return {
         ...response,
         transport: this.getStatus(),
       };
-    }
-
-    this.markFailure(response.error ?? `内核请求失败：${payload.method} ${payload.path}`);
-    return {
-      ...response,
-      transport: this.getStatus(),
-    };
-  }
-
-  private connectPush(): void {
-    if (!this.shouldRun || this.socket) {
-      return;
-    }
-
-    const ws = new WebSocket(getDaemonWebSocketURL());
-    this.socket = ws;
-    this.updateStatus({
-      state: this.status.daemonReachable ? "degraded" : "connecting",
-    });
-
-    ws.addEventListener("open", () => {
-      this.reconnectAttempts = 0;
-      this.lastRevision = 0;
-      this.updateStatus({
-        daemonReachable: true,
-        pushConnected: true,
-        state: "online",
-        lastError: "",
-        lastSuccessAtMs: Date.now(),
-        consecutiveFailures: 0,
-      });
-    });
-
-    ws.addEventListener("message", (event) => {
-      void this.handleMessage(event);
-    });
-
-    ws.addEventListener("close", () => {
-      if (this.socket === ws) {
-        this.socket = null;
+    } catch (error) {
+      try {
+        const fallback = await requestDaemon(payload);
+        if (fallback.snapshot) {
+          void syncLinuxSystemProxyFromSnapshot(fallback.snapshot);
+        }
+        return {
+          ...fallback,
+          transport: this.getStatus(),
+        };
+      } catch {
+        return {
+          ok: false,
+          error:
+            error instanceof Error && error.message.trim() !== ""
+              ? error.message
+              : `内核请求失败：${payload.method} ${payload.path}`,
+          transport: this.getStatus(),
+        };
       }
-      if (!this.shouldRun) {
-        return;
-      }
-      this.markFailure(this.status.lastError || "内核推送连接已断开");
-      this.updateStatus({
-        pushConnected: false,
-        state: this.status.daemonReachable ? "degraded" : "offline",
-      });
-      void this.maybeRecoverDaemon();
-      this.scheduleReconnect();
-    });
-
-    ws.addEventListener("error", () => {
-      if (!this.shouldRun) {
-        return;
-      }
-      this.markFailure("内核推送连接失败");
-    });
-  }
-
-  private async handleMessage(event: MessageEvent): Promise<void> {
-    const raw =
-      typeof event.data === "string"
-        ? event.data
-        : event.data instanceof Blob
-          ? await event.data.text()
-          : String(event.data ?? "");
-    const pushEvent = parsePushEvent(raw);
-    if (!pushEvent) {
-      return;
-    }
-    if (pushEvent.revision > 0 && pushEvent.revision < this.lastRevision) {
-      return;
-    }
-    if (
-      pushEvent.kind === "snapshot_changed" &&
-      pushEvent.revision > 0 &&
-      pushEvent.revision <= this.lastRevision
-    ) {
-      return;
-    }
-    if (pushEvent.revision > this.lastRevision) {
-      this.lastRevision = pushEvent.revision;
-    }
-    this.markPushSuccess();
-    if (pushEvent.payload.snapshot) {
-      void syncLinuxSystemProxyFromSnapshot(pushEvent.payload.snapshot);
-    }
-    this.broadcast(pushEvent);
-  }
-
-  private markRequestSuccess(): void {
-    this.updateStatus({
-      daemonReachable: true,
-      lastError: "",
-      lastSuccessAtMs: Date.now(),
-      consecutiveFailures: 0,
-      state: this.status.pushConnected ? "online" : "degraded",
-    });
-    if (!this.socket && this.shouldRun) {
-      this.connectPush();
     }
   }
 
-  private markPushSuccess(): void {
-    this.updateStatus({
-      daemonReachable: true,
-      pushConnected: true,
-      lastError: "",
-      lastSuccessAtMs: Date.now(),
-      consecutiveFailures: 0,
-      state: "online",
-    });
-  }
-
-  private markFailure(message: string): void {
-    const nextFailures =
-      Math.max(0, Number(this.status.consecutiveFailures ?? 0)) + 1;
-    this.updateStatus({
-      lastError: message,
-      consecutiveFailures: nextFailures,
-      state: this.status.pushConnected ? "degraded" : "offline",
-      daemonReachable: this.status.pushConnected,
-    });
-    if (nextFailures >= packagedRecoveryFailureThreshold) {
-      void this.maybeRecoverDaemon();
-    }
+  abortPendingRequests(): void {
+    this.client.abortPendingRequests("当前页面已取消等待，已中止挂起的内核请求");
   }
 
   private async maybeRecoverDaemon(): Promise<void> {
@@ -261,48 +169,6 @@ class DaemonTransportManager {
       // Keep recovery best-effort.
     } finally {
       this.recoveryInFlight = false;
-    }
-  }
-
-  private scheduleReconnect(): void {
-    if (!this.shouldRun || this.reconnectTimer !== null) {
-      return;
-    }
-    const delay = Math.min(
-      reconnectBaseDelayMs * 2 ** this.reconnectAttempts,
-      reconnectMaxDelayMs,
-    );
-    this.reconnectAttempts += 1;
-    this.reconnectTimer = window.setTimeout(() => {
-      this.reconnectTimer = null;
-      this.connectPush();
-    }, delay);
-  }
-
-  private clearReconnectTimer(): void {
-    if (this.reconnectTimer === null) {
-      return;
-    }
-    window.clearTimeout(this.reconnectTimer);
-    this.reconnectTimer = null;
-  }
-
-  private updateStatus(next: Partial<TransportStatus>): void {
-    const merged: TransportStatus = {
-      ...this.status,
-      ...next,
-      timestampMs: Date.now(),
-    };
-    const changed =
-      merged.state !== this.status.state ||
-      merged.daemonReachable !== this.status.daemonReachable ||
-      merged.pushConnected !== this.status.pushConnected ||
-      merged.lastError !== this.status.lastError ||
-      merged.consecutiveFailures !== this.status.consecutiveFailures ||
-      merged.lastSuccessAtMs !== this.status.lastSuccessAtMs;
-    this.status = merged;
-    if (changed) {
-      this.broadcast(createTransportEvent(merged));
     }
   }
 

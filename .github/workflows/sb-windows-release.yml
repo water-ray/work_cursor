@@ -6,7 +6,7 @@ on:
       sing_box_ref:
         description: "sing-box tag/branch/commit"
         required: true
-        default: "dev-next"
+        default: "v1.13.2"
         type: string
       release_tag:
         description: "Release tag (optional)"
@@ -44,9 +44,9 @@ jobs:
           set -euo pipefail
           if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
             release_tag="${GITHUB_REF_NAME}"
-            sb_ref="dev-next"
+            sb_ref="v1.13.2"
           else
-            sb_ref="${INPUT_SB_REF:-dev-next}"
+            sb_ref="${INPUT_SB_REF:-v1.13.2}"
             release_tag="${INPUT_RELEASE_TAG}"
             if [[ -z "${release_tag}" ]]; then
               release_tag="sb-win-$(date +%Y%m%d-%H%M%S)"

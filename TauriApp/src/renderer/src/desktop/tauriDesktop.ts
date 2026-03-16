@@ -16,7 +16,6 @@ import type {
 } from "@shared/daemon";
 import type { PlatformUpdateState, WaterayPlatformAdapter } from "../platform/adapterTypes";
 
-import { abortPendingDaemonRequests } from "./daemonClient";
 import { daemonTransportManager } from "./daemonTransportManager";
 import { destroyTray, ensureTray, restoreMainWindow } from "./tray";
 
@@ -203,7 +202,7 @@ function createDesktopApi(): WaterayDesktopApi {
       request: (payload: DaemonRequestPayload): Promise<DaemonResponsePayload> =>
         daemonTransportManager.request(payload),
       abortPendingRequests: async (): Promise<void> => {
-        abortPendingDaemonRequests();
+        daemonTransportManager.abortPendingRequests();
       },
       getTransportStatus: async (): Promise<TransportStatus> =>
         daemonTransportManager.getStatus(),

@@ -2,7 +2,9 @@ package com.wateray.desktop.mobilehost
 
 import android.app.Activity
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.VpnService
+import android.os.Build
 import android.os.SystemClock
 import android.util.Log
 import android.webkit.WebView
@@ -15,6 +17,9 @@ import app.tauri.annotation.InvokeArg
 import app.tauri.annotation.TauriPlugin
 import app.tauri.plugin.Invoke
 import app.tauri.plugin.Plugin
+import com.google.gson.Gson
+import com.google.gson.JsonElement
+import com.google.gson.JsonObject
 import io.nekohasekai.libbox.Libbox
 
 @InvokeArg
@@ -22,6 +27,10 @@ class MobileHostStartArgs {
   lateinit var configJson: String
   var profileName: String? = null
   var mode: String? = null
+  var trafficMonitorIntervalSec: Int? = null
+  var runtimeApplyOperation: String? = null
+  var runtimeApplyStrategy: String? = null
+  var changeSetSummary: String? = null
 }
 
 @InvokeArg
@@ -30,9 +39,17 @@ class MobileHostCheckConfigArgs {
 }
 
 @InvokeArg
+class MobileHostStopArgs {
+  var runtimeApplyOperation: String? = null
+  var runtimeApplyStrategy: String? = null
+  var changeSetSummary: String? = null
+}
+
+@InvokeArg
 class MobileHostProbeConfigArgs {
   lateinit var nodeId: String
   lateinit var configJson: String
+  var probeTypes: Array<String>? = null
 }
 
 @InvokeArg
@@ -69,6 +86,9 @@ class MobileHostSelectorSelectionArgs {
 class MobileHostSwitchSelectorsArgs {
   var selections: Array<MobileHostSelectorSelectionArgs>? = null
   var closeConnections: Boolean? = null
+  var runtimeApplyOperation: String? = null
+  var runtimeApplyStrategy: String? = null
+  var changeSetSummary: String? = null
 }
 
 @InvokeArg
@@ -83,6 +103,11 @@ class MobileHostDnsHealthArgs {
   var timeoutMs: Int? = null
 }
 
+data class MobileHostVersionsResult(
+  val waterayVersion: String,
+  val singBoxVersion: String,
+)
+
 @TauriPlugin
 class MobileHostPlugin(private val activity: Activity) : Plugin(activity) {
   companion object {
@@ -91,39 +116,40 @@ class MobileHostPlugin(private val activity: Activity) : Plugin(activity) {
     private const val VPN_PERMISSION_CONFIRM_POLL_INTERVAL_MS = 100L
   }
 
+  private val gson = Gson()
   private var pendingPrepareInvoke: Invoke? = null
   private var prepareFlowLaunched = false
 
   override fun load(webView: WebView) {
     Log.d(TAG, "plugin loaded")
-    MobileHostBridge.refreshPermission(activity.applicationContext)
-    MobileHostBridge.attachStatusEmitter { status ->
+    MobileHostLoopbackServer.configure { command, payload ->
+      handleLoopbackCommand(command, payload)
+    }
+    MobileRuntimeCoordinator.refreshPermission(activity.applicationContext)
+    MobileRuntimeCoordinator.attachStatusEmitter { status ->
+      MobileHostLoopbackServer.broadcastStatusChanged(status)
       activity.runOnUiThread {
         triggerObject("statusChanged", status)
       }
     }
-    MobileHostBridge.attachTaskQueueEmitter { taskQueue ->
+    MobileRuntimeCoordinator.attachPushEmitter { event ->
+      MobileHostLoopbackServer.broadcastDaemonPush(event)
       activity.runOnUiThread {
-        triggerObject("taskQueueChanged", taskQueue)
-      }
-    }
-    MobileHostBridge.attachProbeResultEmitter { payload ->
-      activity.runOnUiThread {
-        triggerObject("probeResultPatch", payload)
+        triggerObject("daemonPush", event)
       }
     }
   }
 
   override fun onResume() {
     Log.d(TAG, "activity resumed")
-    MobileHostBridge.refreshPermission(activity.applicationContext)
+    MobileRuntimeCoordinator.refreshPermission(activity.applicationContext)
     consumePendingPrepareIfNeeded()
   }
 
   override fun onDestroy() {
     clearPendingPrepare()
       ?.reject("VPN 授权请求已取消")
-    MobileHostBridge.clearEmitters()
+    MobileRuntimeCoordinator.clearEmitters()
   }
 
   private fun canLaunchVpnPermission(): Boolean {
@@ -150,7 +176,7 @@ class MobileHostPlugin(private val activity: Activity) : Plugin(activity) {
   }
 
   private fun resolvePrepareResult(invoke: Invoke, granted: Boolean) {
-    val status = MobileHostBridge.refreshPermission(activity.applicationContext)
+    val status = MobileRuntimeCoordinator.refreshPermission(activity.applicationContext)
     invoke.resolveObject(
       PrepareVpnResult(
         granted = granted,
@@ -161,6 +187,44 @@ class MobileHostPlugin(private val activity: Activity) : Plugin(activity) {
 
   private fun isVpnPermissionGranted(): Boolean {
     return VpnService.prepare(activity) == null
+  }
+
+  private fun resolveWaterayVersion(): String {
+    return try {
+      val packageInfo =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+          activity.packageManager.getPackageInfo(
+            activity.packageName,
+            PackageManager.PackageInfoFlags.of(0),
+          )
+        } else {
+          @Suppress("DEPRECATION")
+          activity.packageManager.getPackageInfo(activity.packageName, 0)
+        }
+      packageInfo.versionName?.trim()
+        ?.takeUnless { it.isEmpty() }
+        ?: "unknown"
+    } catch (_: Exception) {
+      "unknown"
+    }
+  }
+
+  private fun resolveSingBoxVersion(): String {
+    val directVersion =
+      try {
+        Libbox.version().trim()
+      } catch (_: Exception) {
+        ""
+      }
+    if (directVersion.isNotEmpty()) {
+      return directVersion
+    }
+    return try {
+      WaterayVpnService.ensureLibboxSetup(activity.applicationContext)
+      Libbox.version().trim()
+    } catch (_: Exception) {
+      ""
+    }
   }
 
   private fun awaitVpnPermissionGrant(timeoutMs: Long = VPN_PERMISSION_CONFIRM_TIMEOUT_MS): Boolean {
@@ -238,12 +302,36 @@ class MobileHostPlugin(private val activity: Activity) : Plugin(activity) {
     }
   }
 
+  private fun resolveRuntimeApplyRequest(
+    operation: String?,
+    strategy: String?,
+    changeSetSummary: String?,
+  ): MobileRuntimeApplyRequest? {
+    val normalizedOperation = operation?.trim().orEmpty()
+    val normalizedStrategy = strategy?.trim().orEmpty()
+    val normalizedSummary = changeSetSummary?.trim().orEmpty()
+    if (normalizedOperation.isEmpty() || normalizedStrategy.isEmpty() || normalizedSummary.isEmpty()) {
+      return null
+    }
+    return MobileRuntimeApplyRequest(
+      operation = normalizedOperation,
+      strategy = normalizedStrategy,
+      changeSetSummary = normalizedSummary,
+    )
+  }
+
   private fun resolveProbeConfigs(
     configArgs: Array<MobileHostProbeConfigArgs>?,
     requireConfigJson: Boolean = true,
   ): List<MobileProbeConfig> {
     return configArgs
-      ?.map { MobileProbeConfig(nodeId = it.nodeId, configJson = it.configJson) }
+      ?.map {
+        MobileProbeConfig(
+          nodeId = it.nodeId,
+          configJson = it.configJson,
+          probeTypes = it.probeTypes?.toList().orEmpty(),
+        )
+      }
       ?.filter {
         it.nodeId.trim().isNotEmpty() &&
           (!requireConfigJson || it.configJson.trim().isNotEmpty())
@@ -251,9 +339,290 @@ class MobileHostPlugin(private val activity: Activity) : Plugin(activity) {
       .orEmpty()
   }
 
+  private fun <T> parseLoopbackPayload(payload: JsonElement?, clazz: Class<T>): T {
+    return gson.fromJson(payload ?: JsonObject(), clazz)
+  }
+
+  private fun performGetStatus(): MobileHostStatus {
+    return MobileRuntimeCoordinator.refreshPermission(activity.applicationContext)
+  }
+
+  private fun performGetVersions(): MobileHostVersionsResult {
+    return MobileHostVersionsResult(
+      waterayVersion = resolveWaterayVersion(),
+      singBoxVersion = resolveSingBoxVersion(),
+    )
+  }
+
+  private fun performCheckConfig(args: MobileHostCheckConfigArgs): CheckConfigResult {
+    val configJson = args.configJson.trim()
+    if (configJson.isEmpty()) {
+      throw IllegalArgumentException("移动端配置不能为空")
+    }
+    Log.d(TAG, "checkConfig invoked")
+    WaterayVpnService.ensureLibboxSetup(activity.applicationContext)
+    Libbox.checkConfig(configJson)
+    val status = MobileRuntimeCoordinator.markNativeReady()
+    Log.d(TAG, "checkConfig passed")
+    return CheckConfigResult(
+      ok = true,
+      version = Libbox.version(),
+      status = status,
+    )
+  }
+
+  private fun performStart(args: MobileHostStartArgs): MobileHostStatus {
+    val configJson = args.configJson.trim()
+    if (configJson.isEmpty()) {
+      throw IllegalArgumentException("移动端配置不能为空")
+    }
+
+    WaterayVpnService.ensureLibboxSetup(activity.applicationContext)
+    Libbox.checkConfig(configJson)
+
+    val startMode = resolveStartMode(args.mode)
+    Log.i(TAG, "start requested, mode=$startMode")
+
+    if (startMode == "tun" && VpnService.prepare(activity) != null) {
+      MobileRuntimeCoordinator.refreshPermission(activity.applicationContext)
+      throw IllegalStateException("请先授权 Android VPN 权限")
+    }
+
+    val profileName = args.profileName?.trim()
+      ?.takeUnless { it.isEmpty() }
+      ?: "Wateray Mobile"
+    val status = MobileRuntimeCoordinator.setStarting(
+      profileName = profileName,
+      configJson = configJson,
+      runtimeMode = startMode,
+      trafficIntervalSec = args.trafficMonitorIntervalSec ?: 0,
+      request = resolveRuntimeApplyRequest(
+        operation = args.runtimeApplyOperation,
+        strategy = args.runtimeApplyStrategy,
+        changeSetSummary = args.changeSetSummary,
+      ),
+    )
+    WaterayVpnService.startService(
+      activity.applicationContext,
+      configJson,
+      profileName,
+      startMode,
+    )
+    return status
+  }
+
+  private fun performStop(request: MobileHostStopArgs? = null): MobileHostStatus {
+    Log.i(TAG, "stop requested")
+    MobileRuntimeCoordinator.setStopping(
+      message = "移动端宿主正在停止",
+      request = resolveRuntimeApplyRequest(
+        operation = request?.runtimeApplyOperation ?: "stop_connection",
+        strategy = request?.runtimeApplyStrategy ?: "fast_restart",
+        changeSetSummary = request?.changeSetSummary ?: "mobile_stop",
+      ),
+    )
+    WaterayVpnService.stopService(activity.applicationContext)
+    return MobileRuntimeCoordinator.snapshotStatus()
+  }
+
+  private fun performClearDnsCache(): MobileHostStatus {
+    val operation = MobileRuntimeCoordinator.beginImmediateOperation(
+      type = "clear_dns_cache",
+      title = "清理 DNS 缓存",
+    )
+    try {
+      val status = MobileRuntimeCoordinator.snapshotStatus()
+      val result = MobileRuntimeController.clearDnsCache(
+        context = activity.applicationContext,
+        flushFakeIp = status.serviceRunning,
+      )
+      if (result.cacheFileBusy) {
+        Log.w(
+          TAG,
+          "dns cache file is still in use, path=${result.cacheFilePath}",
+        )
+      }
+      val nextStatus = MobileRuntimeCoordinator.refreshPermission(activity.applicationContext)
+      MobileRuntimeCoordinator.finishImmediateOperation(operation, success = true)
+      return nextStatus
+    } catch (ex: Exception) {
+      val message = ex.message ?: "移动端清理 DNS 缓存失败"
+      MobileRuntimeCoordinator.finishImmediateOperation(operation, success = false, error = message)
+      throw ex
+    }
+  }
+
+  private fun performProbe(args: MobileHostProbeArgs): MobileProbeResult {
+    val configs = resolveProbeConfigs(args.configs, requireConfigJson = false)
+    if (configs.isEmpty()) {
+      throw IllegalArgumentException("移动端探测配置不能为空")
+    }
+    val status = MobileRuntimeCoordinator.snapshotStatus()
+    if (!status.serviceRunning || !status.tunReady) {
+      throw IllegalStateException("安卓端仅支持在 VPN 代理已启动后执行节点探测")
+    }
+
+    Log.d(TAG, "probe invoked, nodes=${configs.size}")
+    WaterayVpnService.ensureLibboxSetup(activity.applicationContext)
+    return MobileProbeRunner.run(
+      context = activity.applicationContext,
+      configs = configs,
+      probeTypes = args.probeTypes?.toList().orEmpty(),
+      latencyUrl = args.latencyUrl,
+      realConnectUrl = args.realConnectUrl,
+      timeoutMs = args.timeoutMs,
+    )
+  }
+
+  private fun performProbeStart(args: MobileHostProbeStartArgs): MobileProbeTaskStartResult {
+    val configs = resolveProbeConfigs(args.configs, requireConfigJson = false)
+    if (configs.isEmpty()) {
+      throw IllegalArgumentException("移动端探测配置不能为空")
+    }
+    val status = MobileRuntimeCoordinator.snapshotStatus()
+    if (!status.serviceRunning || !status.tunReady) {
+      throw IllegalStateException("安卓端仅支持在 VPN 代理已启动后执行节点探测")
+    }
+    val result = MobileTaskCenter.enqueueProbeTask(
+      context = activity.applicationContext,
+      request = MobileProbeTaskRequest(
+        groupId = args.groupId?.trim().orEmpty(),
+        configs = configs,
+        probeTypes = args.probeTypes?.toList().orEmpty(),
+        runtimeGeneration = status.runtimeGeneration,
+        configDigest = status.configDigest,
+        latencyUrl = args.latencyUrl,
+        realConnectUrl = args.realConnectUrl,
+        timeoutMs = args.timeoutMs,
+      ),
+    )
+    Log.i(TAG, "probeStart queued nodes=${configs.size} taskId=${result.task.id}")
+    return result
+  }
+
+  private fun performProbeCancel(args: MobileHostProbeCancelArgs): MobileTaskQueueResult {
+    return MobileTaskCenter.cancelTask(args.taskId)
+  }
+
+  private fun performGetTaskQueue(): MobileTaskQueueResult {
+    return MobileTaskCenter.queueSnapshot()
+  }
+
+  private fun performSwitchSelectors(args: MobileHostSwitchSelectorsArgs): SwitchSelectorsResult {
+    val selections = args.selections
+      ?.map {
+        MobileSelectorSwitchSelection(
+          selectorTag = it.selectorTag.trim(),
+          outboundTag = it.outboundTag.trim(),
+        )
+      }
+      ?.filter { it.selectorTag.isNotEmpty() && it.outboundTag.isNotEmpty() }
+      .orEmpty()
+    if (selections.isEmpty()) {
+      throw IllegalArgumentException("移动端 selector 热切目标不能为空")
+    }
+    val request = resolveRuntimeApplyRequest(
+      operation = args.runtimeApplyOperation,
+      strategy = args.runtimeApplyStrategy,
+      changeSetSummary = args.changeSetSummary,
+    )
+    val status = MobileRuntimeCoordinator.snapshotStatus()
+    if (!status.serviceRunning) {
+      throw IllegalStateException("移动端代理未运行，无法执行 selector 热切")
+    }
+
+    Log.d(TAG, "switchSelectors invoked, selections=${selections.size}")
+    WaterayVpnService.ensureLibboxSetup(activity.applicationContext)
+    MobileRuntimeCoordinator.beginRuntimeApplyRequest(request)
+    try {
+      val appliedCount = MobileSelectorSwitchRunner.run(
+        context = activity.applicationContext,
+        selections = selections,
+        closeConnections = args.closeConnections == true,
+      )
+      val nextStatus = MobileRuntimeCoordinator.refreshPermission(activity.applicationContext)
+      MobileRuntimeCoordinator.completeRuntimeApplyRequest(
+        success = true,
+        status = nextStatus,
+      )
+      return SwitchSelectorsResult(
+        appliedCount = appliedCount,
+        status = nextStatus,
+      )
+    } catch (ex: Exception) {
+      val message = ex.message ?: "移动端 selector 热切失败"
+      MobileRuntimeCoordinator.completeRuntimeApplyRequest(
+        success = false,
+        status = MobileRuntimeCoordinator.snapshotStatus(),
+        error = message,
+      )
+      throw ex
+    }
+  }
+
+  private fun performDnsHealth(args: MobileHostDnsHealthArgs): MobileDnsHealthCheckResult {
+    if (args.viaService == true) {
+      val status = MobileRuntimeCoordinator.snapshotStatus()
+      if (!status.serviceRunning || !status.tunReady) {
+        throw IllegalStateException("移动端代理未运行，无法通过活动服务执行 DNS 健康检查")
+      }
+    }
+    return MobileDnsHealthRunner.run(
+      MobileDnsHealthCheckConfig(
+        type = args.type,
+        address = args.address,
+        port = args.port,
+        path = args.path,
+        domain = args.domain,
+        viaService = args.viaService == true,
+        serviceSocksPort = args.serviceSocksPort,
+        timeoutMs = args.timeoutMs,
+      ),
+    )
+  }
+
+  private fun handleLoopbackCommand(command: String, payload: JsonElement?): Any? {
+    return when (command.trim()) {
+      "host.getStatus" -> performGetStatus()
+      "host.getVersions" -> performGetVersions()
+      "host.checkConfig" -> performCheckConfig(parseLoopbackPayload(payload, MobileHostCheckConfigArgs::class.java))
+      "host.start" -> performStart(parseLoopbackPayload(payload, MobileHostStartArgs::class.java))
+      "host.stop" -> performStop(parseLoopbackPayload(payload, MobileHostStopArgs::class.java))
+      "host.clearDnsCache" -> performClearDnsCache()
+      "host.probe" -> performProbe(parseLoopbackPayload(payload, MobileHostProbeArgs::class.java))
+      "host.probeStart" -> performProbeStart(parseLoopbackPayload(payload, MobileHostProbeStartArgs::class.java))
+      "host.probeCancel" -> performProbeCancel(parseLoopbackPayload(payload, MobileHostProbeCancelArgs::class.java))
+      "host.getTaskQueue" -> performGetTaskQueue()
+      "host.switchSelectors" -> performSwitchSelectors(parseLoopbackPayload(payload, MobileHostSwitchSelectorsArgs::class.java))
+      "host.dnsHealth" -> performDnsHealth(parseLoopbackPayload(payload, MobileHostDnsHealthArgs::class.java))
+      else -> throw IllegalArgumentException("不支持的移动端 loopback 命令: $command")
+    }
+  }
+
+  @Command
+  fun bootstrap(invoke: Invoke) {
+    try {
+      invoke.resolveObject(MobileHostLoopbackServer.ensureStarted())
+    } catch (ex: Exception) {
+      val message = ex.message ?: "移动端 loopback bootstrap 失败"
+      Log.e(TAG, message, ex)
+      invoke.reject(message, ex)
+    }
+  }
+
   @Command
   fun getStatus(invoke: Invoke) {
-    invoke.resolveObject(MobileHostBridge.refreshPermission(activity.applicationContext))
+    invoke.resolveObject(MobileRuntimeCoordinator.refreshPermission(activity.applicationContext))
+  }
+
+  @Command
+  fun getVersions(invoke: Invoke) {
+    invoke.resolveObject(
+      MobileHostVersionsResult(
+        waterayVersion = resolveWaterayVersion(),
+        singBoxVersion = resolveSingBoxVersion(),
+      ),
+    )
   }
 
   @Command
@@ -311,7 +680,7 @@ class MobileHostPlugin(private val activity: Activity) : Plugin(activity) {
       Log.d(TAG, "checkConfig invoked")
       WaterayVpnService.ensureLibboxSetup(activity.applicationContext)
       Libbox.checkConfig(configJson)
-      val status = MobileHostBridge.markNativeReady()
+      val status = MobileRuntimeCoordinator.markNativeReady()
       Log.d(TAG, "checkConfig passed")
       invoke.resolveObject(
         CheckConfigResult(
@@ -323,7 +692,7 @@ class MobileHostPlugin(private val activity: Activity) : Plugin(activity) {
     } catch (ex: Exception) {
       val message = ex.message ?: "移动端配置校验失败"
       Log.e(TAG, message, ex)
-      MobileHostBridge.setError(message)
+      MobileRuntimeCoordinator.setError(message)
       invoke.reject(message, ex)
     }
   }
@@ -345,7 +714,7 @@ class MobileHostPlugin(private val activity: Activity) : Plugin(activity) {
       Log.i(TAG, "start requested, mode=$startMode")
 
       if (startMode == "tun" && VpnService.prepare(activity) != null) {
-        MobileHostBridge.refreshPermission(activity.applicationContext)
+        MobileRuntimeCoordinator.refreshPermission(activity.applicationContext)
         invoke.reject("请先授权 Android VPN 权限", "VPN_PERMISSION_REQUIRED")
         return
       }
@@ -353,7 +722,17 @@ class MobileHostPlugin(private val activity: Activity) : Plugin(activity) {
       val profileName = args.profileName?.trim()
         ?.takeUnless { it.isEmpty() }
         ?: "Wateray Mobile"
-      val status = MobileHostBridge.setStarting(profileName, configJson, startMode)
+      val status = MobileRuntimeCoordinator.setStarting(
+        profileName = profileName,
+        configJson = configJson,
+        runtimeMode = startMode,
+        trafficIntervalSec = args.trafficMonitorIntervalSec ?: 0,
+        request = resolveRuntimeApplyRequest(
+          operation = args.runtimeApplyOperation,
+          strategy = args.runtimeApplyStrategy,
+          changeSetSummary = args.changeSetSummary,
+        ),
+      )
       WaterayVpnService.startService(
         activity.applicationContext,
         configJson,
@@ -364,24 +743,38 @@ class MobileHostPlugin(private val activity: Activity) : Plugin(activity) {
     } catch (ex: Exception) {
       val message = ex.message ?: "移动端宿主启动失败"
       Log.e(TAG, message, ex)
-      MobileHostBridge.setError(message)
+      MobileRuntimeCoordinator.setError(message)
       invoke.reject(message, ex)
     }
   }
 
   @Command
   fun stop(invoke: Invoke) {
+    val request = runCatching {
+      invoke.parseArgs(MobileHostStopArgs::class.java)
+    }.getOrNull()
     Log.i(TAG, "stop requested")
-    MobileHostBridge.setStopping("移动端宿主正在停止")
+    MobileRuntimeCoordinator.setStopping(
+      message = "移动端宿主正在停止",
+      request = resolveRuntimeApplyRequest(
+        operation = request?.runtimeApplyOperation ?: "stop_connection",
+        strategy = request?.runtimeApplyStrategy ?: "fast_restart",
+        changeSetSummary = request?.changeSetSummary ?: "mobile_stop",
+      ),
+    )
     WaterayVpnService.stopService(activity.applicationContext)
-    invoke.resolveObject(MobileHostBridge.snapshot())
+    invoke.resolveObject(MobileRuntimeCoordinator.snapshotStatus())
   }
 
   @Command
   fun clearDnsCache(invoke: Invoke) {
     Thread {
+      val operation = MobileRuntimeCoordinator.beginImmediateOperation(
+        type = "clear_dns_cache",
+        title = "清理 DNS 缓存",
+      )
       try {
-        val status = MobileHostBridge.snapshot()
+        val status = MobileRuntimeCoordinator.snapshotStatus()
         val result = MobileRuntimeController.clearDnsCache(
           context = activity.applicationContext,
           flushFakeIp = status.serviceRunning,
@@ -392,10 +785,13 @@ class MobileHostPlugin(private val activity: Activity) : Plugin(activity) {
             "dns cache file is still in use, path=${result.cacheFilePath}",
           )
         }
-        invoke.resolveObject(MobileHostBridge.refreshPermission(activity.applicationContext))
+        val nextStatus = MobileRuntimeCoordinator.refreshPermission(activity.applicationContext)
+        MobileRuntimeCoordinator.finishImmediateOperation(operation, success = true)
+        invoke.resolveObject(nextStatus)
       } catch (ex: Exception) {
         val message = ex.message ?: "移动端清理 DNS 缓存失败"
         Log.e(TAG, message, ex)
+        MobileRuntimeCoordinator.finishImmediateOperation(operation, success = false, error = message)
         invoke.reject(message, ex)
       }
     }.start()
@@ -406,12 +802,12 @@ class MobileHostPlugin(private val activity: Activity) : Plugin(activity) {
     Thread {
       try {
         val args = invoke.parseArgs(MobileHostProbeArgs::class.java)
-        val configs = resolveProbeConfigs(args.configs)
+        val configs = resolveProbeConfigs(args.configs, requireConfigJson = false)
         if (configs.isEmpty()) {
           invoke.reject("移动端探测配置不能为空")
           return@Thread
         }
-        val status = MobileHostBridge.snapshot()
+        val status = MobileRuntimeCoordinator.snapshotStatus()
         if (!status.serviceRunning || !status.tunReady) {
           invoke.reject("安卓端仅支持在 VPN 代理已启动后执行节点探测")
           return@Thread
@@ -446,7 +842,7 @@ class MobileHostPlugin(private val activity: Activity) : Plugin(activity) {
         invoke.reject("移动端探测配置不能为空")
         return
       }
-      val status = MobileHostBridge.snapshot()
+      val status = MobileRuntimeCoordinator.snapshotStatus()
       if (!status.serviceRunning || !status.tunReady) {
         invoke.reject("安卓端仅支持在 VPN 代理已启动后执行节点探测")
         return
@@ -457,6 +853,8 @@ class MobileHostPlugin(private val activity: Activity) : Plugin(activity) {
           groupId = args.groupId?.trim().orEmpty(),
           configs = configs,
           probeTypes = args.probeTypes?.toList().orEmpty(),
+          runtimeGeneration = status.runtimeGeneration,
+          configDigest = status.configDigest,
           latencyUrl = args.latencyUrl,
           realConnectUrl = args.realConnectUrl,
           timeoutMs = args.timeoutMs,
@@ -507,7 +905,12 @@ class MobileHostPlugin(private val activity: Activity) : Plugin(activity) {
           invoke.reject("移动端 selector 热切目标不能为空")
           return@Thread
         }
-        val status = MobileHostBridge.snapshot()
+        val request = resolveRuntimeApplyRequest(
+          operation = args.runtimeApplyOperation,
+          strategy = args.runtimeApplyStrategy,
+          changeSetSummary = args.changeSetSummary,
+        )
+        val status = MobileRuntimeCoordinator.snapshotStatus()
         if (!status.serviceRunning) {
           invoke.reject("移动端代理未运行，无法执行 selector 热切")
           return@Thread
@@ -515,20 +918,31 @@ class MobileHostPlugin(private val activity: Activity) : Plugin(activity) {
 
         Log.d(TAG, "switchSelectors invoked, selections=${selections.size}")
         WaterayVpnService.ensureLibboxSetup(activity.applicationContext)
+        MobileRuntimeCoordinator.beginRuntimeApplyRequest(request)
         val appliedCount = MobileSelectorSwitchRunner.run(
           context = activity.applicationContext,
           selections = selections,
           closeConnections = args.closeConnections == true,
         )
+        val nextStatus = MobileRuntimeCoordinator.refreshPermission(activity.applicationContext)
+        MobileRuntimeCoordinator.completeRuntimeApplyRequest(
+          success = true,
+          status = nextStatus,
+        )
         invoke.resolveObject(
           SwitchSelectorsResult(
             appliedCount = appliedCount,
-            status = MobileHostBridge.refreshPermission(activity.applicationContext),
+            status = nextStatus,
           ),
         )
       } catch (ex: Exception) {
         val message = ex.message ?: "移动端 selector 热切失败"
         Log.e(TAG, message, ex)
+        MobileRuntimeCoordinator.completeRuntimeApplyRequest(
+          success = false,
+          status = MobileRuntimeCoordinator.snapshotStatus(),
+          error = message,
+        )
         invoke.reject(message, ex)
       }
     }.start()
@@ -540,7 +954,7 @@ class MobileHostPlugin(private val activity: Activity) : Plugin(activity) {
       try {
         val args = invoke.parseArgs(MobileHostDnsHealthArgs::class.java)
         if (args.viaService == true) {
-          val status = MobileHostBridge.snapshot()
+          val status = MobileRuntimeCoordinator.snapshotStatus()
           if (!status.serviceRunning || !status.tunReady) {
             invoke.reject("移动端代理未运行，无法通过活动服务执行 DNS 健康检查")
             return@Thread

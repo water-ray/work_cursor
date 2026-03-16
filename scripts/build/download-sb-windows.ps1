@@ -2,7 +2,7 @@ param(
   [Parameter(Mandatory = $true)]
   [string]$Tag,
 
-  [string]$Repository = "water-ray/wateray",
+  [string]$Repository = "water-ray/wateray-src",
 
   [string]$OutputDir = "core/prebuilt/windows",
 

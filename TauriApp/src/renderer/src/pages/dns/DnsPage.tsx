@@ -42,7 +42,7 @@ interface DNSResolverServerPreset {
 
 const defaultDNSFakeIPV4Range = "10.128.0.0/9";
 const defaultDNSFakeIPV6Range = "fc00::/18";
-const defaultHealthDomain = "www.qq.com";
+const defaultHealthDomain = "www.baidu.com";
 const defaultHealthTimeoutMS = 5000;
 const defaultCustomHostsPlaceholder = [
   "127.0.0.1 localhost",
