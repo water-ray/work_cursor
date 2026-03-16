@@ -27,6 +27,7 @@ import { SwitchWithLabel } from "../../components/form/SwitchWithLabel";
 import { useAppNotice } from "../../components/notify/AppNoticeProvider";
 import { useDraftNavLock } from "../../hooks/useDraftNavLock";
 import { useDraftNotice } from "../../hooks/useDraftNotice";
+import { isMobileRuntime } from "../../platform/runtimeStore";
 import { daemonApi } from "../../services/daemonApi";
 
 type DNSResolverRole = "remote" | "direct" | "bootstrap";
@@ -41,7 +42,7 @@ interface DNSResolverServerPreset {
 
 const defaultDNSFakeIPV4Range = "10.128.0.0/9";
 const defaultDNSFakeIPV6Range = "fc00::/18";
-const defaultHealthDomain = "www.gstatic.com";
+const defaultHealthDomain = "www.qq.com";
 const defaultHealthTimeoutMS = 5000;
 const defaultCustomHostsPlaceholder = [
   "127.0.0.1 localhost",
@@ -460,6 +461,20 @@ function sanitizeConfig(input: DNSConfig): DNSConfig {
   };
 }
 
+function normalizeConfigForView(input: DNSConfig, mobileView: boolean): DNSConfig {
+  const sanitized = sanitizeConfig(input);
+  if (!mobileView) {
+    return sanitized;
+  }
+  return {
+    ...sanitized,
+    hosts: {
+      ...sanitized.hosts,
+      useSystemHosts: false,
+    },
+  };
+}
+
 function validateEndpoint(role: DNSResolverRole, endpoint: DNSResolverEndpoint): string[] {
   const issues: string[] = [];
   const type = endpoint.type;
@@ -531,9 +546,12 @@ function formatHealthReport(report: DNSHealthReport): string {
 }
 
 export function DnsPage({ snapshot, loading, runAction }: DaemonPageProps) {
+  const isMobileView = isMobileRuntime();
   const notice = useAppNotice();
   const draftNotice = useDraftNotice();
-  const [dnsConfig, setDnsConfig] = useState<DNSConfig>(() => buildDefaultDNSConfig());
+  const [dnsConfig, setDnsConfig] = useState<DNSConfig>(() =>
+    normalizeConfigForView(buildDefaultDNSConfig(), isMobileView),
+  );
   const [dnsDirty, setDnsDirty] = useState(false);
   const [applyingDNS, setApplyingDNS] = useState(false);
   const [clearingDNSCache, setClearingDNSCache] = useState(false);
@@ -550,8 +568,8 @@ export function DnsPage({ snapshot, loading, runAction }: DaemonPageProps) {
     if (!snapshot?.dns || dnsDirty) {
       return;
     }
-    setDnsConfig(sanitizeConfig(cloneDNSConfig(snapshot.dns)));
-  }, [snapshot, dnsDirty]);
+    setDnsConfig(normalizeConfigForView(cloneDNSConfig(snapshot.dns), isMobileView));
+  }, [snapshot, dnsDirty, isMobileView]);
 
   const validationIssues = useMemo(() => validateConfig(sanitizeConfig(dnsConfig)), [dnsConfig]);
   const conflictHints = useMemo(() => buildConflictHints(sanitizeConfig(dnsConfig)), [dnsConfig]);
@@ -589,7 +607,7 @@ export function DnsPage({ snapshot, loading, runAction }: DaemonPageProps) {
   };
 
   const submitDNSDraft = async () => {
-    const nextConfig = sanitizeConfig(dnsConfig);
+    const nextConfig = normalizeConfigForView(dnsConfig, isMobileView);
     const issues = validateConfig(nextConfig);
     if (issues.length > 0) {
       notice.error(issues[0]);
@@ -599,6 +617,7 @@ export function DnsPage({ snapshot, loading, runAction }: DaemonPageProps) {
     try {
       const nextSnapshot = await runAction(() =>
         daemonApi.setSettings({
+          applyRuntime: isMobileView,
           dns: nextConfig,
         }),
       );
@@ -615,7 +634,7 @@ export function DnsPage({ snapshot, loading, runAction }: DaemonPageProps) {
     if (!snapshot || !dnsDirty) {
       return;
     }
-    setDnsConfig(sanitizeConfig(cloneDNSConfig(snapshot.dns)));
+    setDnsConfig(normalizeConfigForView(cloneDNSConfig(snapshot.dns), isMobileView));
     setDnsDirty(false);
     draftNotice.notifyDraftReverted("DNS");
   };
@@ -670,30 +689,36 @@ export function DnsPage({ snapshot, loading, runAction }: DaemonPageProps) {
     const currentPresetValue =
       currentPreset == null ? undefined : encodeResolverPreset(endpoint.type, currentPreset);
     return (
-      <Space
-        direction="vertical"
-        size={8}
-        style={{ width: "100%" }}
-      >
-        <HelpLabel
-          label={title}
-          helpContent={resolverRoleHelpContent[role]}
-        />
+      <div className={isMobileView ? "dns-mobile-panel dns-mobile-endpoint-panel" : undefined}>
         <Space
-          wrap
-          size={8}
+          direction="vertical"
+          size={isMobileView ? 10 : 8}
+          style={{ width: "100%" }}
+          className={isMobileView ? "dns-mobile-stack" : undefined}
         >
+          <HelpLabel
+            label={title}
+            helpContent={resolverRoleHelpContent[role]}
+          />
+          <Space
+            wrap={!isMobileView}
+            direction={isMobileView ? "vertical" : "horizontal"}
+            size={8}
+            className={isMobileView ? "dns-mobile-stack" : undefined}
+          >
           <Select<DNSResolverType>
             value={endpoint.type}
             options={resolverTypeOptions}
-            style={{ width: 180 }}
+            className={isMobileView ? "dns-mobile-field" : undefined}
+            style={isMobileView ? undefined : { width: 180 }}
             onChange={(value) => updateEndpointResolverType(role, value)}
           />
           <Select
             value={currentPresetValue}
             options={presetOptions}
             disabled={isSystemResolver || presetOptions.length === 0}
-            style={{ width: 320 }}
+            className={isMobileView ? "dns-mobile-field" : undefined}
+            style={isMobileView ? undefined : { width: 320 }}
             placeholder={isSystemResolver ? "系统解析类型无需上游服务器" : "请选择 DNS 服务器"}
             onChange={(value) => {
               const preset = decodeResolverPreset(value);
@@ -713,28 +738,49 @@ export function DnsPage({ snapshot, loading, runAction }: DaemonPageProps) {
               { value: "direct", label: "直连" },
               { value: "proxy", label: "代理" },
             ]}
-            style={{ width: 120 }}
+            className={isMobileView ? "dns-mobile-field" : undefined}
+            style={isMobileView ? undefined : { width: 120 }}
             onChange={(value) => updateEndpoint(role, { detour: value })}
           />
+          </Space>
         </Space>
-      </Space>
+      </div>
     );
   };
 
+  const hostsSectionHelpContent = isMobileView
+    ? {
+        scene: "在 DNS 网络查询前使用本地 hosts 覆盖。",
+        effect: "移动端仅保留客户端自定义 hosts 映射，命中后直接返回结果。",
+        caution: "自定义 hosts 会优先于上游 DNS 返回。",
+      }
+    : {
+        scene: "在 DNS 网络查询前使用本地 hosts 覆盖。",
+        effect: "命中 hosts 时直接返回映射，不再请求上游 DNS。",
+        caution: "自定义 hosts 优先级高于系统 hosts。",
+      };
+
   return (
-    <Card loading={loading}>
+    <Card
+      loading={loading}
+      className={isMobileView ? "dns-page-mobile-card" : undefined}
+    >
       <Space
         direction="vertical"
-        size={16}
+        size={isMobileView ? 12 : 16}
         style={{ width: "100%" }}
+        className={isMobileView ? "dns-page-mobile-layout" : undefined}
       >
         <Space
-          align="center"
+          align={isMobileView ? "start" : "center"}
+          wrap
           style={{ width: "100%", justifyContent: "space-between" }}
+          className={isMobileView ? "dns-mobile-header" : undefined}
         >
           <Typography.Text strong>DNS 配置</Typography.Text>
           <Button
             icon={<BiIcon name="trash3" />}
+            className={isMobileView ? "dns-mobile-clear-btn" : undefined}
             loading={clearingDNSCache}
             disabled={loading || applyingDNS}
             onClick={() => {
@@ -788,355 +834,422 @@ export function DnsPage({ snapshot, loading, runAction }: DaemonPageProps) {
         {renderEndpoint("direct", "直连 DNS", dnsConfig.direct)}
         {renderEndpoint("bootstrap", "Bootstrap DNS", dnsConfig.bootstrap)}
 
-        <HelpLabel
-          label={<Typography.Text strong>Hosts 配置</Typography.Text>}
-          helpContent={{
-            scene: "在 DNS 网络查询前使用本地 hosts 覆盖。",
-            effect: "命中 hosts 时直接返回映射，不再请求上游 DNS。",
-            caution: "自定义 hosts 优先级高于系统 hosts。",
-          }}
-        />
-        <Space
-          wrap
-          size={10}
-        >
-          <SwitchWithLabel
-            checked={dnsConfig.hosts.useSystemHosts}
-            onChange={(checked) => {
-              setDnsConfig((current) => ({
-                ...current,
-                hosts: {
-                  ...current.hosts,
-                  useSystemHosts: checked,
-                },
-              }));
-              setDnsDirty(true);
-            }}
-            label="使用系统 hosts 文件"
-            helpContent={{
-              effect: "DNS 查询前先匹配系统 hosts 记录（如 Windows/Linux 默认 hosts）。",
-              recommendation: "适合保留系统层面的域名映射习惯；如需统一由客户端管理可关闭。",
-            }}
-          />
-          <SwitchWithLabel
-            checked={dnsConfig.hosts.useCustomHosts}
-            onChange={(checked) => {
-              setDnsConfig((current) => ({
-                ...current,
-                hosts: {
-                  ...current.hosts,
-                  useCustomHosts: checked,
-                },
-              }));
-              setDnsDirty(true);
-            }}
-            label="使用自定义 hosts"
-            helpContent={{
-              effect: "DNS 查询前先匹配客户端自定义 hosts，优先级高于系统 hosts。",
-              recommendation: "建议仅维护必要映射，避免与系统 hosts 或上游 DNS 规则冲突。",
-            }}
-          />
-        </Space>
-        {dnsConfig.hosts.useCustomHosts ? (
+        <div className={isMobileView ? "dns-mobile-panel" : undefined}>
           <Space
             direction="vertical"
-            size={8}
+            size={isMobileView ? 10 : 8}
             style={{ width: "100%" }}
+            className={isMobileView ? "dns-mobile-stack" : undefined}
           >
             <HelpLabel
-              label="自定义 hosts 记录"
-              helpContent={{
-                effect: "按系统 hosts 格式逐行覆盖域名解析（IP 域名 [别名...]）。",
-                recommendation: "支持注释(#)；内容为空时可先参考下方示例模板。",
-              }}
+              label={<Typography.Text strong>Hosts 配置</Typography.Text>}
+              helpContent={hostsSectionHelpContent}
             />
-            <Input.TextArea
-              value={dnsConfig.hosts.customHosts}
-              placeholder={defaultCustomHostsPlaceholder}
-              autoSize={{ minRows: 6, maxRows: 16 }}
-              onChange={(event) => {
-                const value = event.target.value;
-                setDnsConfig((current) => ({
-                  ...current,
-                  hosts: {
-                    ...current.hosts,
-                    customHosts: value,
-                  },
-                }));
-                setDnsDirty(true);
-              }}
-            />
+            <Space
+              wrap={!isMobileView}
+              direction={isMobileView ? "vertical" : "horizontal"}
+              size={10}
+              className={isMobileView ? "dns-mobile-stack" : undefined}
+            >
+              {!isMobileView ? (
+                <SwitchWithLabel
+                  className={isMobileView ? "dns-mobile-switch" : undefined}
+                  checked={dnsConfig.hosts.useSystemHosts}
+                  onChange={(checked) => {
+                    setDnsConfig((current) => ({
+                      ...current,
+                      hosts: {
+                        ...current.hosts,
+                        useSystemHosts: checked,
+                      },
+                    }));
+                    setDnsDirty(true);
+                  }}
+                  label="使用系统 hosts 文件"
+                  helpContent={{
+                    effect: "DNS 查询前先匹配系统 hosts 记录（如 Windows/Linux 默认 hosts）。",
+                    recommendation: "适合保留系统层面的域名映射习惯；如需统一由客户端管理可关闭。",
+                  }}
+                />
+              ) : null}
+              <SwitchWithLabel
+                className={isMobileView ? "dns-mobile-switch" : undefined}
+                checked={dnsConfig.hosts.useCustomHosts}
+                onChange={(checked) => {
+                  setDnsConfig((current) => ({
+                    ...current,
+                    hosts: {
+                      ...current.hosts,
+                      useCustomHosts: checked,
+                    },
+                  }));
+                  setDnsDirty(true);
+                }}
+                label="使用自定义 hosts"
+                helpContent={{
+                  effect: "DNS 查询前先匹配客户端自定义 hosts，优先于上游 DNS 返回。",
+                  recommendation: isMobileView
+                    ? "建议仅维护必要映射，避免与上游 DNS 规则冲突。"
+                    : "建议仅维护必要映射，避免与系统 hosts 或上游 DNS 规则冲突。",
+                }}
+              />
+            </Space>
+            {dnsConfig.hosts.useCustomHosts ? (
+              <Space
+                direction="vertical"
+                size={8}
+                style={{ width: "100%" }}
+                className={isMobileView ? "dns-mobile-stack" : undefined}
+              >
+                <HelpLabel
+                  label="自定义 hosts 记录"
+                  helpContent={{
+                    effect: "按系统 hosts 格式逐行覆盖域名解析（IP 域名 [别名...]）。",
+                    recommendation: "支持注释(#)；内容为空时可先参考下方示例模板。",
+                  }}
+                />
+                <Input.TextArea
+                  value={dnsConfig.hosts.customHosts}
+                  className={isMobileView ? "dns-mobile-textarea" : undefined}
+                  style={{ width: "100%" }}
+                  placeholder={defaultCustomHostsPlaceholder}
+                  autoSize={{ minRows: 6, maxRows: 16 }}
+                  onChange={(event) => {
+                    const value = event.target.value;
+                    setDnsConfig((current) => ({
+                      ...current,
+                      hosts: {
+                        ...current.hosts,
+                        customHosts: value,
+                      },
+                    }));
+                    setDnsDirty(true);
+                  }}
+                />
+              </Space>
+            ) : null}
           </Space>
-        ) : null}
+        </div>
 
-        <HelpLabel
-          label={<Typography.Text strong>解析策略</Typography.Text>}
-          helpContent={{
-            scene: "控制最终使用哪个 DNS 结果与地址偏好。",
-            effect: "strategy 决定 IPv4/IPv6 取向，final 决定默认服务器。",
-            caution: "final 与 detour 组合不当会导致解析不可达。",
-          }}
-        />
-        <Space
-          wrap
-          size={8}
-        >
-          <HelpLabel
-            label="地址策略"
-            helpContent={{
-              scene: "IPv4/IPv6 偏好控制。",
-              effect: "影响返回记录类型与优先级。",
-              caution: "若网络 IPv6 质量不佳，建议优先 IPv4。",
-            }}
-          />
-          <Select<DNSStrategy>
-            value={dnsConfig.policy.strategy}
-            options={dnsStrategyOptions}
-            style={{ width: 220 }}
-            onChange={(value) => {
-              setDnsConfig((current) => ({
-                ...current,
-                policy: {
-                  ...current.policy,
-                  strategy: value,
-                },
-              }));
-              setDnsDirty(true);
-            }}
-          />
-          <HelpLabel
-            label="默认服务器"
-            helpContent={{
-              scene: "未命中 DNS 规则时的兜底服务器。",
-              effect: "决定默认解析入口走 远程/直连/bootstrap。",
-              caution: "建议结合 远程DNS+代理 关系验证可达性。",
-            }}
-          />
-          <Select<DNSRuleServer>
-            value={dnsConfig.policy.final}
-            options={dnsFinalServerOptions}
-            style={{ width: 220 }}
-            onChange={(value) => {
-              setDnsConfig((current) => ({
-                ...current,
-                policy: {
-                  ...current.policy,
-                  final: value,
-                },
-              }));
-              setDnsDirty(true);
-            }}
-          />
-        </Space>
-
-        <HelpLabel
-          label={<Typography.Text strong>高级设置</Typography.Text>}
-          helpContent={{
-            scene: "调优缓存与性能。",
-            effect: "控制缓存隔离、容量与磁盘持久化。",
-            caution: "容量过小会频繁回源，磁盘缓存开启后应关注磁盘占用。",
-          }}
-        />
-        <Space
-          wrap
-          size={12}
-        >
-          <SwitchWithLabel
-            checked={dnsConfig.cache.independentCache}
-            onChange={(checked) => {
-              setDnsConfig((current) => ({
-                ...current,
-                cache: { ...current.cache, independentCache: checked },
-              }));
-              setDnsDirty(true);
-            }}
-            label="独立缓存"
-            helpContent={{
-              scene: "希望不同链路使用独立缓存。",
-              effect: "避免不同上游缓存互相污染。",
-              caution: "开启后内存占用会增加。",
-            }}
-          />
-          <HelpLabel
-            label="缓存容量"
-            helpContent={{
-              scene: "控制 DNS 内存缓存上限。",
-              effect: "容量越大，重复查询命中率越高。",
-              caution: "建议 1024 以上，过大会增加内存占用。",
-            }}
-          />
-          <InputNumber
-            min={1024}
-            max={65536}
-            value={dnsConfig.cache.capacity}
-            onChange={(value) => {
-              setDnsConfig((current) => ({
-                ...current,
-                cache: { ...current.cache, capacity: Number(value ?? 1024) },
-              }));
-              setDnsDirty(true);
-            }}
-          />
-          <SwitchWithLabel
-            checked={dnsConfig.cache.fileEnabled}
-            onChange={(checked) => {
-              setDnsConfig((current) => ({
-                ...current,
-                cache: {
-                  ...current.cache,
-                  fileEnabled: checked,
-                  storeRDRC: checked ? current.cache.storeRDRC : false,
-                },
-              }));
-              setDnsDirty(true);
-            }}
-            label="缓存文件"
-            helpContent={{
-              scene: "希望重启后保留部分 DNS 缓存。",
-              effect: "将缓存写入本地文件。",
-              caution: "关闭时相关持久化项（如 RDRC）不会生效。",
-            }}
-          />
-          <SwitchWithLabel
-            checked={dnsConfig.cache.storeRDRC}
-            disabled={!dnsConfig.cache.fileEnabled}
-            onChange={(checked) => {
-              setDnsConfig((current) => ({
-                ...current,
-                cache: { ...current.cache, storeRDRC: checked },
-              }));
-              setDnsDirty(true);
-            }}
-            label="Store RDRC"
-            helpContent={{
-              scene: "需要保存更多解析上下文信息。",
-              effect: "增强重启后缓存恢复能力。",
-              caution: "仅在“缓存文件”开启时生效。",
-            }}
-          />
-        </Space>
-
-        <Divider style={{ margin: 0 }} />
-
-        <Space
-          wrap
-          size={8}
-        >
-          <SwitchWithLabel
-            checked={dnsConfig.fakeip.enabled}
-            onChange={(checked) => {
-              setDnsConfig((current) => ({
-                ...current,
-                fakeip: { ...current.fakeip, enabled: checked },
-              }));
-              setDnsDirty(true);
-            }}
-            label="启用 FakeIP"
-            helpContent={{
-              scene: "需要增强基于域名的分流命中。",
-              effect: "将 A/AAAA 查询映射到 FakeIP 段。",
-              caution: "与某些局域网/特殊应用可能存在兼容性差异。",
-            }}
-          />
-          <HelpLabel
-            label="IPv4 CIDR"
-            helpContent={{
-              scene: "定义 FakeIP 的 IPv4 地址池。",
-              effect: "用于分配虚拟地址承载域名映射。",
-              caution: "必须为合法 CIDR，避免与现网地址段冲突。",
-            }}
-          />
-          <Input
-            value={dnsConfig.fakeip.ipv4Range}
-            disabled={!dnsConfig.fakeip.enabled}
-            style={{ width: 200 }}
-            onChange={(event) => {
-              setDnsConfig((current) => ({
-                ...current,
-                fakeip: { ...current.fakeip, ipv4Range: event.target.value },
-              }));
-              setDnsDirty(true);
-            }}
-          />
-          <HelpLabel
-            label="IPv6 CIDR"
-            helpContent={{
-              scene: "定义 FakeIP 的 IPv6 地址池。",
-              effect: "为 IPv6 查询提供虚拟地址映射。",
-              caution: "建议使用保留网段，避免和真实网络重叠。",
-            }}
-          />
-          <Input
-            value={dnsConfig.fakeip.ipv6Range}
-            disabled={!dnsConfig.fakeip.enabled}
-            style={{ width: 220 }}
-            onChange={(event) => {
-              setDnsConfig((current) => ({
-                ...current,
-                fakeip: { ...current.fakeip, ipv6Range: event.target.value },
-              }));
-              setDnsDirty(true);
-            }}
-          />
-        </Space>
-
-        <Divider style={{ margin: 0 }} />
-
-        <HelpLabel
-          label={<Typography.Text strong>DNS 健康检查</Typography.Text>}
-          helpContent={{
-            scene: "应用配置后快速验证可达性。",
-            effect: "并行检测 remote/direct/bootstrap 三路解析结果与耗时。",
-            caution: "若 remote detour=proxy，需先确认代理链路本身可用。",
-          }}
-        />
-        <Space
-          wrap
-          size={8}
-        >
-          <HelpLabel
-            label="检测域名"
-            helpContent={{
-              scene: "选择一个稳定域名做基准测试。",
-              effect: "评估 DNS 请求是否可达且返回结果正常。",
-              caution: "建议使用公共可达域名，如 www.gstatic.com。",
-            }}
-          />
-          <Input
-            value={healthDomain}
-            style={{ width: 240 }}
-            placeholder="检测域名"
-            onChange={(event) => setHealthDomain(event.target.value)}
-          />
-          <HelpLabel
-            label="检测超时(ms)"
-            helpContent={{
-              scene: "控制单次检测等待时间。",
-              effect: "超时越小，失败判定越快。",
-              caution: "建议 3000~8000ms，过小容易误判。",
-            }}
-          />
-          <InputNumber
-            min={500}
-            max={20000}
-            value={healthTimeoutMS}
-            style={{ width: 140 }}
-            onChange={(value) => setHealthTimeoutMS(Number(value ?? defaultHealthTimeoutMS))}
-          />
-          <Button
-            loading={checkingHealth}
-            onClick={() => void checkDNSHealth()}
+        <div className={isMobileView ? "dns-mobile-panel" : undefined}>
+          <Space
+            direction="vertical"
+            size={isMobileView ? 10 : 8}
+            style={{ width: "100%" }}
+            className={isMobileView ? "dns-mobile-stack" : undefined}
           >
-            一键健康检查
-          </Button>
-        </Space>
-        {healthReportText !== "" ? (
-          <Input.TextArea
-            value={healthReportText}
-            readOnly
-            autoSize={{ minRows: 4, maxRows: 10 }}
-          />
-        ) : null}
+            <HelpLabel
+              label={<Typography.Text strong>解析策略</Typography.Text>}
+              helpContent={{
+                scene: "控制最终使用哪个 DNS 结果与地址偏好。",
+                effect: "strategy 决定 IPv4/IPv6 取向，final 决定默认服务器。",
+                caution: "final 与 detour 组合不当会导致解析不可达。",
+              }}
+            />
+            <Space
+              wrap={!isMobileView}
+              direction={isMobileView ? "vertical" : "horizontal"}
+              size={8}
+              className={isMobileView ? "dns-mobile-stack" : undefined}
+            >
+              <HelpLabel
+                label="地址策略"
+                helpContent={{
+                  scene: "IPv4/IPv6 偏好控制。",
+                  effect: "影响返回记录类型与优先级。",
+                  caution: "若网络 IPv6 质量不佳，建议优先 IPv4。",
+                }}
+              />
+              <Select<DNSStrategy>
+                value={dnsConfig.policy.strategy}
+                options={dnsStrategyOptions}
+                className={isMobileView ? "dns-mobile-field" : undefined}
+                style={isMobileView ? undefined : { width: 220 }}
+                onChange={(value) => {
+                  setDnsConfig((current) => ({
+                    ...current,
+                    policy: {
+                      ...current.policy,
+                      strategy: value,
+                    },
+                  }));
+                  setDnsDirty(true);
+                }}
+              />
+              <HelpLabel
+                label="默认服务器"
+                helpContent={{
+                  scene: "未命中 DNS 规则时的兜底服务器。",
+                  effect: "决定默认解析入口走 远程/直连/bootstrap。",
+                  caution: "建议结合 远程DNS+代理 关系验证可达性。",
+                }}
+              />
+              <Select<DNSRuleServer>
+                value={dnsConfig.policy.final}
+                options={dnsFinalServerOptions}
+                className={isMobileView ? "dns-mobile-field" : undefined}
+                style={isMobileView ? undefined : { width: 220 }}
+                onChange={(value) => {
+                  setDnsConfig((current) => ({
+                    ...current,
+                    policy: {
+                      ...current.policy,
+                      final: value,
+                    },
+                  }));
+                  setDnsDirty(true);
+                }}
+              />
+            </Space>
+          </Space>
+        </div>
+
+        <div className={isMobileView ? "dns-mobile-panel" : undefined}>
+          <Space
+            direction="vertical"
+            size={isMobileView ? 10 : 8}
+            style={{ width: "100%" }}
+            className={isMobileView ? "dns-mobile-stack" : undefined}
+          >
+            <HelpLabel
+              label={<Typography.Text strong>高级设置</Typography.Text>}
+              helpContent={{
+                scene: "调优缓存与性能。",
+                effect: "控制缓存隔离、容量与磁盘持久化。",
+                caution: "容量过小会频繁回源，磁盘缓存开启后应关注磁盘占用。",
+              }}
+            />
+            <Space
+              wrap={!isMobileView}
+              direction={isMobileView ? "vertical" : "horizontal"}
+              size={12}
+              className={isMobileView ? "dns-mobile-stack" : undefined}
+            >
+              <SwitchWithLabel
+                className={isMobileView ? "dns-mobile-switch" : undefined}
+                checked={dnsConfig.cache.independentCache}
+                onChange={(checked) => {
+                  setDnsConfig((current) => ({
+                    ...current,
+                    cache: { ...current.cache, independentCache: checked },
+                  }));
+                  setDnsDirty(true);
+                }}
+                label="独立缓存"
+                helpContent={{
+                  scene: "希望不同链路使用独立缓存。",
+                  effect: "避免不同上游缓存互相污染。",
+                  caution: "开启后内存占用会增加。",
+                }}
+              />
+              <HelpLabel
+                label="缓存容量"
+                helpContent={{
+                  scene: "控制 DNS 内存缓存上限。",
+                  effect: "容量越大，重复查询命中率越高。",
+                  caution: "建议 1024 以上，过大会增加内存占用。",
+                }}
+              />
+              <InputNumber
+                min={1024}
+                max={65536}
+                value={dnsConfig.cache.capacity}
+                className={isMobileView ? "dns-mobile-field" : undefined}
+                style={isMobileView ? undefined : { width: 140 }}
+                onChange={(value) => {
+                  setDnsConfig((current) => ({
+                    ...current,
+                    cache: { ...current.cache, capacity: Number(value ?? 1024) },
+                  }));
+                  setDnsDirty(true);
+                }}
+              />
+              <SwitchWithLabel
+                className={isMobileView ? "dns-mobile-switch" : undefined}
+                checked={dnsConfig.cache.fileEnabled}
+                onChange={(checked) => {
+                  setDnsConfig((current) => ({
+                    ...current,
+                    cache: {
+                      ...current.cache,
+                      fileEnabled: checked,
+                      storeRDRC: checked ? current.cache.storeRDRC : false,
+                    },
+                  }));
+                  setDnsDirty(true);
+                }}
+                label="缓存文件"
+                helpContent={{
+                  scene: "希望重启后保留部分 DNS 缓存。",
+                  effect: "将缓存写入本地文件。",
+                  caution: "关闭时相关持久化项（如 RDRC）不会生效。",
+                }}
+              />
+              <SwitchWithLabel
+                className={isMobileView ? "dns-mobile-switch" : undefined}
+                checked={dnsConfig.cache.storeRDRC}
+                disabled={!dnsConfig.cache.fileEnabled}
+                onChange={(checked) => {
+                  setDnsConfig((current) => ({
+                    ...current,
+                    cache: { ...current.cache, storeRDRC: checked },
+                  }));
+                  setDnsDirty(true);
+                }}
+                label="Store RDRC"
+                helpContent={{
+                  scene: "需要保存更多解析上下文信息。",
+                  effect: "增强重启后缓存恢复能力。",
+                  caution: "仅在“缓存文件”开启时生效。",
+                }}
+              />
+            </Space>
+
+            <Divider
+              style={{ margin: isMobileView ? "2px 0" : 0 }}
+              className={isMobileView ? "dns-mobile-section-divider" : undefined}
+            />
+
+            <Space
+              wrap={!isMobileView}
+              direction={isMobileView ? "vertical" : "horizontal"}
+              size={8}
+              className={isMobileView ? "dns-mobile-stack" : undefined}
+            >
+              <SwitchWithLabel
+                className={isMobileView ? "dns-mobile-switch" : undefined}
+                checked={dnsConfig.fakeip.enabled}
+                onChange={(checked) => {
+                  setDnsConfig((current) => ({
+                    ...current,
+                    fakeip: { ...current.fakeip, enabled: checked },
+                  }));
+                  setDnsDirty(true);
+                }}
+                label="启用 FakeIP"
+                helpContent={{
+                  scene: "需要增强基于域名的分流命中。",
+                  effect: "将 A/AAAA 查询映射到 FakeIP 段。",
+                  caution: "与某些局域网/特殊应用可能存在兼容性差异。",
+                }}
+              />
+              <HelpLabel
+                label="IPv4 CIDR"
+                helpContent={{
+                  scene: "定义 FakeIP 的 IPv4 地址池。",
+                  effect: "用于分配虚拟地址承载域名映射。",
+                  caution: "必须为合法 CIDR，避免与现网地址段冲突。",
+                }}
+              />
+              <Input
+                value={dnsConfig.fakeip.ipv4Range}
+                disabled={!dnsConfig.fakeip.enabled}
+                className={isMobileView ? "dns-mobile-field" : undefined}
+                style={isMobileView ? undefined : { width: 200 }}
+                onChange={(event) => {
+                  setDnsConfig((current) => ({
+                    ...current,
+                    fakeip: { ...current.fakeip, ipv4Range: event.target.value },
+                  }));
+                  setDnsDirty(true);
+                }}
+              />
+              <HelpLabel
+                label="IPv6 CIDR"
+                helpContent={{
+                  scene: "定义 FakeIP 的 IPv6 地址池。",
+                  effect: "为 IPv6 查询提供虚拟地址映射。",
+                  caution: "建议使用保留网段，避免和真实网络重叠。",
+                }}
+              />
+              <Input
+                value={dnsConfig.fakeip.ipv6Range}
+                disabled={!dnsConfig.fakeip.enabled}
+                className={isMobileView ? "dns-mobile-field" : undefined}
+                style={isMobileView ? undefined : { width: 220 }}
+                onChange={(event) => {
+                  setDnsConfig((current) => ({
+                    ...current,
+                    fakeip: { ...current.fakeip, ipv6Range: event.target.value },
+                  }));
+                  setDnsDirty(true);
+                }}
+              />
+            </Space>
+          </Space>
+        </div>
+
+        <div className={isMobileView ? "dns-mobile-panel" : undefined}>
+          <Space
+            direction="vertical"
+            size={isMobileView ? 10 : 8}
+            style={{ width: "100%" }}
+            className={isMobileView ? "dns-mobile-stack" : undefined}
+          >
+            <HelpLabel
+              label={<Typography.Text strong>DNS 健康检查</Typography.Text>}
+              helpContent={{
+                scene: "应用配置后快速验证可达性。",
+                effect: "并行检测 remote/direct/bootstrap 三路解析结果与耗时。",
+                caution: "若 remote detour=proxy，需先确认代理链路本身可用。",
+              }}
+            />
+            <Space
+              wrap={!isMobileView}
+              direction={isMobileView ? "vertical" : "horizontal"}
+              size={8}
+              className={isMobileView ? "dns-mobile-stack" : undefined}
+            >
+              <HelpLabel
+                label="检测域名"
+                helpContent={{
+                  scene: "选择一个稳定域名做基准测试。",
+                  effect: "评估 DNS 请求是否可达且返回结果正常。",
+                  caution: "建议使用公共可达域名，如 www.qq.com。",
+                }}
+              />
+              <Input
+                value={healthDomain}
+                className={isMobileView ? "dns-mobile-field" : undefined}
+                style={isMobileView ? undefined : { width: 240 }}
+                placeholder="检测域名"
+                onChange={(event) => setHealthDomain(event.target.value)}
+              />
+              <HelpLabel
+                label="检测超时(ms)"
+                helpContent={{
+                  scene: "控制单次检测等待时间。",
+                  effect: "超时越小，失败判定越快。",
+                  caution: "建议 3000~8000ms，过小容易误判。",
+                }}
+              />
+              <InputNumber
+                min={500}
+                max={20000}
+                value={healthTimeoutMS}
+                className={isMobileView ? "dns-mobile-field" : undefined}
+                style={isMobileView ? undefined : { width: 140 }}
+                onChange={(value) => setHealthTimeoutMS(Number(value ?? defaultHealthTimeoutMS))}
+              />
+              <Button
+                className={isMobileView ? "dns-mobile-health-btn" : undefined}
+                loading={checkingHealth}
+                onClick={() => void checkDNSHealth()}
+              >
+                一键健康检查
+              </Button>
+            </Space>
+            {healthReportText !== "" ? (
+              <Input.TextArea
+                value={healthReportText}
+                readOnly
+                className={isMobileView ? "dns-mobile-textarea dns-mobile-report" : undefined}
+                style={{ width: "100%" }}
+                autoSize={{ minRows: 4, maxRows: 10 }}
+              />
+            ) : null}
+          </Space>
+        </div>
 
       </Space>
     </Card>

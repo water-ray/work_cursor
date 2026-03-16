@@ -1,31 +1,22 @@
+import type { WaterayPlatformAdapter, PlatformUpdateState } from "./adapterTypes";
 import type { WaterayPlatformApi } from "./runtimeTypes";
 import { createMobileDaemonBridge } from "./mobileDaemon";
 
-type WaterayDesktopApi = Window["waterayDesktop"];
-
-interface UpdateState {
-  currentVersion: string;
+interface UnsupportedUpdateState extends PlatformUpdateState {
   currentPlatform: "android" | "ios" | "unknown";
   installKind: "unknown";
-  supported: boolean;
   stage: "unsupported";
-  statusMessage: string;
-  lastError: string;
-  lastCheckedAtMs: number;
-  downloadProgressPercent: number;
-  downloadedBytes: number;
-  totalBytes: number;
-  candidate: null;
 }
 
 function rejectUnsupported(action: string): Promise<never> {
   return Promise.reject(new Error(`移动端暂不支持${action}`));
 }
 
-function createUnsupportedUpdateState(platform: WaterayPlatformApi): UpdateState {
+function createUnsupportedUpdateState(platform: WaterayPlatformApi): UnsupportedUpdateState {
   return {
     currentVersion: "unknown",
-    currentPlatform: platform.kind === "ios" ? "ios" : platform.kind === "android" ? "android" : "unknown",
+    currentPlatform:
+      platform.kind === "ios" ? "ios" : platform.kind === "android" ? "android" : "unknown",
     installKind: "unknown",
     supported: false,
     stage: "unsupported",
@@ -39,8 +30,8 @@ function createUnsupportedUpdateState(platform: WaterayPlatformApi): UpdateState
   };
 }
 
-export function installWaterayMobileShim(platform: WaterayPlatformApi): WaterayDesktopApi {
-  const desktopApi: WaterayDesktopApi = {
+export function createMobilePlatformAdapter(platform: WaterayPlatformApi): WaterayPlatformAdapter {
+  return {
     window: {
       minimize: () => rejectUnsupported("窗口最小化"),
       minimizeToTray: () => rejectUnsupported("托盘最小化"),
@@ -74,11 +65,4 @@ export function installWaterayMobileShim(platform: WaterayPlatformApi): WaterayD
       onStateChanged: () => () => {},
     },
   };
-
-  Object.defineProperty(window, "waterayDesktop", {
-    configurable: true,
-    value: desktopApi,
-  });
-
-  return desktopApi;
 }

@@ -6,6 +6,7 @@ import { normalizeCountryCode } from "../app/data/countryMetadata";
 import { readProxyStartupSmartOptimizePreference } from "../app/settings/uiPreferences";
 import type { AppNoticeApi } from "../components/notify/AppNoticeProvider";
 import { ensureTray, restoreMainWindow } from "../desktop/tray";
+import { getPlatformAdapter, isDesktopRuntime } from "../platform/runtimeStore";
 import {
   buildServiceStartedMessage,
   restartServiceWithFeedback,
@@ -236,7 +237,7 @@ export function useTrayMenuController({
   );
 
   useEffect(() => {
-    if (window.waterayPlatform?.isDesktop === false) {
+    if (!isDesktopRuntime()) {
       return;
     }
     let disposed = false;
@@ -451,7 +452,7 @@ export function useTrayMenuController({
         text: "后台运行（关面板）",
         action: () => {
           runDetachedAction(
-            () => window.waterayDesktop.window.closePanelKeepCore(),
+            () => getPlatformAdapter().window.closePanelKeepCore(),
             "后台运行失败",
           );
         },
@@ -460,7 +461,7 @@ export function useTrayMenuController({
         id: trayMenuQuitAll,
         text: "完全退出（含内核）",
         action: () => {
-          runDetachedAction(() => window.waterayDesktop.window.quitAll(), "完全退出失败");
+          runDetachedAction(() => getPlatformAdapter().window.quitAll(), "完全退出失败");
         },
       },
     ];

@@ -12,6 +12,7 @@ import { useEffect, useMemo, useState } from "react";
 
 import { useAppNotice } from "../../components/notify/AppNoticeProvider";
 import type { WaterayMobileHostStatus } from "../../platform/mobileHost";
+import { getRuntimePlatform } from "../../platform/runtimeStore";
 
 const storageKeyConfig = "wateray.mobile.debug.config";
 const storageKeyProfileName = "wateray.mobile.debug.profileName";
@@ -121,7 +122,7 @@ function resolveStatusColor(state: WaterayMobileHostStatus["state"]): string {
 
 export function MobileProxyHostPanel() {
   const notice = useAppNotice();
-  const mobileHost = window.waterayPlatform.mobileHost;
+  const mobileHost = getRuntimePlatform().mobileHost;
   const [status, setStatus] = useState<WaterayMobileHostStatus>(emptyStatus);
   const [busy, setBusy] = useState(false);
   const [configJson, setConfigJson] = useState<string>(() =>

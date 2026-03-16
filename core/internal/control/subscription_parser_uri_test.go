@@ -1,7 +1,9 @@
 package control
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -71,6 +73,20 @@ func TestPostProcessParsedNodesAndStatusKeepsDuplicateNodes(t *testing.T) {
 	}
 	if status != "" {
 		t.Fatalf("expected empty status to stay empty, got %q", status)
+	}
+}
+
+func TestParseURILinesBase64WholeContentDoesNotDuplicateNodes(t *testing.T) {
+	parser := NewSubscriptionParser()
+	content := strings.Join([]string{
+		"ss://YWVzLTI1Ni1nY206c2VjcmV0QDEuMi4zLjQ6ODM4OA==#HK-SS-01",
+		"vless://99e4f414-8c33-4a4b-af38-58804603f1a8@example.com:443?type=ws#demo",
+	}, "\n")
+	encoded := base64.StdEncoding.EncodeToString([]byte(content))
+
+	nodes := parser.parseURILines(encoded, "group-1")
+	if len(nodes) != 2 {
+		t.Fatalf("expected 2 nodes after parsing base64 subscription, got %d", len(nodes))
 	}
 }
 

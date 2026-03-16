@@ -1,11 +1,14 @@
 package com.wateray.desktop.mobilehost
 
+import android.util.Base64
 import android.util.Log
+import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.net.Proxy
 import java.net.Socket
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
@@ -15,7 +18,10 @@ data class MobileDnsHealthCheckConfig(
   val type: String,
   val address: String,
   val port: Int? = null,
+  val path: String? = null,
   val domain: String,
+  val viaService: Boolean = false,
+  val serviceSocksPort: Int? = null,
   val timeoutMs: Int? = null,
 )
 
@@ -33,6 +39,8 @@ object MobileDnsHealthRunner {
   private const val maxTimeoutMs = 20000
   private const val dnsTypeA = 1
   private const val dnsTypeAAAA = 28
+  private const val defaultHttpsPath = "/dns-query"
+  private const val localhost = "127.0.0.1"
 
   fun run(config: MobileDnsHealthCheckConfig): MobileDnsHealthCheckResult {
     val startedAt = System.nanoTime()
@@ -48,14 +56,44 @@ object MobileDnsHealthRunner {
         throw IllegalArgumentException("dns health domain is required")
       }
       val resolvedIp = when (normalizedType) {
-        "udp" -> resolveAll(domain) { query ->
-          executeUdpQuery(address, normalizePort(normalizedType, config.port), timeoutMs, query)
+        "udp" -> {
+          if (config.viaService) {
+            throw UnsupportedOperationException("移动端暂未支持通过运行中的 VPN 服务验证 udp DNS")
+          }
+          resolveAll(domain) { query ->
+            executeUdpQuery(address, normalizePort(normalizedType, config.port), timeoutMs, query)
+          }
         }
         "tcp" -> resolveAll(domain) { query ->
-          executeTcpQuery(address, normalizePort(normalizedType, config.port), timeoutMs, query)
+          executeTcpQuery(
+            address,
+            normalizePort(normalizedType, config.port),
+            timeoutMs,
+            query,
+            config.viaService,
+            config.serviceSocksPort,
+          )
         }
         "tls" -> resolveAll(domain) { query ->
-          executeTlsQuery(address, normalizePort(normalizedType, config.port), timeoutMs, query)
+          executeTlsQuery(
+            address,
+            normalizePort(normalizedType, config.port),
+            timeoutMs,
+            query,
+            config.viaService,
+            config.serviceSocksPort,
+          )
+        }
+        "https" -> resolveAll(domain) { query ->
+          executeHttpsQuery(
+            address,
+            normalizePort(normalizedType, config.port),
+            normalizeHttpsPath(config.path),
+            timeoutMs,
+            query,
+            config.viaService,
+            config.serviceSocksPort,
+          )
         }
         else -> throw UnsupportedOperationException("移动端暂未支持 $normalizedType 类型 DNS 健康检查")
       }
@@ -116,11 +154,10 @@ object MobileDnsHealthRunner {
     port: Int,
     timeoutMs: Int,
     query: ByteArray,
+    viaService: Boolean,
+    serviceSocksPort: Int?,
   ): ByteArray {
-    Socket().use { socket ->
-      WaterayVpnService.protectSocket(socket)
-      socket.connect(InetSocketAddress(host, port), timeoutMs)
-      socket.soTimeout = timeoutMs
+    openSocket(host, port, timeoutMs, viaService, serviceSocksPort).use { socket ->
       return executeLengthPrefixedQuery(socket.getInputStream(), socket.getOutputStream(), query)
     }
   }
@@ -130,12 +167,11 @@ object MobileDnsHealthRunner {
     port: Int,
     timeoutMs: Int,
     query: ByteArray,
+    viaService: Boolean,
+    serviceSocksPort: Int?,
   ): ByteArray {
     val factory = SSLSocketFactory.getDefault() as SSLSocketFactory
-    Socket().use { rawSocket ->
-      WaterayVpnService.protectSocket(rawSocket)
-      rawSocket.connect(InetSocketAddress(host, port), timeoutMs)
-      rawSocket.soTimeout = timeoutMs
+    openSocket(host, port, timeoutMs, viaService, serviceSocksPort).use { rawSocket ->
       val socket = factory.createSocket(rawSocket, host, port, true) as SSLSocket
       socket.useClientMode = true
       socket.soTimeout = timeoutMs
@@ -148,6 +184,166 @@ object MobileDnsHealthRunner {
         )
       }
     }
+  }
+
+  private fun executeHttpsQuery(
+    host: String,
+    port: Int,
+    path: String,
+    timeoutMs: Int,
+    query: ByteArray,
+    viaService: Boolean,
+    serviceSocksPort: Int?,
+  ): ByteArray {
+    val factory = SSLSocketFactory.getDefault() as SSLSocketFactory
+    openSocket(host, port, timeoutMs, viaService, serviceSocksPort).use { rawSocket ->
+      val socket = factory.createSocket(rawSocket, host, port, true) as SSLSocket
+      socket.useClientMode = true
+      socket.soTimeout = timeoutMs
+      socket.startHandshake()
+      socket.use { sslSocket ->
+        val requestTarget = buildHttpsRequestTarget(path, query)
+        val requestText = buildString {
+          append("GET ")
+          append(requestTarget)
+          append(" HTTP/1.1\r\n")
+          append("Host: ")
+          append(host)
+          append("\r\n")
+          append("Accept: application/dns-message\r\n")
+          append("Connection: close\r\n\r\n")
+        }
+        sslSocket.getOutputStream().write(requestText.toByteArray(Charsets.US_ASCII))
+        sslSocket.getOutputStream().flush()
+        return readHttpResponseBody(sslSocket.getInputStream())
+      }
+    }
+  }
+
+  private fun openSocket(
+    host: String,
+    port: Int,
+    timeoutMs: Int,
+    viaService: Boolean,
+    serviceSocksPort: Int?,
+  ): Socket {
+    val socket = if (viaService) {
+      val socksPort = normalizeServiceSocksPort(serviceSocksPort)
+      Socket(Proxy(Proxy.Type.SOCKS, InetSocketAddress(localhost, socksPort)))
+    } else {
+      Socket()
+    }
+    if (!viaService) {
+      WaterayVpnService.protectSocket(socket)
+    }
+    val endpoint = if (viaService) {
+      InetSocketAddress.createUnresolved(host, port)
+    } else {
+      InetSocketAddress(host, port)
+    }
+    socket.connect(endpoint, timeoutMs)
+    socket.soTimeout = timeoutMs
+    return socket
+  }
+
+  private fun buildHttpsRequestTarget(path: String, query: ByteArray): String {
+    val encodedQuery = Base64.encodeToString(
+      query,
+      Base64.NO_WRAP or Base64.NO_PADDING or Base64.URL_SAFE,
+    )
+    val separator = if (path.contains("?")) '&' else '?'
+    return "$path$separator" + "dns=$encodedQuery"
+  }
+
+  private fun readHttpResponseBody(input: InputStream): ByteArray {
+    val statusLine = readHttpLine(input)
+    if (
+      !statusLine.startsWith("HTTP/1.1 200")
+      && !statusLine.startsWith("HTTP/1.0 200")
+    ) {
+      throw IllegalStateException("dns-over-https status=$statusLine")
+    }
+    var contentLength: Int? = null
+    var chunked = false
+    while (true) {
+      val line = readHttpLine(input)
+      if (line.isEmpty()) {
+        break
+      }
+      val separatorIndex = line.indexOf(':')
+      if (separatorIndex <= 0) {
+        continue
+      }
+      val headerName = line.substring(0, separatorIndex).trim().lowercase()
+      val headerValue = line.substring(separatorIndex + 1).trim()
+      when (headerName) {
+        "content-length" -> contentLength = headerValue.toIntOrNull()
+        "transfer-encoding" -> {
+          if (headerValue.lowercase().contains("chunked")) {
+            chunked = true
+          }
+        }
+      }
+    }
+    return when {
+      chunked -> readChunkedBody(input)
+      contentLength != null -> readExactly(input, contentLength)
+      else -> readRemaining(input)
+    }
+  }
+
+  private fun readHttpLine(input: InputStream): String {
+    val output = ByteArrayOutputStream()
+    while (true) {
+      val value = input.read()
+      if (value < 0) {
+        break
+      }
+      if (value == '\n'.code) {
+        break
+      }
+      if (value != '\r'.code) {
+        output.write(value)
+      }
+    }
+    return output.toString(Charsets.US_ASCII.name())
+  }
+
+  private fun readChunkedBody(input: InputStream): ByteArray {
+    val output = ByteArrayOutputStream()
+    while (true) {
+      val line = readHttpLine(input)
+      val chunkSize = line.substringBefore(';').trim().toIntOrNull(16)
+        ?: throw IllegalStateException("invalid chunked dns response")
+      if (chunkSize == 0) {
+        while (readHttpLine(input).isNotEmpty()) {
+          // Consume optional trailer headers.
+        }
+        break
+      }
+      output.write(readExactly(input, chunkSize))
+      val cr = input.read()
+      val lf = input.read()
+      if (cr != '\r'.code || lf != '\n'.code) {
+        throw IllegalStateException("invalid dns chunk delimiter")
+      }
+    }
+    return output.toByteArray()
+  }
+
+  private fun readRemaining(input: InputStream): ByteArray {
+    val output = ByteArrayOutputStream()
+    val buffer = ByteArray(4096)
+    while (true) {
+      val read = input.read(buffer)
+      if (read < 0) {
+        break
+      }
+      if (read > 0) {
+        output.write(buffer, 0, read)
+      }
+    }
+    return output.toByteArray()
   }
 
   private fun executeLengthPrefixedQuery(
@@ -169,6 +365,9 @@ object MobileDnsHealthRunner {
   }
 
   private fun readExactly(input: InputStream, length: Int): ByteArray {
+    if (length < 0) {
+      throw IllegalArgumentException("length must be non-negative")
+    }
     val buffer = ByteArray(length)
     var offset = 0
     while (offset < length) {
@@ -301,6 +500,7 @@ object MobileDnsHealthRunner {
   private fun normalizePort(type: String, value: Int?): Int {
     val preferred = when (type) {
       "tls" -> 853
+      "https" -> 443
       else -> 53
     }
     val port = value ?: preferred
@@ -308,6 +508,22 @@ object MobileDnsHealthRunner {
       return port
     }
     return preferred
+  }
+
+  private fun normalizeHttpsPath(value: String?): String {
+    val path = value?.trim().orEmpty()
+    if (path.isEmpty()) {
+      return defaultHttpsPath
+    }
+    return if (path.startsWith("/")) path else "/$path"
+  }
+
+  private fun normalizeServiceSocksPort(value: Int?): Int {
+    val port = value ?: 0
+    if (port in 1..65535) {
+      return port
+    }
+    throw IllegalArgumentException("running service dns health requires a valid local socks port")
   }
 
   private fun normalizeTimeoutMs(value: Int?): Int {

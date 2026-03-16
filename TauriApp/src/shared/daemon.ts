@@ -74,6 +74,7 @@ export type RuleProfileSourceKind = "manual" | "subscription";
 export type RuleSetDownloadMode = "auto" | "direct" | "proxy";
 export type DaemonPushEventKind =
   | "snapshot_changed"
+  | "probe_result_patch"
   | "log_proxy"
   | "log_core"
   | "log_ui"
@@ -379,7 +380,6 @@ export interface ProbeNodesRequestPayload extends Record<string, unknown> {
   timeoutMs?: number;
   probeType?: ProbeType;
   probeTypes?: ProbeType[];
-  background?: boolean;
 }
 
 export interface ProbeNodesSummary {
@@ -390,6 +390,26 @@ export interface ProbeNodesSummary {
   freshProbeCount?: number;
   skippedRealConnectDueToLatency?: number;
   reprobedLatencyBeforeRealConnect?: number;
+}
+
+export interface ProbeNodeResultPatch {
+  nodeId: string;
+  completedStages?: ProbeRuntimeStage[];
+  latencyMs?: number;
+  realConnectMs?: number;
+  probeScore?: number;
+  latencyProbedAtMs?: number;
+  realConnectProbedAtMs?: number;
+  errorMessage?: string;
+}
+
+export interface ProbeResultPatchPayload {
+  taskId: string;
+  groupId?: string;
+  updates: ProbeNodeResultPatch[];
+  completedCount: number;
+  totalCount: number;
+  final: boolean;
 }
 
 export interface ClearProbeDataRequestPayload extends Record<string, unknown> {
@@ -405,6 +425,15 @@ export interface ResetTrafficStatsRequestPayload extends Record<string, unknown>
 
 export interface UpdateNodeCountriesRequestPayload extends Record<string, unknown> {
   nodeIds: string[];
+}
+
+export interface RemoveNodeRequestItem extends Record<string, unknown> {
+  groupId: string;
+  nodeId: string;
+}
+
+export interface RemoveNodesRequestPayload extends Record<string, unknown> {
+  items: RemoveNodeRequestItem[];
 }
 
 export interface AddManualNodeRequestPayload extends Record<string, unknown> {
@@ -580,6 +609,7 @@ export interface ActiveNodeConnection {
 
 export interface DaemonPushPayload {
   snapshot?: DaemonSnapshot;
+  probeResultPatch?: ProbeResultPatchPayload;
   logEntry?: RuntimeLogEntry;
   traffic?: TrafficTickPayload;
   runtimeApply?: RuntimeApplyStatus;

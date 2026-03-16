@@ -1,7 +1,8 @@
 import { Modal } from "antd";
-import { useCallback } from "react";
+import { useCallback, useMemo, useState } from "react";
 import type { DaemonSnapshot, NodeGroup, NodeProtocol } from "../../../../shared/daemon";
 import type { DaemonPageProps } from "../../app/types";
+import type { AppNoticeApi } from "../../components/notify/AppNoticeProvider";
 import { daemonApi } from "../../services/daemonApi";
 import type { NodeRow } from "./subscriptionsTableColumns";
 
@@ -15,6 +16,7 @@ interface UseSubscriptionsRowActionsParams {
   operationRows: NodeRow[];
   anchorRow: NodeRow | null;
   runAction: DaemonPageProps["runAction"];
+  notice: AppNoticeApi;
   openNodeEditor: (
     state:
       | { mode: "add"; protocol: NodeProtocol; groupId: string }
@@ -38,6 +40,7 @@ export function useSubscriptionsRowActions({
   operationRows,
   anchorRow,
   runAction,
+  notice,
   openNodeEditor,
   setSelectedRowKeys,
   activateNode,
@@ -46,12 +49,78 @@ export function useSubscriptionsRowActions({
   clearProbeDataFromContext,
   updateNodeCountriesFromContext,
 }: UseSubscriptionsRowActionsParams) {
+  const [pullingGroupIds, setPullingGroupIds] = useState<string[]>([]);
+  const pendingSubscriptionPullGroupIdSet = useMemo(() => {
+    const next = new Set<string>();
+    for (const task of snapshot?.backgroundTasks ?? []) {
+      if (task.type !== "subscription_pull") {
+        continue;
+      }
+      if (task.status !== "queued" && task.status !== "running") {
+        continue;
+      }
+      const scopeKey = String(task.scopeKey ?? "").trim();
+      if (!scopeKey.startsWith("subscription_pull:group:")) {
+        continue;
+      }
+      next.add(scopeKey.slice("subscription_pull:group:".length));
+    }
+    return next;
+  }, [snapshot?.backgroundTasks]);
+  const isPullSubscriptionPending = useCallback(
+    (groupId: string): boolean => {
+      const normalizedGroupId = groupId.trim();
+      if (normalizedGroupId === "") {
+        return false;
+      }
+      return (
+        pullingGroupIds.includes(normalizedGroupId) ||
+        pendingSubscriptionPullGroupIdSet.has(normalizedGroupId)
+      );
+    },
+    [pendingSubscriptionPullGroupIdSet, pullingGroupIds],
+  );
+  const pullSubscriptionForGroup = useCallback(
+    (groupId: string, groupName?: string) => {
+      const normalizedGroupId = groupId.trim();
+      if (normalizedGroupId === "" || isPullSubscriptionPending(normalizedGroupId)) {
+        return;
+      }
+      const resolvedGroupName =
+        groupName?.trim() ||
+        orderedGroups.find((group) => group.id === normalizedGroupId)?.name?.trim() ||
+        "当前分组";
+      setPullingGroupIds((previous) =>
+        previous.includes(normalizedGroupId) ? previous : [...previous, normalizedGroupId],
+      );
+      void (async () => {
+        try {
+          const result = await daemonApi.pullSubscriptionByGroupWithStatus(normalizedGroupId);
+          const nextSnapshot = await runAction(async () => result.snapshot);
+          const backgroundRunning =
+            result.task?.status === "queued" || result.task?.status === "running";
+          if (!backgroundRunning) {
+            const nextGroup = nextSnapshot.groups.find((group) => group.id === normalizedGroupId);
+            notice.success(`拉取订阅完成：${resolvedGroupName} · ${nextGroup?.nodes.length ?? 0} 个节点`);
+          }
+        } catch (error) {
+          notice.error(error instanceof Error ? error.message : `拉取订阅失败：${resolvedGroupName}`);
+        } finally {
+          setPullingGroupIds((previous) =>
+            previous.filter((item) => item !== normalizedGroupId),
+          );
+        }
+      })();
+    },
+    [isPullSubscriptionPending, notice, orderedGroups, runAction],
+  );
+
   const handlePullSubscriptionFromMenu = useCallback(() => {
     if (!currentTabGroup) {
       return;
     }
-    void runAction(() => daemonApi.pullSubscriptionByGroup(currentTabGroup.id));
-  }, [currentTabGroup, runAction]);
+    pullSubscriptionForGroup(currentTabGroup.id, currentTabGroup.name);
+  }, [currentTabGroup, pullSubscriptionForGroup]);
 
   const handleUseNodeFromMenu = useCallback(() => {
     if (!anchorRow) {
@@ -161,7 +230,7 @@ export function useSubscriptionsRowActions({
 
   const deleteRowsWithConfirm = useCallback((rowsToDelete?: NodeRow[]) => {
     const targetRows = rowsToDelete && rowsToDelete.length > 0 ? rowsToDelete : operationRows;
-    if (!snapshot || targetRows.length === 0) {
+    if (targetRows.length === 0) {
       return;
     }
     Modal.confirm({
@@ -170,26 +239,35 @@ export function useSubscriptionsRowActions({
       okText: "确定",
       cancelText: "取消",
       onOk: async () => {
-        let currentSnapshot = snapshot;
-        for (const row of targetRows) {
-          currentSnapshot = await daemonApi.removeNode(row.groupId, row.node.id);
+        try {
+          await runAction(() =>
+            daemonApi.removeNodes({
+              items: targetRows.map((row) => ({
+                groupId: row.groupId,
+                nodeId: row.node.id,
+              })),
+            }),
+          );
+          setSelectedRowKeys((previous) =>
+            previous.filter(
+              (keyItem) => !targetRows.some((row) => row.node.id === keyItem.toString()),
+            ),
+          );
+          notice.success(`已删除 ${targetRows.length} 条节点`);
+        } catch (error) {
+          notice.error(error instanceof Error ? error.message : "删除节点失败");
+          throw error;
         }
-        setSelectedRowKeys((previous) =>
-          previous.filter(
-            (keyItem) => !targetRows.some((row) => row.node.id === keyItem.toString()),
-          ),
-        );
-        await runAction(async () => currentSnapshot);
       },
     });
   }, [
     activeTabId,
     allGroupTabId,
     currentTabGroup?.name,
+    notice,
     operationRows,
     runAction,
     setSelectedRowKeys,
-    snapshot,
   ]);
 
   const handleDeleteRowsFromMenu = useCallback(() => {
@@ -210,5 +288,7 @@ export function useSubscriptionsRowActions({
     handleMoveOrCopyFromMenu,
     handleDeleteRowsFromMenu,
     deleteRowsWithConfirm,
+    pullSubscriptionForGroup,
+    isPullSubscriptionPending,
   };
 }

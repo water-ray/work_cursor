@@ -6,15 +6,15 @@
   "description": "Wateray desktop frontend powered by Tauri v2 + React + Ant Design",
   "scripts": {
     "dev": "node scripts/run-tauri-dev.mjs dev",
-    "web:dev": "vite",
-    "build": "vite build",
-    "preview": "vite preview",
+    "web:dev": "python ../scripts/build/common/build_renderer.py dev",
+    "build": "python ../scripts/build/common/build_renderer.py build",
+    "preview": "python ../scripts/build/common/build_renderer.py preview",
     "typecheck": "tsc --noEmit",
     "tauri": "tauri",
     "tauri:build": "tauri build",
     "android:init": "tauri android init --ci",
-    "android:dev": "tauri android dev",
-    "android:build:debug": "tauri android build --debug --apk --ci"
+    "android:dev": "python ../scripts/build/android/run_dev.py",
+    "android:build:debug": "python ../scripts/build/android/build_debug.py"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

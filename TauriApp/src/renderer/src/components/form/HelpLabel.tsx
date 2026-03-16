@@ -1,8 +1,10 @@
 import { Popover, Space, Typography } from "antd";
-import { isValidElement } from "react";
+import type { TooltipPlacement } from "antd/es/tooltip";
+import { isValidElement, useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
 import { BiIcon } from "../icons/BiIcon";
+import { isMobileRuntime } from "../../platform/runtimeStore";
 
 export interface HelpContentSections {
   scene?: ReactNode;
@@ -111,6 +113,51 @@ export function HelpLabel({
   helpTitle = "配置说明",
   helpMaxWidth = 520,
 }: HelpLabelProps) {
+  const isMobileView = isMobileRuntime();
+  const anchorRef = useRef<HTMLSpanElement | null>(null);
+  const [open, setOpen] = useState(false);
+  const [mobilePlacement, setMobilePlacement] = useState<TooltipPlacement>("bottom");
+  const [mobilePopoverWidth, setMobilePopoverWidth] = useState<number>(() => {
+    if (typeof window === "undefined") {
+      return helpMaxWidth;
+    }
+    return Math.min(helpMaxWidth, Math.max(220, window.innerWidth - 24));
+  });
+
+  const updateMobilePopoverLayout = useCallback(() => {
+    if (!isMobileView || typeof window === "undefined") {
+      return;
+    }
+    const viewportWidth = Math.max(280, Math.round(window.innerWidth || 0));
+    const viewportHeight = Math.max(0, Math.round(window.innerHeight || 0));
+    setMobilePopoverWidth(Math.min(helpMaxWidth, Math.max(220, viewportWidth - 24)));
+    const anchorRect = anchorRef.current?.getBoundingClientRect();
+    if (!anchorRect || viewportHeight <= 0) {
+      setMobilePlacement("bottom");
+      return;
+    }
+    const anchorCenterY = anchorRect.top + anchorRect.height / 2;
+    setMobilePlacement(anchorCenterY < viewportHeight / 2 ? "bottom" : "top");
+  }, [helpMaxWidth, isMobileView]);
+
+  useEffect(() => {
+    if (!isMobileView || !open) {
+      return;
+    }
+    updateMobilePopoverLayout();
+    const handleViewportChange = () => {
+      updateMobilePopoverLayout();
+    };
+    window.addEventListener("resize", handleViewportChange);
+    window.addEventListener("scroll", handleViewportChange, true);
+    return () => {
+      window.removeEventListener("resize", handleViewportChange);
+      window.removeEventListener("scroll", handleViewportChange, true);
+    };
+  }, [isMobileView, open, updateMobilePopoverLayout]);
+
+  const resolvedPopoverWidth = isMobileView ? mobilePopoverWidth : helpMaxWidth;
+
   return (
     <Space
       size={6}
@@ -120,16 +167,45 @@ export function HelpLabel({
       {typeof label === "string" ? <Typography.Text>{label}</Typography.Text> : label}
       {helpContent ? (
         <Popover
+          open={open}
           trigger="click"
-          placement="rightTop"
-          title={helpTitle}
+          placement={isMobileView ? mobilePlacement : "rightTop"}
+          title={
+            <div style={{ maxWidth: resolvedPopoverWidth, overflowWrap: "anywhere" }}>
+              {helpTitle}
+            </div>
+          }
           content={
-            <div style={{ maxWidth: helpMaxWidth, lineHeight: 1.5 }}>
+            <div
+              style={{
+                width: resolvedPopoverWidth,
+                maxWidth: resolvedPopoverWidth,
+                lineHeight: 1.5,
+                overflowWrap: "anywhere",
+                wordBreak: "break-word",
+              }}
+            >
               {renderHelpContent(helpContent)}
             </div>
           }
+          overlayStyle={
+            isMobileView
+              ? {
+                  maxWidth: resolvedPopoverWidth,
+                  width: resolvedPopoverWidth,
+                }
+              : undefined
+          }
+          getPopupContainer={() => document.body}
+          onOpenChange={(nextOpen) => {
+            if (isMobileView && nextOpen) {
+              updateMobilePopoverLayout();
+            }
+            setOpen(nextOpen);
+          }}
         >
           <span
+            ref={anchorRef}
             className="help-popover-anchor"
             data-help-popover="true"
             onMouseDown={(event) => {

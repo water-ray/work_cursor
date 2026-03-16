@@ -632,9 +632,36 @@ func normalizeConvertedPayload(value any) string {
 	}
 }
 
+func normalizeURICandidateText(value string) string {
+	return strings.TrimSpace(strings.ReplaceAll(value, "\r\n", "\n"))
+}
+
+func shouldAddDecodedWholeContentCandidate(content string, decoded string) bool {
+	if !strings.Contains(decoded, "://") {
+		return false
+	}
+	lines := splitLines(content)
+	meaningful := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "//") {
+			continue
+		}
+		meaningful = append(meaningful, line)
+	}
+	if len(meaningful) != 1 {
+		return true
+	}
+	decodedLine, ok := decodeBase64String(meaningful[0])
+	if !ok {
+		return true
+	}
+	return normalizeURICandidateText(decodedLine) != normalizeURICandidateText(decoded)
+}
+
 func (p *SubscriptionParser) parseURILines(content string, groupID string) []Node {
 	candidates := []string{content}
-	if decoded, ok := decodeBase64String(content); ok && strings.Contains(decoded, "://") {
+	if decoded, ok := decodeBase64String(content); ok && shouldAddDecodedWholeContentCandidate(content, decoded) {
 		candidates = append(candidates, decoded)
 	}
 

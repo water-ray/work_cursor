@@ -21,6 +21,7 @@ type Service interface {
 	AddManualNode(ctx context.Context, req AddManualNodeRequest) (StateSnapshot, error)
 	UpdateManualNode(ctx context.Context, req UpdateManualNodeRequest) (StateSnapshot, error)
 	ImportManualNodesText(ctx context.Context, req ImportManualNodesTextRequest) (StateSnapshot, error)
+	RemoveNodes(ctx context.Context, req RemoveNodesRequest) (StateSnapshot, error)
 	TransferNodes(ctx context.Context, req TransferNodesRequest) (StateSnapshot, error)
 	ReorderNodes(ctx context.Context, req ReorderNodesRequest) (StateSnapshot, error)
 	ReorderGroups(ctx context.Context, req ReorderGroupsRequest) (StateSnapshot, error)

@@ -576,10 +576,31 @@ function parseUriNode(line: string, groupId: string, index: number): VpnNode | n
   });
 }
 
+function normalizeUriCandidateText(value: string): string {
+  return value.replace(/\r\n/g, "\n").trim();
+}
+
+function shouldAddDecodedWholeContentCandidate(content: string, decodedContent: string): boolean {
+  if (!decodedContent.includes("://")) {
+    return false;
+  }
+  const lines = splitLines(content)
+    .map((item) => item.trim())
+    .filter((item) => item !== "" && !item.startsWith("#") && !item.startsWith("//"));
+  if (lines.length !== 1) {
+    return true;
+  }
+  const decodedLine = decodeBase64String(lines[0]);
+  if (decodedLine === "") {
+    return true;
+  }
+  return normalizeUriCandidateText(decodedLine) !== normalizeUriCandidateText(decodedContent);
+}
+
 function parseUriLines(content: string, groupId: string): VpnNode[] {
   const candidates = [content];
   const decodedContent = decodeBase64String(content);
-  if (decodedContent.includes("://")) {
+  if (shouldAddDecodedWholeContentCandidate(content, decodedContent)) {
     candidates.push(decodedContent);
   }
   const nodes: VpnNode[] = [];

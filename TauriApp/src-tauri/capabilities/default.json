@@ -26,7 +26,13 @@
     "mobile-host:allow-checkConfig",
     "mobile-host:allow-start",
     "mobile-host:allow-stop",
+    "mobile-host:allow-clearDnsCache",
     "mobile-host:allow-probe",
+    "mobile-host:allow-probeStart",
+    "mobile-host:allow-probeCancel",
+    "mobile-host:allow-getTaskQueue",
+    "mobile-host:allow-dnsHealth",
+    "mobile-host:allow-switchSelectors",
     {
       "identifier": "http:default",
       "allow": [

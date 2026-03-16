@@ -23,6 +23,7 @@ import type { MouseEvent as ReactMouseEvent, ReactNode } from "react";
 import { DraftActionBar } from "../../components/draft/DraftActionBar";
 import { HelpLabel } from "../../components/form/HelpLabel";
 import { SwitchWithLabel } from "../../components/form/SwitchWithLabel";
+import { CountryFlag } from "../../components/flag/CountryFlag";
 import { BiIcon } from "../../components/icons/BiIcon";
 import { useAppNotice } from "../../components/notify/AppNoticeProvider";
 import { useDraftNavLock } from "../../hooks/useDraftNavLock";
@@ -48,6 +49,8 @@ import type { ColumnKey, NodeRow, SortState } from "./subscriptionsTableColumns"
 import { useSubscriptionsRowActions } from "./useSubscriptionsRowActions";
 import { useSubscriptionsGroupActions } from "./useSubscriptionsGroupActions";
 import { SubscriptionNodeEditorModal } from "./SubscriptionNodeEditorModal";
+import { MobileSwipeActionCard } from "./MobileSwipeActionCard";
+import { MobileVirtualList } from "./MobileVirtualList";
 import {
   protocolLabel as formatNodeProtocolLabel,
   supportedNodeProtocols,
@@ -73,12 +76,17 @@ import type {
 } from "../../../../shared/daemon";
 import { normalizeCountryCode } from "../../app/data/countryMetadata";
 import type { DaemonPageProps } from "../../app/types";
+import { isMobileRuntime } from "../../platform/runtimeStore";
 import { daemonApi } from "../../services/daemonApi";
 import { listenSubscriptionsExternalFocus } from "../../services/subscriptionsExternalFocus";
+import { listenSubscriptionsUiAction } from "../../services/subscriptionsUiEvents";
 
 const ALL_GROUP_TAB_ID = "__all_groups__";
 const ADD_GROUP_TAB_ID = "__add_group__";
 const subscriptionsTableScrollHeightPx = 360;
+const mobileVirtualNodeCardHeightPx = 52;
+const mobileVirtualNodeCardGapPx = 8;
+
 function formatProbeExecutionHint(summary: ProbeNodesSummary | undefined): string {
   const cachedCount = Math.max(0, Number(summary?.cachedResultCount ?? 0));
   const freshCount = Math.max(0, Number(summary?.freshProbeCount ?? 0));
@@ -232,6 +240,74 @@ function formatTrafficMB(value: number): string {
   return `${value.toFixed(1)} MB`;
 }
 
+function formatNodeProtocolCompactLabel(protocol: string | undefined): string {
+  const normalized = String(protocol ?? "").trim().toUpperCase();
+  if (normalized === "") {
+    return "-";
+  }
+  return normalized.length <= 6 ? normalized : normalized.slice(0, 6);
+}
+
+function resolveMobileGroupMetaLabel(group: NodeGroup): string {
+  return group.kind === "subscription" ? "订阅分组" : "普通分组";
+}
+
+function formatProbeScoreLabel(value: number | undefined): string {
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+    return String(Math.round(value));
+  }
+  return "-";
+}
+
+function formatProbeLatencyLabel(value: number | undefined): string {
+  if (typeof value === "number" && Number.isFinite(value) && value !== 0) {
+    return String(Math.round(value));
+  }
+  return "-";
+}
+
+type MobileProbeMetricTone = "good" | "warn" | "bad" | "muted" | "pending";
+
+function resolveMobileProbeToneClass(tone: MobileProbeMetricTone): string {
+  return `is-${tone}`;
+}
+
+function resolveMobileLatencyMetricTone(value: number | undefined): MobileProbeMetricTone {
+  const normalized = Math.round(Number(value ?? 0));
+  if (normalized === -1 || normalized >= 1000) {
+    return "bad";
+  }
+  if (normalized >= 200) {
+    return "warn";
+  }
+  if (normalized >= 1) {
+    return "good";
+  }
+  return "muted";
+}
+
+function resolveMobileScoreMetricTone(value: number | undefined): MobileProbeMetricTone {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    return "muted";
+  }
+  const normalized = Math.round(value);
+  if (normalized >= 86) {
+    return "good";
+  }
+  if (normalized >= 51) {
+    return "warn";
+  }
+  return "bad";
+}
+
+function resolveMobileMetricText(
+  value: number | undefined,
+  pending: boolean,
+  formatter: (input: number | undefined) => string,
+): string {
+  return pending ? "探测中" : formatter(value);
+}
+
 function resolveTrafficMonitorIntervalSec(value: number | undefined): 0 | 1 | 2 | 5 {
   if (value === 1 || value === 2 || value === 5) {
     return value;
@@ -332,7 +408,15 @@ export function SubscriptionsPage({
   snapshot,
   loading,
   runAction,
-}: DaemonPageProps) {
+  active = true,
+}: DaemonPageProps & {
+  active?: boolean;
+}) {
+  const isMobileView = isMobileRuntime();
+  const probeRunsInBackground = isMobileView;
+  const backgroundTaskHint = probeRunsInBackground
+    ? "请通过左上角悬浮图标查看进度。"
+    : "请通过后台任务查看进度。";
   const notice = useAppNotice();
   const draftNotice = useDraftNotice();
   const groups = snapshot?.groups ?? [];
@@ -346,8 +430,12 @@ export function SubscriptionsPage({
     }
     return groups[0].id;
   });
+  const [mobileExpandedGroupId, setMobileExpandedGroupId] = useState<string | null>(() =>
+    snapshot?.activeGroupId ? snapshot.activeGroupId : (groups[0]?.id ?? null),
+  );
   const initializedDefaultTabRef = useRef(activeTabId !== ALL_GROUP_TAB_ID);
   const [selectedRowKeys, setSelectedRowKeys] = useState<string[]>([]);
+  const [mobileMultiSelectEnabled, setMobileMultiSelectEnabled] = useState(false);
   const [localActiveNodeID, setLocalActiveNodeID] = useState<string>("");
   const [sortState, setSortState] = useState<SortState>({
     key: "",
@@ -412,6 +500,7 @@ export function SubscriptionsPage({
     url: string;
   }>();
   const addSubscriptionUrlValue = Form.useWatch("url", subscriptionForm);
+  const showAddSubscriptionPullHint = String(addSubscriptionUrlValue ?? "").trim() !== "";
 
   useEffect(() => {
     let raf1 = 0;
@@ -490,10 +579,19 @@ export function SubscriptionsPage({
     }
     return next;
   }, [trafficMonitoringEnabled, snapshot?.activeConnectionNodes]);
-  const baseRows = useMemo(
-    () => (tableRenderReady ? groupRows(orderedGroups, activeTabId) : []),
-    [tableRenderReady, orderedGroups, activeTabId],
-  );
+  const baseRows = useMemo(() => {
+    if (isMobileView) {
+      if (!active) {
+        return [] as NodeRow[];
+      }
+      const activeGroup = orderedGroups.find((group) => group.id === activeTabId);
+      if (!activeGroup) {
+        return [] as NodeRow[];
+      }
+      return groupRows([activeGroup], activeGroup.id);
+    }
+    return tableRenderReady ? groupRows(orderedGroups, activeTabId) : [];
+  }, [active, activeTabId, isMobileView, orderedGroups, tableRenderReady]);
   const rows = useMemo(() => {
     const rowsWithRealtime = baseRows.map((row) => {
       const realtime = realtimeNodeSpeedByID.get(row.node.id);
@@ -554,6 +652,18 @@ export function SubscriptionsPage({
   }, [orderedGroups, snapshot?.activeGroupId]);
 
   useEffect(() => {
+    if (!isMobileView) {
+      return;
+    }
+    setMobileExpandedGroupId((previous) => {
+      if (!previous) {
+        return previous;
+      }
+      return orderedGroups.some((group) => group.id === previous) ? previous : null;
+    });
+  }, [isMobileView, orderedGroups]);
+
+  useEffect(() => {
     if (activeTabId === ALL_GROUP_TAB_ID) {
       if (sortState.order !== "none") {
         setSortState({
@@ -577,11 +687,14 @@ export function SubscriptionsPage({
       initializedDefaultTabRef.current = true;
       setContextMenu(null);
       setActiveTabId(detail.groupId);
+      if (isMobileView) {
+        setMobileExpandedGroupId(detail.groupId);
+      }
       setSelectedRowKeys([detail.nodeId]);
       setPendingExternalFocus(detail);
       setLocalActiveNodeID(detail.nodeId);
     });
-  }, [orderedGroups]);
+  }, [isMobileView, orderedGroups]);
 
   useEffect(() => {
     if (contextMenu == null) {
@@ -672,6 +785,10 @@ export function SubscriptionsPage({
   const currentTabGroup = useMemo(
     () => orderedGroups.find((group) => group.id === activeTabId) ?? null,
     [orderedGroups, activeTabId],
+  );
+  const editingGroup = useMemo(
+    () => orderedGroups.find((group) => group.id === editingGroupID) ?? null,
+    [editingGroupID, orderedGroups],
   );
   const manualGroups = useMemo(
     () => orderedGroups.filter((group) => group.kind === "manual"),
@@ -936,14 +1053,12 @@ export function SubscriptionsPage({
         groupId: activeGroupId,
         nodeIds: targetNodeIDs,
         probeType: "node_latency",
-        background: window.waterayPlatform?.isMobile === true,
+        background: probeRunsInBackground,
       });
       const next = await runAction(async () => probeResult.snapshot);
-      if (probeResult.task && !probeResult.summary) {
+      if (probeResult.task) {
         notice.info(
-          window.waterayPlatform?.isMobile === true
-            ? "延迟探测已加入后台任务，请通过左上角悬浮图标查看进度。"
-            : "延迟探测已加入后台任务，请通过后台任务查看进度。",
+          `延迟探测已加入后台任务${formatProbeExecutionHint(probeResult.summary)}，${backgroundTaskHint}`,
           { title: "后台任务" },
         );
         return;
@@ -977,14 +1092,12 @@ export function SubscriptionsPage({
         groupId: activeGroupId,
         nodeIds: targetNodeIDs,
         probeType: "real_connect",
-        background: window.waterayPlatform?.isMobile === true,
+        background: probeRunsInBackground,
       });
       const next = await runAction(async () => probeResult.snapshot);
-      if (probeResult.task && !probeResult.summary) {
+      if (probeResult.task) {
         notice.info(
-          window.waterayPlatform?.isMobile === true
-            ? "节点评分已加入后台任务，请通过左上角悬浮图标查看进度。"
-            : "节点评分已加入后台任务，请通过后台任务查看进度。",
+          `节点评分已加入后台任务${formatProbeExecutionHint(probeResult.summary)}，${backgroundTaskHint}`,
           { title: "后台任务" },
         );
         return;
@@ -1256,14 +1369,12 @@ export function SubscriptionsPage({
           groupId: currentTabGroup.id,
           nodeIds: targetNodeIDs,
           probeTypes,
-          background: window.waterayPlatform?.isMobile === true,
+          background: probeRunsInBackground,
         });
         const next = await runAction(async () => probeResult.snapshot);
-        if (probeResult.task && !probeResult.summary) {
+        if (probeResult.task) {
           notice.info(
-            window.waterayPlatform?.isMobile === true
-              ? `${actionName}已加入后台任务，请通过左上角悬浮图标查看进度。`
-              : `${actionName}已加入后台任务，请通过后台任务查看进度。`,
+            `${actionName}已加入后台任务${formatProbeExecutionHint(probeResult.summary)}，${backgroundTaskHint}`,
             { title: "后台任务" },
           );
           return;
@@ -1437,6 +1548,176 @@ export function SubscriptionsPage({
     }
   }, [operationRows, probeBusy, runAction, updatingNodeCountries, notice]);
 
+  const copySubscriptionUrlForGroup = useCallback(
+    async (group: NodeGroup): Promise<void> => {
+      if (group.kind !== "subscription" || !group.subscriptionId) {
+        return;
+      }
+      const source = subscriptions.find((item) => item.id === group.subscriptionId) ?? null;
+      const url = (source?.url ?? "").trim();
+      if (!url) {
+        notice.warning("当前分组没有可复制的订阅地址。");
+        return;
+      }
+      try {
+        await navigator.clipboard.writeText(url);
+        notice.success("订阅链接已复制");
+      } catch {
+        notice.warning("复制失败，请检查系统剪贴板权限");
+      }
+    },
+    [notice, subscriptions],
+  );
+
+  const probeGroupByTypes = useCallback(
+    async (
+      group: NodeGroup,
+      probeTypes: ProbeType[],
+      actionName: string,
+      targetRows?: NodeRow[],
+    ): Promise<void> => {
+      if (!snapshot || snapshot.connectionStage !== "connected") {
+        notice.warning("请先启动代理，再执行探测。");
+        return;
+      }
+      const scopedRows = targetRows && targetRows.length > 0 ? targetRows : groupRows([group], group.id);
+      const targetNodeIDs = Array.from(new Set(scopedRows.map((row) => row.node.id)));
+      if (targetNodeIDs.length === 0) {
+        notice.warning("当前分组没有可探测节点。");
+        return;
+      }
+      const scoreOnlyAction =
+        probeTypes.length === 1 && probeTypes[0] === "real_connect";
+      const targetNodeIDSet = new Set(targetNodeIDs);
+      initializedDefaultTabRef.current = true;
+      setActiveTabId(group.id);
+      setProbingNodes(true);
+      try {
+        const probeResult = await daemonApi.probeNodesWithSummary({
+          groupId: group.id,
+          nodeIds: targetNodeIDs,
+          probeTypes,
+          background: probeRunsInBackground,
+        });
+        const next = await runAction(async () => probeResult.snapshot);
+        if (probeResult.task) {
+          notice.info(`${actionName}已加入后台任务${formatProbeExecutionHint(probeResult.summary)}，${backgroundTaskHint}`, {
+            title: "后台任务",
+          });
+          return;
+        }
+        if (Number(probeResult.summary?.requested ?? 0) <= 0) {
+          return;
+        }
+        const nextRows = groupRows(next.groups ?? [], group.id);
+        const scopedRows = nextRows.filter((row) => targetNodeIDSet.has(row.node.id));
+        const summaries: string[] = [];
+        if (probeTypes.includes("node_latency")) {
+          const available = scopedRows.filter((row) => row.node.latencyMs > 0).length;
+          summaries.push(`延迟可用 ${available}/${scopedRows.length}`);
+        }
+        if (probeTypes.includes("real_connect")) {
+          const available = scopedRows.filter((row) => (row.node.probeRealConnectMs ?? -1) > 0).length;
+          summaries.push(
+            `${scoreOnlyAction ? "评分可用" : "真连可用"} ${available}/${scopedRows.length}`,
+          );
+          const skippedByLatency = Math.max(
+            0,
+            Number(probeResult.summary?.skippedRealConnectDueToLatency ?? 0),
+          );
+          if (skippedByLatency > 0) {
+            summaries.push(`延迟不可用跳过 ${skippedByLatency}`);
+          }
+          const reprobedLatency = Math.max(
+            0,
+            Number(probeResult.summary?.reprobedLatencyBeforeRealConnect ?? 0),
+          );
+          if (reprobedLatency > 0) {
+            summaries.push(`真连前延迟重测 ${reprobedLatency}`);
+          }
+        }
+        const executionHint = formatProbeExecutionHint(probeResult.summary);
+        const summaryText = summaries.length > 0 ? summaries.join("，") : `节点数 ${scopedRows.length}`;
+        notice.success(`${actionName}完成：${summaryText}${executionHint}`);
+      } catch (error) {
+        notice.error(error instanceof Error ? error.message : `${actionName}失败`);
+      } finally {
+        setProbingNodes(false);
+      }
+    },
+    [backgroundTaskHint, notice, probeRunsInBackground, runAction, snapshot],
+  );
+
+  const clearProbeDataForGroup = useCallback(
+    async (group: NodeGroup, targetRows?: NodeRow[]): Promise<void> => {
+      if (probeBusy || clearingProbeData || resettingTrafficStats) {
+        return;
+      }
+      const scopedRows = targetRows && targetRows.length > 0 ? targetRows : groupRows([group], group.id);
+      const targetNodeIDs = Array.from(new Set(scopedRows.map((row) => row.node.id)));
+      if (targetNodeIDs.length === 0) {
+        notice.warning("当前分组没有可重置评分的节点。");
+        return;
+      }
+      initializedDefaultTabRef.current = true;
+      setActiveTabId(group.id);
+      setClearingProbeData(true);
+      try {
+        await runAction(() =>
+          daemonApi.clearProbeData({
+            groupId: group.id,
+            nodeIds: targetNodeIDs,
+            probeTypes: ["node_latency", "real_connect"],
+          }),
+        );
+        notice.success(`已重置 ${targetNodeIDs.length} 个节点的评分数据`);
+      } catch (error) {
+        notice.error(error instanceof Error ? error.message : "重置评分失败");
+      } finally {
+        setClearingProbeData(false);
+      }
+    },
+    [clearingProbeData, notice, probeBusy, resettingTrafficStats, runAction],
+  );
+
+  const resetTrafficStatsForGroup = useCallback(
+    async (group: NodeGroup, targetRows?: NodeRow[]): Promise<void> => {
+      if (probeBusy || clearingProbeData || resettingTrafficStats) {
+        return;
+      }
+      const scopedRows = targetRows && targetRows.length > 0 ? targetRows : groupRows([group], group.id);
+      const targetNodeIDs = Array.from(new Set(scopedRows.map((row) => row.node.id)));
+      if (targetNodeIDs.length === 0) {
+        notice.warning("当前分组没有可重置流量的节点。");
+        return;
+      }
+      initializedDefaultTabRef.current = true;
+      setActiveTabId(group.id);
+      setResettingTrafficStats(true);
+      try {
+        await runAction(() =>
+          daemonApi.resetTrafficStats({
+            groupId: group.id,
+            nodeIds: targetNodeIDs,
+          }),
+        );
+        notice.success(`已重置 ${targetNodeIDs.length} 个节点的流量统计`);
+      } catch (error) {
+        notice.error(error instanceof Error ? error.message : "重置流量统计失败");
+      } finally {
+        setResettingTrafficStats(false);
+      }
+    },
+    [clearingProbeData, notice, probeBusy, resettingTrafficStats, runAction],
+  );
+
+  const updateSingleNodeCountry = useCallback(
+    async (_row: NodeRow): Promise<void> => {
+      notice.warning("移动端暂未接入更新国家能力");
+    },
+    [notice],
+  );
+
   const copyNodesToClipboard = useCallback(
     async (rowsToCopy?: NodeRow[]): Promise<void> => {
       const targetRows = rowsToCopy && rowsToCopy.length > 0 ? rowsToCopy : operationRows;
@@ -1534,6 +1815,9 @@ export function SubscriptionsPage({
       return;
     }
     const normalizedProbeSettings = getNormalizedProbeSettingsDraft();
+    if (isMobileView) {
+      normalizedProbeSettings.autoProbeOnActiveGroup = false;
+    }
     const pendingNodeOrders: Record<string, string[]> = {
       ...draftNodeOrders,
     };
@@ -1604,6 +1888,7 @@ export function SubscriptionsPage({
     hasAnyDraftChanges,
     applyingDraftChanges,
     getNormalizedProbeSettingsDraft,
+    isMobileView,
     applyProbeSettingsFromSnapshot,
     hasDraftOrderChanges,
     hasProbeSettingsDraftChanges,
@@ -1855,6 +2140,8 @@ export function SubscriptionsPage({
     handleMoveOrCopyFromMenu,
     handleDeleteRowsFromMenu,
     deleteRowsWithConfirm,
+    pullSubscriptionForGroup,
+    isPullSubscriptionPending,
   } = useSubscriptionsRowActions({
     snapshot,
     activeTabId,
@@ -1865,6 +2152,7 @@ export function SubscriptionsPage({
     operationRows,
     anchorRow,
     runAction,
+    notice,
     openNodeEditor,
     setSelectedRowKeys,
     activateNode,
@@ -1873,6 +2161,9 @@ export function SubscriptionsPage({
     clearProbeDataFromContext,
     updateNodeCountriesFromContext,
   });
+  const currentTabPullSubscriptionPending = Boolean(
+    currentTabGroup && isPullSubscriptionPending(currentTabGroup.id),
+  );
 
   const {
     openAddSubscriptionModal,
@@ -1897,6 +2188,18 @@ export function SubscriptionsPage({
     editGroupForm,
     notice,
   });
+
+  useEffect(() => {
+    if (!isMobileView) {
+      return;
+    }
+    return listenSubscriptionsUiAction((detail) => {
+      if (detail.action !== "open_add_group") {
+        return;
+      }
+      openAddSubscriptionModal();
+    });
+  }, [isMobileView, openAddSubscriptionModal]);
 
   const handleMenuClick: MenuProps["onClick"] = ({ key }) => {
     setContextMenu(null);
@@ -2145,8 +2448,303 @@ export function SubscriptionsPage({
     };
   }, [activateNode, copyNodesToClipboard, deleteRowsWithConfirm, openManualRowEditor, pasteNodesFromClipboard, selectedRowKeys]);
 
+  const subscriptionById = useMemo(
+    () => new Map(subscriptions.map((item) => [item.id, item])),
+    [subscriptions],
+  );
+  const mobileExpandedGroupRows = useMemo(() => {
+    if (!isMobileView || !active || !mobileExpandedGroupId) {
+      return [] as NodeRow[];
+    }
+    const expandedGroup = orderedGroups.find((group) => group.id === mobileExpandedGroupId);
+    if (!expandedGroup) {
+      return [] as NodeRow[];
+    }
+    return groupRows([expandedGroup], expandedGroup.id);
+  }, [active, isMobileView, mobileExpandedGroupId, orderedGroups]);
+  const mobileExpandedGroup = useMemo(
+    () => orderedGroups.find((group) => group.id === mobileExpandedGroupId) ?? null,
+    [mobileExpandedGroupId, orderedGroups],
+  );
+  const mobileExpandedGroupRowKeySet = useMemo(
+    () => new Set(mobileExpandedGroupRows.map((row) => row.key)),
+    [mobileExpandedGroupRows],
+  );
+  const mobileSelectedExpandedGroupRows = useMemo(
+    () => mobileExpandedGroupRows.filter((row) => selectedRowKeySet.has(row.key)),
+    [mobileExpandedGroupRows, selectedRowKeySet],
+  );
+  const mobileExpandedGroupActionRows =
+    mobileMultiSelectEnabled && mobileSelectedExpandedGroupRows.length > 0
+      ? mobileSelectedExpandedGroupRows
+      : mobileExpandedGroupRows;
+  const mobileExpandedGroupSelectionCount = mobileSelectedExpandedGroupRows.length;
+  const mobileAllExpandedGroupRowsSelected =
+    mobileExpandedGroupRows.length > 0 &&
+    mobileExpandedGroupSelectionCount === mobileExpandedGroupRows.length;
+  const mobileActionBusy =
+    probeBusy || clearingProbeData || resettingTrafficStats || updatingNodeCountries;
+  const toggleMobileRowSelection = useCallback((rowKey: string) => {
+    setSelectedRowKeys((previous) => {
+      const scoped = previous.filter((item) => mobileExpandedGroupRowKeySet.has(item));
+      return scoped.includes(rowKey)
+        ? scoped.filter((item) => item !== rowKey)
+        : [...scoped, rowKey];
+    });
+  }, [mobileExpandedGroupRowKeySet]);
+  const enterMobileMultiSelectMode = useCallback((rowKey: string) => {
+    setMobileMultiSelectEnabled(true);
+    setSelectedRowKeys((previous) => {
+      const scoped = previous.filter((item) => mobileExpandedGroupRowKeySet.has(item));
+      if (scoped.includes(rowKey)) {
+        return scoped;
+      }
+      return [...scoped, rowKey];
+    });
+  }, [mobileExpandedGroupRowKeySet]);
+  const toggleMobileSelectAllRows = useCallback(() => {
+    setMobileMultiSelectEnabled(true);
+    setSelectedRowKeys((previous) => {
+      const scoped = previous.filter((item) => mobileExpandedGroupRowKeySet.has(item));
+      if (
+        mobileExpandedGroupRows.length > 0 &&
+        scoped.length === mobileExpandedGroupRows.length
+      ) {
+        return [];
+      }
+      return mobileExpandedGroupRows.map((row) => row.key);
+    });
+  }, [mobileExpandedGroupRowKeySet, mobileExpandedGroupRows]);
+  useEffect(() => {
+    if (!isMobileView) {
+      return;
+    }
+    setSelectedRowKeys((previous) => {
+      const next = previous.filter((item) => mobileExpandedGroupRowKeySet.has(item));
+      return next.length === previous.length ? previous : next;
+    });
+  }, [isMobileView, mobileExpandedGroupRowKeySet]);
+  useEffect(() => {
+    if (!isMobileView) {
+      return;
+    }
+    if (!mobileMultiSelectEnabled) {
+      return;
+    }
+    if (mobileExpandedGroupSelectionCount > 0) {
+      return;
+    }
+    setMobileMultiSelectEnabled(false);
+  }, [isMobileView, mobileExpandedGroupSelectionCount, mobileMultiSelectEnabled]);
+  const stopCollapseAction = (event: ReactMouseEvent<HTMLElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+  };
+  const collapseMobileExpandedGroup = () => {
+    setMobileExpandedGroupId(null);
+    setMobileMultiSelectEnabled(false);
+    setSelectedRowKeys([]);
+  };
+  const mobileExpandedGroupCanProbe =
+    snapshot?.connectionStage === "connected" &&
+    mobileExpandedGroupActionRows.length > 0 &&
+    !mobileActionBusy;
+  const mobileExpandedGroupCanReset =
+    mobileExpandedGroupActionRows.length > 0 &&
+    !probeBusy &&
+    !clearingProbeData &&
+    !resettingTrafficStats;
+  const mobileSelectAllIconName = mobileAllExpandedGroupRowsSelected
+    ? "check-square-fill"
+    : mobileExpandedGroupSelectionCount > 0
+      ? "dash-square"
+      : "square";
+
+  const renderMobileCollapsedGroupHeaderActions = (
+    group: NodeGroup,
+    groupSubscriptionUrl: string,
+  ) => (
+    <div className="subscriptions-mobile-group-header-actions">
+      <Tooltip title={groupSubscriptionUrl ? "复制订阅地址" : "当前分组没有订阅地址"}>
+        <Button
+          type="text"
+          size="small"
+          icon={<BiIcon name="copy" />}
+          disabled={!groupSubscriptionUrl}
+          onMouseDown={stopCollapseAction}
+          onClick={(event) => {
+            stopCollapseAction(event);
+            void copySubscriptionUrlForGroup(group);
+          }}
+        />
+      </Tooltip>
+      <Tooltip title="编辑分组">
+        <Button
+          type="text"
+          size="small"
+          icon={<BiIcon name="pencil-square" />}
+          onMouseDown={stopCollapseAction}
+          onClick={(event) => {
+            stopCollapseAction(event);
+            openEditGroupModal(group);
+          }}
+        />
+      </Tooltip>
+      <Tooltip title="删除分组">
+        <Button
+          danger
+          type="text"
+          size="small"
+          icon={<BiIcon name="trash" />}
+          onMouseDown={stopCollapseAction}
+          onClick={(event) => {
+            stopCollapseAction(event);
+            confirmRemoveGroup(group);
+          }}
+        />
+      </Tooltip>
+    </div>
+  );
+
+  const renderMobileExpandedGroupHeaderActions = (group: NodeGroup) => (
+    <div className="subscriptions-mobile-group-header-actions is-expanded">
+      {group.kind === "manual" ? (
+        <Tooltip title="添加节点">
+          <Button
+            type="text"
+            size="small"
+            icon={<BiIcon name="sign-intersection" />}
+            onClick={() => {
+              openNodeEditor({
+                mode: "add",
+                protocol: supportedNodeProtocols[0],
+                groupId: group.id,
+              });
+            }}
+          />
+        </Tooltip>
+      ) : (
+        <Tooltip title="拉取订阅">
+          <Button
+            type="text"
+            size="small"
+            icon={<BiIcon name="arrow-down-square" />}
+            loading={isPullSubscriptionPending(group.id)}
+            disabled={isPullSubscriptionPending(group.id)}
+            onClick={() => {
+              pullSubscriptionForGroup(group.id, group.name);
+            }}
+          />
+        </Tooltip>
+      )}
+    </div>
+  );
+
+  const renderMobileExpandedGroupToolbar = (
+    group: NodeGroup,
+    actionRows: NodeRow[],
+    options?: {
+      sticky?: boolean;
+    },
+  ) => (
+    <div className={`subscriptions-mobile-group-toolbar${options?.sticky ? " is-sticky" : ""}`}>
+      <div className="subscriptions-mobile-group-toolbar-leading">
+        {mobileMultiSelectEnabled ? (
+          <>
+            <button
+              type="button"
+              className="subscriptions-mobile-select-toggle"
+              onClick={() => {
+                toggleMobileSelectAllRows();
+              }}
+            >
+              <BiIcon name={mobileSelectAllIconName} />
+            </button>
+            <Typography.Text
+              type="secondary"
+              className="subscriptions-mobile-group-toolbar-count"
+            >
+              {mobileExpandedGroupSelectionCount} 条记录
+            </Typography.Text>
+          </>
+        ) : null}
+      </div>
+      <div className="subscriptions-mobile-group-toolbar-actions">
+        <Tooltip title={mobileExpandedGroupCanProbe ? "一键探测延迟" : "需先启动代理且当前范围内有节点"}>
+          <Button
+            type="text"
+            size="small"
+            icon={<BiIcon name="lightning-charge-fill" />}
+            disabled={!mobileExpandedGroupCanProbe}
+            loading={probeBusy}
+            onClick={() => {
+              void probeGroupByTypes(group, ["node_latency"], "延迟探测", actionRows);
+            }}
+          />
+        </Tooltip>
+        <Tooltip title={mobileExpandedGroupCanProbe ? "一键评分" : "需先启动代理且当前范围内有节点"}>
+          <Button
+            type="text"
+            size="small"
+            icon={<BiIcon name="star-fill" />}
+            disabled={!mobileExpandedGroupCanProbe}
+            loading={probeBusy}
+            onClick={() => {
+              void probeGroupByTypes(group, ["real_connect"], "节点评分", actionRows);
+            }}
+          />
+        </Tooltip>
+        <Tooltip title={mobileExpandedGroupCanReset ? "重置评分" : "当前没有可重置评分的数据"}>
+          <Button
+            type="text"
+            size="small"
+            icon={<BiIcon name="eraser-fill" />}
+            disabled={!mobileExpandedGroupCanReset}
+            loading={clearingProbeData}
+            onClick={() => {
+              void clearProbeDataForGroup(group, actionRows);
+            }}
+          />
+        </Tooltip>
+        <Tooltip title={mobileExpandedGroupCanReset ? "重置流量" : "当前没有可重置流量的数据"}>
+          <Button
+            type="text"
+            size="small"
+            icon={<BiIcon name="lightbulb-off" />}
+            disabled={!mobileExpandedGroupCanReset}
+            loading={resettingTrafficStats}
+            onClick={() => {
+              void resetTrafficStatsForGroup(group, actionRows);
+            }}
+          />
+        </Tooltip>
+        <Tooltip
+          title={
+            actionRows.length > 0
+              ? mobileMultiSelectEnabled
+                ? `删除已选 ${mobileExpandedGroupSelectionCount} 个节点`
+                : "删除当前分组全部节点"
+              : "当前没有可删除节点"
+          }
+        >
+          <Button
+            type="text"
+            size="small"
+            danger
+            icon={<BiIcon name="trash" />}
+            disabled={actionRows.length === 0}
+            onClick={() => {
+              deleteRowsWithConfirm(actionRows);
+            }}
+          />
+        </Tooltip>
+      </div>
+    </div>
+  );
+
   return (
     <Space
+      className={`subscriptions-page${isMobileView ? " subscriptions-page-mobile" : ""}`}
       direction="vertical"
       size={12}
       style={{ width: "100%" }}
@@ -2171,6 +2769,285 @@ export function SubscriptionsPage({
         }}
       />
 
+      {isMobileView ? (
+        <Card loading={loading} className="subscriptions-mobile-section-card">
+          {orderedGroups.length === 0 ? (
+            <div className="subscriptions-mobile-empty-state">
+              <Typography.Text type="secondary">当前没有可用分组。</Typography.Text>
+            </div>
+          ) : (
+            <>
+              {mobileExpandedGroup ? (
+                <div className="subscriptions-mobile-sticky-active-group">
+                  <div className="subscriptions-mobile-active-group-panel">
+                    <div className="subscriptions-mobile-group-header is-sticky">
+                      <button
+                        type="button"
+                        className="subscriptions-mobile-group-header-main subscriptions-mobile-group-header-toggle"
+                        onClick={collapseMobileExpandedGroup}
+                      >
+                        <span className="subscriptions-mobile-group-collapse-icon">
+                          <BiIcon name="chevron-up" />
+                        </span>
+                        <div className="subscriptions-mobile-group-header-text">
+                          <span className="subscriptions-mobile-group-header-name-row">
+                            <Typography.Text strong className="subscriptions-mobile-group-header-name">
+                              {mobileExpandedGroup.name}
+                            </Typography.Text>
+                            {snapshot?.activeGroupId === mobileExpandedGroup.id ? (
+                              <span className="active-group-dot" />
+                            ) : null}
+                          </span>
+                          <Typography.Text
+                            type="secondary"
+                            className="subscriptions-mobile-group-header-meta"
+                          >
+                            {resolveMobileGroupMetaLabel(mobileExpandedGroup)} ·{" "}
+                            {mobileExpandedGroup.nodes.length} 个节点
+                          </Typography.Text>
+                        </div>
+                      </button>
+                      {renderMobileExpandedGroupHeaderActions(mobileExpandedGroup)}
+                    </div>
+                    {renderMobileExpandedGroupToolbar(
+                      mobileExpandedGroup,
+                      mobileExpandedGroupActionRows,
+                      { sticky: true },
+                    )}
+                    <div className="subscriptions-mobile-active-group-nodes-scroll">
+                      {mobileExpandedGroupRows.length === 0 ? (
+                        <div className="subscriptions-mobile-empty-state is-panel-empty">
+                          <Typography.Text type="secondary">当前分组暂无节点。</Typography.Text>
+                        </div>
+                      ) : (
+                        <MobileVirtualList
+                          items={mobileExpandedGroupRows}
+                          className="subscriptions-mobile-virtual-list"
+                          itemHeight={mobileVirtualNodeCardHeightPx}
+                          itemGap={mobileVirtualNodeCardGapPx}
+                          getItemKey={(row) => row.key}
+                          renderItem={(row) => {
+                            const isActiveNode = row.node.id === activeNodeID;
+                            const isSelected = selectedRowKeySet.has(row.key);
+                            const showSelectionState = mobileMultiSelectEnabled;
+                            return (
+                              <MobileSwipeActionCard
+                                leadingActions={
+                                  mobileMultiSelectEnabled
+                                    ? []
+                                    : [
+                                        {
+                                          key: "select",
+                                          label: "多选",
+                                          icon: <BiIcon name="square" />,
+                                          autoTriggerOnOpen: true,
+                                          onClick: () => {
+                                            enterMobileMultiSelectMode(row.key);
+                                          },
+                                        },
+                                      ]
+                                }
+                                trailingActions={
+                                  mobileMultiSelectEnabled
+                                    ? []
+                                    : [
+                                        {
+                                          key: "country",
+                                          label: "国家",
+                                          icon: <BiIcon name="globe2" />,
+                                          onClick: () => {
+                                            void updateSingleNodeCountry(row);
+                                          },
+                                        },
+                                        {
+                                          key: "edit",
+                                          label: "编辑",
+                                          icon: <BiIcon name="pencil-square" />,
+                                          disabled: mobileExpandedGroup.kind !== "manual",
+                                          onClick: () => {
+                                            openManualRowEditor(row);
+                                          },
+                                        },
+                                        {
+                                          key: "delete",
+                                          label: "删除",
+                                          icon: <BiIcon name="trash" />,
+                                          danger: true,
+                                          onClick: () => {
+                                            deleteRowsWithConfirm([row]);
+                                          },
+                                        },
+                                      ]
+                                }
+                              >
+                                <button
+                                  type="button"
+                                  className={`subscriptions-mobile-node-card${isActiveNode ? " is-active" : ""}${isSelected ? " is-selected" : ""}`}
+                                  onClick={() => {
+                                    if (mobileMultiSelectEnabled) {
+                                      toggleMobileRowSelection(row.key);
+                                      return;
+                                    }
+                                    void activateNode(row);
+                                  }}
+                                >
+                                  {showSelectionState ? (
+                                    <span className="subscriptions-mobile-node-card-check">
+                                      <BiIcon name={isSelected ? "check-square-fill" : "square"} />
+                                    </span>
+                                  ) : null}
+                                  <span className="subscriptions-mobile-node-card-flag">
+                                    {row.country ? (
+                                      <CountryFlag
+                                        code={row.country}
+                                        ariaLabel={row.displayName}
+                                      />
+                                    ) : (
+                                      <BiIcon name="globe2" />
+                                    )}
+                                  </span>
+                                  <div className="subscriptions-mobile-node-card-body">
+                                    {(() => {
+                                      const latencyPending = isProbePending(row.node.id, "node_latency");
+                                      const realConnectPending = isProbePending(row.node.id, "real_connect");
+                                      const scorePending = latencyPending || realConnectPending;
+                                      const scoreText = resolveMobileMetricText(
+                                        row.node.probeScore,
+                                        scorePending,
+                                        formatProbeScoreLabel,
+                                      );
+                                      const latencyText = resolveMobileMetricText(
+                                        row.node.latencyMs,
+                                        latencyPending,
+                                        formatProbeLatencyLabel,
+                                      );
+                                      const realConnectText = resolveMobileMetricText(
+                                        row.node.probeRealConnectMs,
+                                        realConnectPending,
+                                        formatProbeLatencyLabel,
+                                      );
+                                      const scoreTone = scorePending
+                                        ? "pending"
+                                        : resolveMobileScoreMetricTone(row.node.probeScore);
+                                      const latencyTone = latencyPending
+                                        ? "pending"
+                                        : resolveMobileLatencyMetricTone(row.node.latencyMs);
+                                      const realConnectTone = realConnectPending
+                                        ? "pending"
+                                        : resolveMobileLatencyMetricTone(row.node.probeRealConnectMs);
+                                      return (
+                                        <>
+                                          <div className="subscriptions-mobile-node-card-text">
+                                            <Typography.Text
+                                              strong
+                                              className="subscriptions-mobile-node-card-title"
+                                            >
+                                              {row.displayName}
+                                            </Typography.Text>
+                                            <Typography.Text
+                                              type="secondary"
+                                              className="subscriptions-mobile-node-card-subtitle"
+                                            >
+                                              {formatNodeProtocolCompactLabel(row.node.protocol)}
+                                            </Typography.Text>
+                                          </div>
+                                          <div className="subscriptions-mobile-node-card-metrics">
+                                            <span
+                                              className={`subscriptions-mobile-node-card-metric subscriptions-mobile-node-card-score ${resolveMobileProbeToneClass(scoreTone)}`}
+                                            >
+                                              <BiIcon name="star-fill" />
+                                              <span>{scoreText}</span>
+                                            </span>
+                                            <div className="subscriptions-mobile-node-card-latency-row">
+                                              <span
+                                                className={`subscriptions-mobile-node-card-metric subscriptions-mobile-node-card-latency ${resolveMobileProbeToneClass(latencyTone)}`}
+                                              >
+                                                <BiIcon name="lightning-charge-fill" />
+                                                <span>{latencyText}</span>
+                                              </span>
+                                              <span
+                                                className={`subscriptions-mobile-node-card-metric subscriptions-mobile-node-card-latency ${resolveMobileProbeToneClass(realConnectTone)}`}
+                                              >
+                                                <BiIcon name="plug-fill" />
+                                                <span>{realConnectText}</span>
+                                              </span>
+                                            </div>
+                                          </div>
+                                        </>
+                                      );
+                                    })()}
+                                  </div>
+                                </button>
+                              </MobileSwipeActionCard>
+                            );
+                          }}
+                        />
+                      )}
+                    </div>
+                  </div>
+                </div>
+              ) : null}
+              <Collapse
+                accordion
+                className="subscriptions-mobile-group-collapse"
+                activeKey={mobileExpandedGroupId ? [mobileExpandedGroupId] : []}
+                onChange={(key) => {
+                  const nextKey = Array.isArray(key)
+                    ? (key[0] ? String(key[0]) : null)
+                    : key
+                      ? String(key)
+                      : null;
+                  setMobileExpandedGroupId(nextKey);
+                  setMobileMultiSelectEnabled(false);
+                  setSelectedRowKeys([]);
+                  if (nextKey) {
+                    initializedDefaultTabRef.current = true;
+                    setActiveTabId(nextKey);
+                  }
+                }}
+                items={orderedGroups.filter((group) => group.id !== mobileExpandedGroupId).map((group) => {
+                const subscriptionSource =
+                  group.kind === "subscription" && group.subscriptionId
+                    ? (subscriptionById.get(group.subscriptionId) ?? null)
+                    : null;
+                return {
+                  key: group.id,
+                  label: (
+                    <div className="subscriptions-mobile-group-header">
+                      <div className="subscriptions-mobile-group-header-main">
+                        <div className="subscriptions-mobile-group-header-text">
+                          <span className="subscriptions-mobile-group-header-name-row">
+                            <Typography.Text strong className="subscriptions-mobile-group-header-name">
+                              {group.name}
+                            </Typography.Text>
+                            {snapshot?.activeGroupId === group.id ? (
+                              <span className="active-group-dot" />
+                            ) : null}
+                          </span>
+                          <Typography.Text
+                            type="secondary"
+                            className="subscriptions-mobile-group-header-meta"
+                          >
+                            {resolveMobileGroupMetaLabel(group)} · {group.nodes.length} 个节点
+                          </Typography.Text>
+                        </div>
+                      </div>
+                      {group.id === mobileExpandedGroupId
+                        ? null
+                        : renderMobileCollapsedGroupHeaderActions(
+                            group,
+                            subscriptionSource?.url?.trim() ?? "",
+                          )}
+                    </div>
+                  ),
+                  children: null,
+                };
+              })}
+              />
+            </>
+          )}
+        </Card>
+      ) : (
       <Card
         loading={loading}
       >
@@ -2244,14 +3121,21 @@ export function SubscriptionsPage({
               />
             </Tooltip>
             <Tooltip
-              title={canPullSubscription ? "拉取订阅" : "仅订阅分组可用"}
+              title={
+                !canPullSubscription
+                  ? "仅订阅分组可用"
+                  : currentTabPullSubscriptionPending
+                    ? "拉取订阅中"
+                    : "拉取订阅"
+              }
             >
               <Button
                 type="text"
                 size="small"
                 className="subscriptions-main-header-detail-btn"
                 icon={<BiIcon name="arrow-down-square" />}
-                disabled={!canPullSubscription}
+                loading={currentTabPullSubscriptionPending}
+                disabled={!canPullSubscription || currentTabPullSubscriptionPending}
                 onClick={() => {
                   handlePullSubscriptionFromMenu();
                 }}
@@ -2560,10 +3444,11 @@ export function SubscriptionsPage({
           )}
         </div>
       </Card>
+      )}
 
       <Card
         size="small"
-        className="subscriptions-probe-card"
+        className={`subscriptions-probe-card${isMobileView ? " subscriptions-mobile-section-card subscriptions-mobile-probe-card" : ""}`}
       >
         <Collapse
           size="small"
@@ -2579,11 +3464,19 @@ export function SubscriptionsPage({
               key: "probe-settings",
               label: (
                 <HelpLabel
-                  label={<Typography.Text strong>探测设置</Typography.Text>}
+                  label={
+                    <Typography.Text strong className="subscriptions-probe-settings-header-title">
+                      探测设置
+                    </Typography.Text>
+                  }
                   helpContent={{
-                  scene: "需要调整节点延迟探测、真连接评分和自动评分行为时使用。",
+                    scene: isMobileView
+                      ? "需要调整节点延迟探测与真连接评分相关参数时使用。"
+                      : "需要调整节点延迟探测、真连接评分和自动评分行为时使用。",
                     effect:
-                      "这里的配置会影响后续探测任务的并发数、超时时间、探测间隔、测试地址以及自动评分策略。",
+                      isMobileView
+                        ? "这里的配置会影响后续探测任务的并发数、超时时间、探测间隔和测试地址。"
+                        : "这里的配置会影响后续探测任务的并发数、超时时间、探测间隔、测试地址以及自动评分策略。",
                     caution:
                       "配置变更会影响之后的评分结果与探测节奏；并发或频率过高时，可能增加网络请求压力。",
                   }}
@@ -2665,20 +3558,22 @@ export function SubscriptionsPage({
                       />
                     </div>
                   </div>
-                  <Space
-                    wrap
-                    size={[18, 8]}
-                    className="subscriptions-probe-settings-switches"
-                  >
-                    <SwitchWithLabel
-                      label="自动评分"
-                      helpContent="开启后按“探测间隔”自动执行当前激活分组的一键评分（真连评分逻辑），关闭则仅手动评分。"
-                      checked={probeSettingsDraft.autoProbeOnActiveGroup}
-                      onChange={(checked) => {
-                        updateProbeSettingsDraft({ autoProbeOnActiveGroup: checked });
-                      }}
-                    />
-                  </Space>
+                  {!isMobileView ? (
+                    <Space
+                      wrap
+                      size={[18, 8]}
+                      className="subscriptions-probe-settings-switches"
+                    >
+                      <SwitchWithLabel
+                        label="自动评分"
+                        helpContent="开启后按“探测间隔”自动执行当前激活分组的一键评分（真连评分逻辑），关闭则仅手动评分。"
+                        checked={probeSettingsDraft.autoProbeOnActiveGroup}
+                        onChange={(checked) => {
+                          updateProbeSettingsDraft({ autoProbeOnActiveGroup: checked });
+                        }}
+                      />
+                    </Space>
+                  ) : null}
                   <Space
                     size={10}
                     className="subscriptions-probe-settings-actions"
@@ -2710,10 +3605,10 @@ export function SubscriptionsPage({
               <Typography.Text
                 style={{
                   color: "#389e0d",
-                  visibility: (addSubscriptionUrlValue ?? "").trim() !== "" ? "visible" : "hidden",
+                  visibility: showAddSubscriptionPullHint ? "visible" : "hidden",
                 }}
               >
-                添加后,在表格右键拉取订阅
+                展开分组后点击图标"拉取订阅"
               </Typography.Text>
               <Space size={8}>
                 <CancelBtn />
@@ -2734,7 +3629,14 @@ export function SubscriptionsPage({
               <Input placeholder="例如：机场A / 普通分组A" />
             </Form.Item>
             <Form.Item
-              label="URL/订阅地址（留空=普通分组,否则=订阅分组）"
+              label={(
+                <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                  <span>URL/订阅地址</span>
+                  <Typography.Text type="secondary" style={{ fontSize: 12, lineHeight: 1.3 }}>
+                    （留空=普通分组；填写订阅地址=订阅分组）
+                  </Typography.Text>
+                </div>
+              )}
               name="url"
             >
               <Input placeholder="https://example.com/subscription" />
@@ -2753,6 +3655,36 @@ export function SubscriptionsPage({
           onOk={() => {
             void submitEditGroup();
           }}
+          footer={(_, { OkBtn, CancelBtn }) => (
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: 12,
+              }}
+            >
+              <Button
+                danger
+                type="text"
+                disabled={!editingGroup}
+                icon={<BiIcon name="trash" />}
+                onClick={() => {
+                  if (!editingGroup) {
+                    return;
+                  }
+                  closeEditGroupModal();
+                  confirmRemoveGroup(editingGroup);
+                }}
+              >
+                删除分组
+              </Button>
+              <Space size={8}>
+                <CancelBtn />
+                <OkBtn />
+              </Space>
+            </div>
+          )}
         >
           <Form
             layout="vertical"
@@ -2766,7 +3698,14 @@ export function SubscriptionsPage({
               <Input placeholder="例如：机场A / 普通分组A" />
             </Form.Item>
             <Form.Item
-              label="URL/订阅地址（留空=普通分组,否则=订阅分组）"
+              label={(
+                <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                  <span>URL/订阅地址</span>
+                  <Typography.Text type="secondary" style={{ fontSize: 12, lineHeight: 1.3 }}>
+                    （留空=普通分组；填写订阅地址=订阅分组）
+                  </Typography.Text>
+                </div>
+              )}
               name="url"
             >
               <Input placeholder="https://example.com/subscription" />

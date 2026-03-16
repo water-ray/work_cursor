@@ -26,6 +26,8 @@ use tokio::time::sleep;
 use tauri_plugin_http::reqwest;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
+use crate::platform_contracts;
+
 #[cfg(target_os = "windows")]
 use webview2_com_sys::Microsoft::Web::WebView2::Win32::GetAvailableCoreWebView2BrowserVersionString;
 #[cfg(target_os = "windows")]
@@ -229,18 +231,18 @@ fn is_mobile_platform() -> bool {
 
 #[tauri::command]
 pub fn runtime_platform_info() -> RuntimePlatformInfo {
-    let is_mobile = is_mobile_platform();
+    let contract = platform_contracts::resolve_runtime_platform_contract(runtime_platform_kind());
     RuntimePlatformInfo {
-        kind: runtime_platform_kind().to_string(),
-        is_mobile,
-        supports_window_controls: !is_mobile,
-        supports_tray: !is_mobile,
-        supports_packaged_daemon: !is_mobile,
-        supports_system_proxy_mode: !is_mobile,
-        supports_local_file_access: !is_mobile,
-        supports_in_app_updates: !is_mobile,
-        supports_mobile_vpn_host: is_mobile,
-        requires_sandbox_data_root: is_mobile,
+        kind: contract.kind.to_string(),
+        is_mobile: contract.is_mobile,
+        supports_window_controls: contract.supports_window_controls,
+        supports_tray: contract.supports_tray,
+        supports_packaged_daemon: contract.supports_packaged_daemon,
+        supports_system_proxy_mode: contract.supports_system_proxy_mode,
+        supports_local_file_access: contract.supports_local_file_access,
+        supports_in_app_updates: contract.supports_in_app_updates,
+        supports_mobile_vpn_host: contract.supports_mobile_vpn_host,
+        requires_sandbox_data_root: contract.requires_sandbox_data_root,
     }
 }
 
@@ -266,9 +268,6 @@ fn restore_main_window(app: &AppHandle) {
     }
     let _ = window.set_focus();
 }
-
-#[cfg(any(target_os = "android", target_os = "ios"))]
-fn restore_main_window(_app: &AppHandle) {}
 
 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 fn should_restore_main_window_from_tray_event(event: &TrayIconEvent) -> bool {

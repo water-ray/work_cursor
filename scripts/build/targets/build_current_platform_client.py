@@ -10,6 +10,10 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from scripts.build.targets.desktop import resolve_current_platform_id
+from scripts.build.common.sync_default_rulesets import (
+    ensure_default_rule_sets_synced,
+    print_rule_set_sync_summary,
+)
 
 
 class CurrentPlatformBuildError(RuntimeError):
@@ -31,8 +35,9 @@ def run_command(command: list[str]) -> None:
 def main() -> int:
     try:
         platform_id = resolve_current_platform_id()
-        print(f"当前平台：{platform_id}，构建桌面客户端目录产物")
-        run_command([sys.executable, str(ROOT_DIR / "scripts" / "build" / "targets" / "desktop.py")])
+        print_rule_set_sync_summary(ensure_default_rule_sets_synced())
+        print(f"当前平台：{platform_id}，转发到 scripts/build/desktop/build_current_host.py")
+        run_command([sys.executable, str(ROOT_DIR / "scripts" / "build" / "desktop" / "build_current_host.py")])
         return 0
     except CurrentPlatformBuildError as err:
         print(f"构建失败：[current_platform_client] {err}", file=sys.stderr)

@@ -1,4 +1,5 @@
 import type { DaemonPushEvent, DaemonResponsePayload, TransportStatus } from "../../../shared/daemon";
+import { getPlatformAdapter } from "../platform/runtimeStore";
 
 type Listener = () => void;
 
@@ -54,7 +55,7 @@ export const daemonTransportStore = {
   },
   async refresh(): Promise<void> {
     try {
-      const status = await window.waterayDesktop.daemon.getTransportStatus();
+      const status = await getPlatformAdapter().daemon.getTransportStatus();
       setStatus(status);
     } catch {
       // Ignore refresh errors and wait for next push/request response.

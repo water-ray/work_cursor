@@ -1,7 +1,10 @@
-import { Alert, Layout, Menu, Spin } from "antd";
-import { Suspense, lazy, useEffect, useRef, useState } from "react";
-import { Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
+import { Alert, Layout, Menu } from "antd";
+import { useEffect, useRef, useState } from "react";
+import type { CSSProperties } from "react";
+import { useLocation, useNavigate } from "react-router-dom";
 
+import { AppRoutes } from "../../apps/shared/AppRoutes";
+import type { NavRoute } from "../../apps/shared/navigationTypes";
 import { useDaemonSnapshot } from "../../hooks/useDaemonSnapshot";
 import { useTrayMenuController } from "../../hooks/useTrayMenuController";
 import { useTaskCenter } from "../../hooks/useTaskCenter";
@@ -13,31 +16,11 @@ import {
   uiPreferenceChangedEventName,
   type UIPreferenceChangedEventDetail,
 } from "../settings/uiPreferences";
-import { navRoutes, resolveTitle } from "../navigation/navItems";
 import { daemonApi } from "../../services/daemonApi";
 import { MobileQuickPanels } from "./MobileQuickPanels";
-
-const SubscriptionsPage = lazy(async () => ({
-  default: (await import("../../pages/subscriptions/SubscriptionsPage")).SubscriptionsPage,
-}));
-const ProxyPage = lazy(async () => ({
-  default: (await import("../../pages/proxy/ProxyPage")).ProxyPage,
-}));
-const DnsPage = lazy(async () => ({
-  default: (await import("../../pages/dns/DnsPage")).DnsPage,
-}));
-const RulesPage = lazy(async () => ({
-  default: (await import("../../pages/rules/RulesPage")).RulesPage,
-}));
-const LogsPage = lazy(async () => ({
-  default: (await import("../../pages/logs/LogsPage")).LogsPage,
-}));
-const AirportPage = lazy(async () => ({
-  default: (await import("../../pages/airport/AirportPage")).AirportPage,
-}));
-const SettingsPage = lazy(async () => ({
-  default: (await import("../../pages/settings/SettingsPage")).SettingsPage,
-}));
+import { MobileProxyControlBar } from "./MobileProxyControlBar";
+import { MobileRulesQuickBar } from "./MobileRulesQuickBar";
+import { MobileSubscriptionsQuickBar } from "./MobileSubscriptionsQuickBar";
 
 function runtimeApplyOperationLabel(operation: string | undefined): string {
   switch (operation) {
@@ -56,25 +39,19 @@ function runtimeApplyOperationLabel(operation: string | undefined): string {
   }
 }
 
-function RouteLoadingFallback() {
-  return (
-    <div
-      style={{
-        minHeight: 320,
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-      }}
-    >
-      <Spin size="large" />
-    </div>
-  );
-}
-
-export function AppShell() {
-  const isDesktopRuntime = window.waterayPlatform?.isDesktop !== false;
+export function AppShell({
+  mode,
+  navRoutes,
+  resolveTitle,
+}: {
+  mode: "desktop" | "mobile";
+  navRoutes: NavRoute[];
+  resolveTitle: (pathname: string) => string;
+}) {
+  const isDesktopShell = mode === "desktop";
   const location = useLocation();
   const notice = useAppNotice();
+  const mobileTopBarWrapRef = useRef<HTMLDivElement | null>(null);
   const daemonState = useDaemonSnapshot({
     includeLogs: location.pathname.startsWith("/logs"),
   });
@@ -98,6 +75,16 @@ export function AppShell() {
   });
   const defaultRoutePath = navRoutes[0]?.path ?? "/subscriptions";
   const airportRouteActive = location.pathname.startsWith("/airport");
+  const allowMobileLogs = navRoutes.some((route) => route.key === "logs");
+  const mobileSubscriptionsRouteActive =
+    !isDesktopShell && location.pathname.startsWith("/subscriptions");
+  const mobileRulesRouteActive =
+    !isDesktopShell && location.pathname.startsWith("/rules");
+  const mobileSecondaryRowActive =
+    mobileSubscriptionsRouteActive || mobileRulesRouteActive;
+  const [mobileTopOffsetPx, setMobileTopOffsetPx] = useState<number>(() =>
+    isDesktopShell || airportRouteActive ? 0 : (mobileSecondaryRowActive ? 154 : 104),
+  );
   const selectedKey =
     navRoutes.find((item) => location.pathname.startsWith(item.path))?.path ??
     defaultRoutePath;
@@ -141,6 +128,50 @@ export function AppShell() {
   }, []);
 
   useEffect(() => {
+    if (isDesktopShell) {
+      return;
+    }
+    if (airportRouteActive) {
+      setMobileTopOffsetPx(0);
+      return;
+    }
+    const mobileTopBarWrap = mobileTopBarWrapRef.current;
+    const contentContainer = contentScrollRef.current;
+    if (!mobileTopBarWrap || !contentContainer) {
+      return;
+    }
+
+    let rafId = 0;
+    const updateMobileTopOffset = () => {
+      window.cancelAnimationFrame(rafId);
+      rafId = window.requestAnimationFrame(() => {
+        const topBarRect = mobileTopBarWrap.getBoundingClientRect();
+        const contentRect = contentContainer.getBoundingClientRect();
+        const nextOffset = Math.max(0, Math.ceil(topBarRect.bottom - contentRect.top + 8));
+        setMobileTopOffsetPx((current) =>
+          Math.abs(current - nextOffset) <= 1 ? current : nextOffset,
+        );
+      });
+    };
+
+    updateMobileTopOffset();
+    const resizeObserver =
+      typeof ResizeObserver === "undefined"
+        ? null
+        : new ResizeObserver(() => {
+            updateMobileTopOffset();
+          });
+    resizeObserver?.observe(mobileTopBarWrap);
+    resizeObserver?.observe(contentContainer);
+    window.addEventListener("resize", updateMobileTopOffset);
+    return () => {
+      window.cancelAnimationFrame(rafId);
+      resizeObserver?.disconnect();
+      window.removeEventListener("resize", updateMobileTopOffset);
+    };
+  }, [airportRouteActive, isDesktopShell, location.pathname, mobileSecondaryRowActive]);
+
+  useEffect(() => {
     const lastApply = daemonState.snapshot?.lastRuntimeApply;
     if (!lastApply) {
       return;
@@ -180,6 +211,13 @@ export function AppShell() {
         : `${runtimeApplyOperationLabel(lastApply.operation)}失败：${reason}`,
     );
   }, [daemonState.snapshot?.lastRuntimeApply, notice]);
+
+  const mobileShellStyle: CSSProperties | undefined = !isDesktopShell
+    ? ({
+        "--mobile-top-offset": `${mobileTopOffsetPx}px`,
+      } as CSSProperties)
+    : undefined;
+  const mobileContentStyle = mobileShellStyle;
 
   const removeQueuedTask = async (taskId: string, title: string) => {
     const normalizedTaskId = taskId.trim();
@@ -343,8 +381,8 @@ export function AppShell() {
   }, [dragScrollEnabled]);
 
   return (
-    <Layout className="app-shell">
-      {isDesktopRuntime ? (
+    <Layout className="app-shell" style={mobileShellStyle}>
+      {isDesktopShell ? (
         <WindowTitleBar
           title={resolveTitle(location.pathname)}
           systemType={daemonState.snapshot?.systemType}
@@ -357,7 +395,7 @@ export function AppShell() {
           onTaskCenterToggle={taskCenter.toggleOpen}
         />
       ) : null}
-      {isDesktopRuntime ? (
+      {isDesktopShell ? (
         <TaskCenterPanel
           open={taskCenter.open}
           runningCount={taskCenter.runningCount}
@@ -390,10 +428,33 @@ export function AppShell() {
           }}
         />
       )}
+      {!isDesktopShell && !airportRouteActive ? (
+        <div
+          ref={mobileTopBarWrapRef}
+          className={`mobile-proxy-control-bar-wrap${mobileSecondaryRowActive ? " has-secondary-row" : ""}`}
+        >
+          <MobileProxyControlBar
+            snapshot={daemonState.snapshot}
+            loading={daemonState.loading}
+            runAction={daemonState.runAction}
+          />
+          {mobileSubscriptionsRouteActive ? (
+            <MobileSubscriptionsQuickBar
+              snapshot={daemonState.snapshot}
+              loading={daemonState.loading}
+            />
+          ) : mobileRulesRouteActive ? (
+            <MobileRulesQuickBar
+              snapshot={daemonState.snapshot}
+            />
+          ) : null}
+        </div>
+      ) : null}
       <Layout.Content className="content-area">
         <div
           ref={contentScrollRef}
-          className={`content-scroll-view${dragScrollEnabled && !airportRouteActive ? " drag-scroll-enabled" : ""}${airportRouteActive ? " airport-web-content-mode" : ""}`}
+          className={`content-scroll-view${!isDesktopShell ? " mobile-content-scroll-view" : ""}${mobileSecondaryRowActive ? " mobile-content-scroll-view-with-secondary-row" : ""}${dragScrollEnabled && !airportRouteActive ? " drag-scroll-enabled" : ""}${airportRouteActive ? " airport-web-content-mode" : ""}`}
+          style={mobileContentStyle}
         >
           {daemonState.error && !airportRouteActive ? (
             <Alert
@@ -403,50 +464,15 @@ export function AppShell() {
               message={`内核通信失败：${daemonState.error}`}
             />
           ) : null}
-          <Suspense fallback={<RouteLoadingFallback />}>
-            <Routes>
-              <Route
-                path="/subscriptions"
-                element={<SubscriptionsPage {...daemonState} />}
-              />
-              <Route
-                path="/proxy"
-                element={<ProxyPage {...daemonState} />}
-              />
-              <Route
-                path="/dns"
-                element={<DnsPage {...daemonState} />}
-              />
-              <Route
-                path="/rules"
-                element={<RulesPage {...daemonState} />}
-              />
-              <Route
-                path="/logs"
-                element={<LogsPage {...daemonState} />}
-              />
-              <Route
-                path="/airport"
-                element={<AirportPage command={null} />}
-              />
-              <Route
-                path="/settings"
-                element={<SettingsPage {...daemonState} />}
-              />
-              <Route
-                path="*"
-                element={
-                  <Navigate
-                    to={defaultRoutePath}
-                    replace
-                  />
-                }
-              />
-            </Routes>
-          </Suspense>
+          <AppRoutes
+            daemonState={daemonState}
+            defaultRoutePath={defaultRoutePath}
+            mode={mode}
+            allowMobileLogs={allowMobileLogs}
+          />
         </div>
       </Layout.Content>
-      <div className="bottom-nav-wrap">
+      <div className={`bottom-nav-wrap${!isDesktopShell ? " mobile-bottom-nav-wrap" : ""}`}>
         <div
           id="app-bottom-overlay-root"
           className="app-bottom-overlay-root"
@@ -455,7 +481,7 @@ export function AppShell() {
           key="main-bottom-menu"
           mode="horizontal"
           selectedKeys={[selectedKey]}
-          className="bottom-nav-menu"
+          className={`bottom-nav-menu${!isDesktopShell ? " mobile-bottom-nav-menu" : ""}`}
           items={bottomNavItems}
           onClick={(event) => {
             navigate(event.key);

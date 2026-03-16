@@ -16,6 +16,7 @@ import {
   notifyConfigSaved,
 } from "../../services/configChangeMessage";
 import { daemonApi } from "../../services/daemonApi";
+import { isMobileRuntime } from "../../platform/runtimeStore";
 import { ComposedRulesTabs } from "./components/ComposedRulesTabs";
 import { NodePoolTable } from "./components/NodePoolTable";
 import {
@@ -100,6 +101,7 @@ function clearPendingRuleConfig(): void {
 
 export function RulesPage({ snapshot, loading, runAction }: DaemonPageProps) {
   const notice = useAppNotice();
+  const isMobileView = isMobileRuntime();
   const initialPendingConfigRef = useRef<PendingRuleConfigCache | null>(readPendingRuleConfig());
   const [editingConfig, setEditingConfig] = useState<RuleConfigV2>(
     () => initialPendingConfigRef.current?.config ?? createEmptyRuleConfig(),
@@ -256,10 +258,13 @@ export function RulesPage({ snapshot, loading, runAction }: DaemonPageProps) {
   }, [snapshot, runAction]);
 
   return (
-    <Card loading={loading}>
+    <Card
+      loading={loading}
+      className={isMobileView ? "subscriptions-mobile-section-card" : undefined}
+    >
       <Space
         direction="vertical"
-        size={16}
+        size={isMobileView ? 12 : 16}
         style={{ width: "100%" }}
       >
         <ComposedRulesTabs
@@ -269,7 +274,7 @@ export function RulesPage({ snapshot, loading, runAction }: DaemonPageProps) {
           onChange={replaceGroups}
         />
 
-        <Divider style={{ margin: "6px 0" }} />
+        <Divider style={{ margin: isMobileView ? "2px 0 4px" : "6px 0" }} />
 
         <NodePoolTable
           value={editingConfig.policyGroups ?? []}

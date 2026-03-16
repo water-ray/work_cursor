@@ -17,6 +17,7 @@ from scripts.build.common.build_manifest import (
     build_desktop_bundle_manifest,
     write_manifest,
 )
+from scripts.build.common.version_sync import ensure_project_versions_synced
 
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -164,30 +165,10 @@ def ensure_required_files(target: DesktopBuildTarget) -> None:
 
 
 def load_release_version() -> str:
-    version = VERSION_PATH.read_text(encoding="utf-8").strip()
-    if not SEMVER_PATTERN.match(version):
-        raise BuildError(12, "prepare", f"VERSION 格式非法（需要 X.Y.Z）：{version!r}")
-
-    package_payload = json.loads((TAURI_DIR / "package.json").read_text(encoding="utf-8"))
-    package_version = str(package_payload.get("version", "")).strip()
-    if package_version != version:
-        raise BuildError(
-            12,
-            "prepare",
-            f"VERSION 与 TauriApp/package.json 版本不一致：{version} != {package_version}",
-        )
-
-    package_lock_path = TAURI_DIR / "package-lock.json"
-    if package_lock_path.exists():
-        lock_payload = json.loads(package_lock_path.read_text(encoding="utf-8"))
-        lock_version = str(lock_payload.get("version", "")).strip()
-        if lock_version != version:
-            raise BuildError(
-                12,
-                "prepare",
-                f"VERSION 与 package-lock.json 版本不一致：{version} != {lock_version}",
-            )
-    return version
+    try:
+        return ensure_project_versions_synced()
+    except Exception as err:
+        raise BuildError(12, "prepare", str(err)) from err
 
 
 def clean_outputs(target: DesktopBuildTarget) -> None:
@@ -324,12 +305,17 @@ def ensure_frontend_deps() -> None:
 
 def build_frontend_bundle() -> None:
     print_step("构建 Tauri 前端 bundle")
-    run_command(["npm", "run", "build"], cwd=TAURI_DIR, stage="frontend_build", code=31)
+    env = os.environ.copy()
+    env["WATERAY_APP_TARGET"] = "desktop"
+    env["VITE_WATERAY_APP_TARGET"] = "desktop"
+    run_command(["npm", "run", "build"], cwd=TAURI_DIR, stage="frontend_build", code=31, env=env)
 
 
 def build_tauri_shell(target: DesktopBuildTarget) -> None:
     print_step("编译 Tauri 桌面宿主")
     env = os.environ.copy()
+    env["WATERAY_APP_TARGET"] = "desktop"
+    env["VITE_WATERAY_APP_TARGET"] = "desktop"
     if target.platform_id == "linux" and env.get("CI", "").strip() == "1":
         # Tauri CLI expects a boolean string for CI, while some IDEs export `1`.
         env["CI"] = "true"

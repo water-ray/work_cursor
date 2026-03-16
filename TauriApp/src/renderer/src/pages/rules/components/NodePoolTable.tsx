@@ -21,6 +21,8 @@ import { BiIcon } from "../../../components/icons/BiIcon";
 import { useAppNotice } from "../../../components/notify/AppNoticeProvider";
 import { useDraftNavLock } from "../../../hooks/useDraftNavLock";
 import { useDraftNotice } from "../../../hooks/useDraftNotice";
+import { isMobileRuntime } from "../../../platform/runtimeStore";
+import { MobileSwipeActionCard } from "../../subscriptions/MobileSwipeActionCard";
 import {
   buildCountrySearchText,
   countryMetadataList,
@@ -477,6 +479,10 @@ function resolvePoolTypeLabel(record: RulePolicyGroup): string {
   return "混合";
 }
 
+function resolvePoolFallbackLabel(record: RulePolicyGroup): string {
+  return record.nodePool?.fallbackMode === "active_node" ? "代理" : "拦截";
+}
+
 export function NodePoolTable({
   value,
   activeNodes,
@@ -485,6 +491,7 @@ export function NodePoolTable({
 }: NodePoolTableProps) {
   const notice = useAppNotice();
   const draftNotice = useDraftNotice();
+  const isMobileView = isMobileRuntime();
   const [modalOpen, setModalOpen] = useState(false);
   const [editingID, setEditingID] = useState<string>("");
   const [draft, setDraft] = useState<NodePoolDraft>(() => buildEmptyDraft());
@@ -824,6 +831,86 @@ export function NodePoolTable({
     }
   };
 
+  const renderNodePoolRefsSummary = (record: RulePolicyGroup): ReactNode => {
+    const refs = record.nodePool?.nodes ?? [];
+    if (refs.length === 0) {
+      return <Typography.Text type="secondary">全部节点</Typography.Text>;
+    }
+    return (
+      <Space size={[4, 4]} wrap>
+        {refs.slice(0, 6).map((ref, index) => (
+          <Tag key={`${record.id}-${index}`}>{renderPoolConditionLabel(ref)}</Tag>
+        ))}
+        {refs.length > 6 ? <Tag>+{refs.length - 6}</Tag> : null}
+      </Space>
+    );
+  };
+
+  const renderNodePoolAvailableSummary = (record: RulePolicyGroup): ReactNode => {
+    const availableNodeIDs = normalizeNodeIDList(record.nodePool?.availableNodeIds);
+    if (availableNodeIDs.length === 0) {
+      return <Typography.Text type="secondary">暂未筛选到可用节点</Typography.Text>;
+    }
+    return (
+      <Space size={[4, 4]} wrap>
+        {availableNodeIDs.slice(0, 5).map((nodeID) => {
+          const node = activeNodeByID.get(nodeID);
+          const score =
+            typeof node?.probeScore === "number" && node.probeScore > 0
+              ? ` ${node.probeScore.toFixed(1)}`
+              : "";
+          return <Tag key={`${record.id}-${nodeID}`}>{node ? `${node.name}${score}` : nodeID}</Tag>;
+        })}
+        {availableNodeIDs.length > 5 ? <Tag>+{availableNodeIDs.length - 5}</Tag> : null}
+      </Space>
+    );
+  };
+
+  const renderMobileNodePoolRefsSummary = (record: RulePolicyGroup): ReactNode => {
+    const refs = record.nodePool?.nodes ?? [];
+    if (refs.length === 0) {
+      return (
+        <div className="rules-mobile-node-pool-card-scroll rules-mobile-node-pool-card-scroll-tags">
+          <Tag>活动分组全部节点</Tag>
+        </div>
+      );
+    }
+    return (
+      <div className="rules-mobile-node-pool-card-scroll rules-mobile-node-pool-card-scroll-tags">
+        {refs.map((ref, index) => (
+          <Tag key={`${record.id}-${index}`}>{renderPoolConditionLabel(ref)}</Tag>
+        ))}
+      </div>
+    );
+  };
+
+  const renderMobileNodePoolAvailableSummary = (record: RulePolicyGroup): ReactNode => {
+    const availableNodeIDs = normalizeNodeIDList(record.nodePool?.availableNodeIds);
+    if (availableNodeIDs.length === 0) {
+      return (
+        <Typography.Text type="secondary" className="rules-mobile-node-pool-card-empty">
+          无优选结果
+        </Typography.Text>
+      );
+    }
+    return (
+      <div className="rules-mobile-node-pool-card-scroll rules-mobile-node-pool-card-scroll-tags">
+        {availableNodeIDs.map((nodeID) => {
+          const node = activeNodeByID.get(nodeID);
+          const score =
+            typeof node?.probeScore === "number" && node.probeScore > 0
+              ? ` ${node.probeScore.toFixed(1)}`
+              : "";
+          return (
+            <Tag key={`${record.id}-${nodeID}`}>
+              {node ? `${node.name}${score}` : nodeID}
+            </Tag>
+          );
+        })}
+      </div>
+    );
+  };
+
   return (
     <Space
       direction="vertical"
@@ -850,76 +937,215 @@ export function NodePoolTable({
           onClick: discardDraftChanges,
         }}
       />
-
-      <Space style={{ width: "100%", justifyContent: "space-between" }}>
+      {isMobileView ? (
         <Space
-          size={8}
-          align="center"
-          wrap
+          direction="vertical"
+          size={12}
+          style={{ width: "100%" }}
         >
-          <HelpLabel
-            label={
-              <Typography.Text strong style={{ fontSize: 15, color: "#1f2430" }}>
-                节点池管理
-              </Typography.Text>
-            }
-            helpContent={{
-              scene: "需要把某类流量限制在特定节点集合中，并为这批候选节点设置统一回退行为时使用。",
-              effect:
-                "这里用于配置规则“动作=节点池”时的优选条件、启用状态、回退方案和优选结果；筛选节点后会按评分保留最多 5 个候选节点。",
-              caution:
-                "节点池禁用后，绑定该节点池的规则会直接按回退方案执行；修改“节点类型”或“优选条件”后，建议重新执行一次“筛选节点”。",
-            }}
-          />
+          <div className="rules-mobile-header-row">
+            <Typography.Text strong style={{ fontSize: 15, color: "#1f2430" }}>
+              节点池管理
+            </Typography.Text>
+            <Space size={8} className="rules-mobile-header-row-actions">
+              <Button
+                size="small"
+                loading={filteringNodePools}
+                onClick={() => {
+                  void filterAvailableNodePools();
+                }}
+              >
+                筛选节点
+              </Button>
+              <Button
+                type="primary"
+                size="small"
+                onClick={() => {
+                  setEditingID("");
+                  setDraft(buildEmptyDraft());
+                  setModalOpen(true);
+                }}
+              >
+                新增节点池
+              </Button>
+            </Space>
+          </div>
+          {draftNodePools.length === 0 ? (
+            <div className="subscriptions-mobile-empty-state">
+              <Typography.Text type="secondary">当前没有已配置的节点池。</Typography.Text>
+            </div>
+          ) : (
+            <div className="rules-mobile-node-pool-list">
+              {draftNodePools.map((record) => (
+                <MobileSwipeActionCard
+                  key={record.id}
+                  trailingActions={[
+                    {
+                      key: "edit",
+                      label: "编辑",
+                      icon: <BiIcon name="pencil-square" />,
+                      onClick: () => {
+                        setEditingID(record.id);
+                        setDraft(toDraft(record));
+                        setModalOpen(true);
+                      },
+                    },
+                    {
+                      key: "delete",
+                      label: "删除",
+                      icon: <BiIcon name="trash" />,
+                      danger: true,
+                      onClick: () => {
+                        setDraftNodePools((prev) => prev.filter((item) => item.id !== record.id));
+                        setDraftTouched(true);
+                      },
+                    },
+                  ]}
+                >
+                  <div className={`rules-mobile-node-pool-card${record.nodePool?.enabled === false ? " is-disabled" : ""}`}>
+                    <div className="rules-mobile-node-pool-card-row rules-mobile-node-pool-card-row-primary">
+                      <div className="rules-mobile-node-pool-card-cell rules-mobile-node-pool-card-cell-title">
+                        <Typography.Text strong className="rules-mobile-node-pool-card-title">
+                          {record.name || record.id}
+                        </Typography.Text>
+                      </div>
+                      <div className="rules-mobile-node-pool-card-cell rules-mobile-node-pool-card-cell-fallback">
+                        <Typography.Text type="secondary" className="rules-mobile-node-pool-card-meta-text">
+                          {resolvePoolFallbackLabel(record)}
+                        </Typography.Text>
+                      </div>
+                      <div className="rules-mobile-node-pool-card-cell rules-mobile-node-pool-card-switch">
+                        <Switch
+                          size="small"
+                          checked={record.nodePool?.enabled !== false}
+                          onChange={(checked) => {
+                            setDraftNodePools((prev) =>
+                              prev.map((item) =>
+                                item.id === record.id
+                                  ? {
+                                      ...item,
+                                      nodePool: {
+                                        enabled: checked,
+                                        nodes: item.nodePool?.nodes ?? [],
+                                        nodeSelectStrategy:
+                                          item.nodePool?.nodeSelectStrategy === "first"
+                                            ? "first"
+                                            : "fastest",
+                                        fallbackMode:
+                                          item.nodePool?.fallbackMode === "active_node"
+                                            ? "active_node"
+                                            : "reject",
+                                        availableNodeIds: normalizeNodeIDList(item.nodePool?.availableNodeIds),
+                                      },
+                                    }
+                                  : item,
+                              ),
+                            );
+                            setDraftTouched(true);
+                          }}
+                        />
+                      </div>
+                    </div>
+                    <div className="rules-mobile-node-pool-card-row rules-mobile-node-pool-card-row-secondary">
+                      <div className="rules-mobile-node-pool-card-cell">
+                        <Typography.Text type="secondary" className="rules-mobile-node-pool-card-meta-text">
+                          {resolvePoolTypeLabel(record)}
+                        </Typography.Text>
+                      </div>
+                      <div className="rules-mobile-node-pool-card-cell">
+                        {renderMobileNodePoolRefsSummary(record)}
+                      </div>
+                    </div>
+                    <div className="rules-mobile-node-pool-card-row rules-mobile-node-pool-card-row-results">
+                      <div className="rules-mobile-node-pool-card-cell">
+                        {renderMobileNodePoolAvailableSummary(record)}
+                      </div>
+                    </div>
+                  </div>
+                </MobileSwipeActionCard>
+              ))}
+            </div>
+          )}
         </Space>
-        <Space size={8}>
-          <Button
-            loading={filteringNodePools}
-            onClick={() => {
-              void filterAvailableNodePools();
-            }}
-          >
-            筛选节点
-          </Button>
-          <Button
-            type="primary"
-            onClick={() => {
-              setEditingID("");
-              setDraft(buildEmptyDraft());
-              setModalOpen(true);
-            }}
-          >
-            新增节点池
-          </Button>
-        </Space>
-      </Space>
+      ) : (
+        <>
+          <Space style={{ width: "100%", justifyContent: "space-between" }}>
+            <Space
+              size={8}
+              align="center"
+              wrap
+            >
+              <HelpLabel
+                label={
+                  <Typography.Text strong style={{ fontSize: 15, color: "#1f2430" }}>
+                    节点池管理
+                  </Typography.Text>
+                }
+                helpContent={{
+                  scene: "需要把某类流量限制在特定节点集合中，并为这批候选节点设置统一回退行为时使用。",
+                  effect:
+                    "这里用于配置规则“动作=节点池”时的优选条件、启用状态、回退方案和优选结果；筛选节点后会按评分保留最多 5 个候选节点。",
+                  caution:
+                    "节点池禁用后，绑定该节点池的规则会直接按回退方案执行；修改“节点类型”或“优选条件”后，建议重新执行一次“筛选节点”。",
+                }}
+              />
+            </Space>
+            <Space size={8}>
+              <Button
+                loading={filteringNodePools}
+                onClick={() => {
+                  void filterAvailableNodePools();
+                }}
+              >
+                筛选节点
+              </Button>
+              <Button
+                type="primary"
+                onClick={() => {
+                  setEditingID("");
+                  setDraft(buildEmptyDraft());
+                  setModalOpen(true);
+                }}
+              >
+                新增节点池
+              </Button>
+            </Space>
+          </Space>
 
-      <Table<RulePolicyGroup>
-        rowKey="id"
-        size="small"
-        pagination={false}
-        columns={columns}
-        dataSource={draftNodePools}
-      />
+          <Table<RulePolicyGroup>
+            rowKey="id"
+            size="small"
+            pagination={false}
+            columns={columns}
+            dataSource={draftNodePools}
+          />
+        </>
+      )}
 
       <Modal
         title={editingID ? "编辑节点池" : "新增节点池"}
         open={modalOpen}
         onOk={saveDraft}
         onCancel={() => setModalOpen(false)}
-        width={860}
+        width={isMobileView ? "calc(100vw - 16px)" : 860}
         okText="保存"
         cancelText="取消"
+        styles={{
+          body: {
+            padding: isMobileView ? 12 : undefined,
+          },
+        }}
       >
         <Form
           layout="vertical"
           requiredMark={false}
+          size={isMobileView ? "small" : "middle"}
         >
           <div
             style={{
               display: "grid",
-              gridTemplateColumns: "280px minmax(0, 1fr)",
-              gap: 16,
+              gridTemplateColumns: isMobileView ? "minmax(0, 1fr)" : "280px minmax(0, 1fr)",
+              gap: isMobileView ? 12 : 16,
               alignItems: "start",
             }}
           >
@@ -1086,7 +1312,7 @@ export function NodePoolTable({
                 style={{ marginBottom: 0 }}
               >
                 <Input.TextArea
-                  rows={7}
+                  rows={isMobileView ? 6 : 7}
                   value={draft.nodesText}
                   onChange={(event) => setDraft({ ...draft, nodesText: event.target.value })}
                   placeholder={valuePlaceholderByType(draft.refType)}

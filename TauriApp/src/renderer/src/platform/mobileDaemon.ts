@@ -1,4 +1,5 @@
 import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
+import { appDataDir, join } from "@tauri-apps/api/path";
 
 import defaultState from "../../../../default-config/waterayd_state.json";
 import type {
@@ -11,33 +12,80 @@ import type {
   DaemonSnapshot,
   ProbeNodesRequestPayload,
   ProbeNodesSummary,
+  ProbeResultPatchPayload,
   ProbeSettings,
   ProbeType,
   ProxyMode,
+  ProbeRuntimeTask,
+  RemoveNodesRequestPayload,
+  ResetTrafficStatsRequestPayload,
+  RuleConfigV2,
+  RuleSetDownloadMode,
+  RuleSetLocalStatus,
+  RuleSetUpdateSummary,
+  RuntimeApplyOperation,
+  RuntimeApplyResult,
+  RuntimeApplyStrategy,
   StartPrecheckIssue,
   StartPrecheckResult,
+  TrafficTickPayload,
   TransportStatus,
   UpdateManualNodeRequestPayload,
   VpnNode,
 } from "../../../shared/daemon";
-import type { WaterayMobileHostApi, WaterayMobileHostStatus } from "./mobileHost";
+import type {
+  WaterayMobileHostApi,
+  WaterayMobileHostStatus,
+  WaterayMobileRuleSetStatusItem,
+  WaterayMobileTaskQueueResult,
+} from "./mobileHost";
 import {
   buildMobileProbeConfig,
   buildMobileRuntimeConfig,
+  buildMobileSelectorSelections,
+  resolveNodePoolRefsToNodeIds,
   type MobileResolverContext,
 } from "./mobileRuntimeConfig";
 import { checkMobileDnsHealth } from "./mobileDnsHealth";
 import { parseSubscriptionText } from "./mobileSubscriptionParser";
+import { applyProbeResultPatchToSnapshot } from "../services/probeResultPatch";
 
 type DaemonBridge = Window["waterayDesktop"]["daemon"];
 type PushListener = (event: DaemonPushEvent) => void;
+type MobileProbeNodesRequestPayload = ProbeNodesRequestPayload & { background?: boolean };
 
 type MobilePersistedSnapshot = Partial<DaemonSnapshot>;
+type MobileTrafficNodeCounter = {
+  uploadBytes: number;
+  downloadBytes: number;
+};
+type MobileTrafficNodeSnapshot = MobileTrafficNodeCounter & {
+  nodeId: string;
+  connections: number;
+};
+type MobileTrafficSnapshot = {
+  uploadBytes: number;
+  downloadBytes: number;
+  totalConnections: number;
+  tcpConnections: number;
+  udpConnections: number;
+  activeNodeCount: number;
+  nodes: MobileTrafficNodeSnapshot[];
+};
+type MobileTrafficSampleState = {
+  sampledAtMs: number;
+  uploadBytes: number;
+  downloadBytes: number;
+  nodeCounters: Map<string, MobileTrafficNodeCounter>;
+  nodeTotals: Map<string, MobileTrafficNodeCounter>;
+};
 
 const mobileStateStorageKey = "wateray.mobile.snapshot.v1";
 const defaultProbeLatencyUrl = "https://www.gstatic.com/generate_204";
 const defaultProbeRealConnectUrl = "https://www.google.com/generate_204";
 const requestBaseUrl = "http://mobile.wateray.local";
+const defaultMobileMixedProxyPort = 1088;
+const defaultMobileClashApiControllerUrl = "http://127.0.0.1:39081";
 
 const probeScoreLatencyGoodMs = 80;
 const probeScoreLatencyBadMs = 600;
@@ -51,6 +99,12 @@ const maxBackgroundTaskHistory = 24;
 const probeConfigBuildYieldInterval = 8;
 const mobileVpnPermissionConfirmTimeoutMs = 3000;
 const mobileVpnPermissionConfirmPollIntervalMs = 100;
+const mobileBuiltInRuleSetLocalPathByTag = new Map<string, string>();
+let mobileDnsCacheFilePath: string | null = null;
+
+interface MobileBuiltInRuleSetStatus extends RuleSetLocalStatus {
+  localPath?: string | null;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -62,6 +116,114 @@ function deepClone<T>(value: T): T {
 
 function nowMs(): number {
   return Date.now();
+}
+
+function toNonNegativeInt(value: unknown): number {
+  const normalized = Math.trunc(Number(value ?? 0));
+  if (!Number.isFinite(normalized) || normalized <= 0) {
+    return 0;
+  }
+  return normalized;
+}
+
+function pickTrafficCounter(source: Record<string, unknown>, ...keys: string[]): number {
+  for (const key of keys) {
+    if (!(key in source)) {
+      continue;
+    }
+    return toNonNegativeInt(source[key]);
+  }
+  return 0;
+}
+
+function parseMobileRuntimeNodeIdFromTag(rawTag: string): string | null {
+  const tag = rawTag.trim();
+  if (!tag.startsWith("node-")) {
+    return null;
+  }
+  const nodeId = tag.slice(5).trim();
+  return nodeId !== "" ? nodeId : null;
+}
+
+function buildTrafficSnapshotFromConnectionsPayload(payload: unknown): MobileTrafficSnapshot {
+  if (!isRecord(payload)) {
+    return {
+      uploadBytes: 0,
+      downloadBytes: 0,
+      totalConnections: 0,
+      tcpConnections: 0,
+      udpConnections: 0,
+      activeNodeCount: 0,
+      nodes: [],
+    };
+  }
+  const connections = Array.isArray(payload.connections) ? payload.connections : [];
+  const nodeUsage = new Map<string, MobileTrafficNodeSnapshot>();
+  let tcpConnections = 0;
+  let udpConnections = 0;
+  for (const item of connections) {
+    if (!isRecord(item)) {
+      continue;
+    }
+    const metadata = isRecord(item.metadata) ? item.metadata : {};
+    const network = String(metadata.network ?? "").trim().toLowerCase();
+    if (network.startsWith("tcp")) {
+      tcpConnections += 1;
+    } else if (network.startsWith("udp")) {
+      udpConnections += 1;
+    }
+    const uploadBytes = pickTrafficCounter(item, "upload", "upload_bytes");
+    const downloadBytes = pickTrafficCounter(item, "download", "download_bytes");
+    const nodeIds = new Set<string>();
+    for (const chain of Array.isArray(item.chains) ? item.chains : []) {
+      const nodeId = parseMobileRuntimeNodeIdFromTag(String(chain ?? ""));
+      if (nodeId) {
+        nodeIds.add(nodeId);
+      }
+    }
+    nodeIds.forEach((nodeId) => {
+      const current = nodeUsage.get(nodeId);
+      if (current) {
+        current.connections += 1;
+        current.uploadBytes += uploadBytes;
+        current.downloadBytes += downloadBytes;
+        return;
+      }
+      nodeUsage.set(nodeId, {
+        nodeId,
+        connections: 1,
+        uploadBytes,
+        downloadBytes,
+      });
+    });
+  }
+  const nodes = Array.from(nodeUsage.values()).sort((left, right) => {
+    if (left.connections === right.connections) {
+      return left.nodeId.localeCompare(right.nodeId);
+    }
+    return right.connections - left.connections;
+  });
+  return {
+    uploadBytes: pickTrafficCounter(payload, "uploadTotal", "upload_total"),
+    downloadBytes: pickTrafficCounter(payload, "downloadTotal", "download_total"),
+    totalConnections: connections.length,
+    tcpConnections,
+    udpConnections,
+    activeNodeCount: nodes.length,
+    nodes,
+  };
+}
+
+function normalizeMobileMixedProxyPort(value: number | undefined): number {
+  const normalized = Math.trunc(Number(value ?? defaultMobileMixedProxyPort));
+  if (Number.isFinite(normalized) && normalized >= 1 && normalized <= 65535) {
+    return normalized;
+  }
+  return defaultMobileMixedProxyPort;
+}
+
+function buildMobileMixedProxyUrl(snapshot: DaemonSnapshot): string {
+  return `http://127.0.0.1:${normalizeMobileMixedProxyPort(snapshot.localProxyPort)}`;
 }
 
 function createId(prefix: string): string {
@@ -125,13 +287,28 @@ function normalizeBackgroundTasks(tasks: BackgroundTask[] | undefined): Backgrou
     .slice(0, maxBackgroundTaskHistory);
 }
 
-function createMobileResolverContext(
+async function ensureMobileDnsCacheFilePath(): Promise<string | undefined> {
+  if (mobileDnsCacheFilePath !== null) {
+    return mobileDnsCacheFilePath || undefined;
+  }
+  try {
+    const sandboxRoot = await appDataDir();
+    mobileDnsCacheFilePath = await join(sandboxRoot, "mobile-host", "work", "singbox-cache.db");
+  } catch {
+    mobileDnsCacheFilePath = "";
+  }
+  return mobileDnsCacheFilePath || undefined;
+}
+
+async function createMobileResolverContext(
   status: WaterayMobileHostStatus | null | undefined,
-): MobileResolverContext {
+): Promise<MobileResolverContext> {
   return {
     systemDnsServers: Array.isArray(status?.systemDnsServers)
       ? status.systemDnsServers
       : [],
+    builtInRuleSetPaths: Object.fromEntries(mobileBuiltInRuleSetLocalPathByTag.entries()),
+    dnsCacheFilePath: await ensureMobileDnsCacheFilePath(),
   };
 }
 
@@ -164,7 +341,7 @@ function normalizeDnsConfig(input: MobilePersistedSnapshot["dns"] | undefined): 
   };
 }
 
-function normalizeProbeTypes(payload: ProbeNodesRequestPayload): ProbeType[] {
+function normalizeProbeTypes(payload: MobileProbeNodesRequestPayload): ProbeType[] {
   const requested =
     payload.probeTypes && payload.probeTypes.length > 0
       ? payload.probeTypes
@@ -175,6 +352,48 @@ function normalizeProbeTypes(payload: ProbeNodesRequestPayload): ProbeType[] {
     (value): value is ProbeType => value === "node_latency" || value === "real_connect",
   );
   return normalized.length > 0 ? normalized : ["node_latency"];
+}
+
+function normalizeGeoRuleSetValue(rawValue: string): string {
+  const value = rawValue.trim().toLowerCase();
+  if (value === "") {
+    return "";
+  }
+  return value
+    .replace(/[^a-z0-9\-_.!@]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .replace(/_/g, "-");
+}
+
+function collectBuiltInRuleSetValues(config: RuleConfigV2 | undefined): {
+  geoip: string[];
+  geosite: string[];
+} {
+  const geoip = new Set<string>();
+  const geosite = new Set<string>();
+  for (const rule of config?.rules ?? []) {
+    if (rule.enabled === false) {
+      continue;
+    }
+    for (const rawValue of rule.match?.geoip ?? []) {
+      const value = normalizeGeoRuleSetValue(String(rawValue ?? ""));
+      if (value === "" || value === "private") {
+        continue;
+      }
+      geoip.add(value);
+    }
+    for (const rawValue of rule.match?.geosite ?? []) {
+      const value = normalizeGeoRuleSetValue(String(rawValue ?? ""));
+      if (value === "") {
+        continue;
+      }
+      geosite.add(value);
+    }
+  }
+  return {
+    geoip: Array.from(geoip).sort(),
+    geosite: Array.from(geosite).sort(),
+  };
 }
 
 function createDefaultMobileSnapshot(): DaemonSnapshot {
@@ -237,6 +456,7 @@ function normalizeSnapshot(input: MobilePersistedSnapshot | null | undefined): D
     probeSettings: {
       ...base.probeSettings,
       ...(input.probeSettings ?? {}),
+      autoProbeOnActiveGroup: false,
     },
     backgroundTasks: normalizeBackgroundTasks(input.backgroundTasks),
     operations: Array.isArray(input.operations) ? input.operations : [],
@@ -283,7 +503,7 @@ function normalizeProbeSettings(snapshot: DaemonSnapshot): ProbeSettings {
       snapshot.probeSettings?.realConnectTestUrl?.trim() || defaultProbeRealConnectUrl,
     nodeInfoQueryUrl:
       snapshot.probeSettings?.nodeInfoQueryUrl?.trim() || "https://api.ipapi.is",
-    autoProbeOnActiveGroup: snapshot.probeSettings?.autoProbeOnActiveGroup === true,
+    autoProbeOnActiveGroup: false,
   };
 }
 
@@ -330,6 +550,314 @@ function computeNodeProbeScore(node: VpnNode): number {
     latencyScore * probeScoreLatencyWeight +
       realConnectScore * probeScoreRealConnectWeight,
   );
+}
+
+function resolveNodeProbeTimestampMs(node: VpnNode, probeType: ProbeType): number {
+  if (probeType === "real_connect") {
+    return Math.max(0, Number(node.realConnectProbedAtMs ?? 0));
+  }
+  return Math.max(0, Number(node.latencyProbedAtMs ?? 0));
+}
+
+function shouldExecuteProbeByInterval(
+  node: VpnNode,
+  probeType: ProbeType,
+  intervalMin: number,
+  nowMsValue: number,
+): boolean {
+  const lastProbeAtMs = resolveNodeProbeTimestampMs(node, probeType);
+  if (lastProbeAtMs <= 0) {
+    return true;
+  }
+  const safeIntervalMin = Math.max(1, Number(intervalMin) || 180);
+  const intervalMs = safeIntervalMin * 60 * 1000;
+  if (intervalMs <= 0) {
+    return true;
+  }
+  if (nowMsValue <= 0) {
+    return true;
+  }
+  if (nowMsValue < lastProbeAtMs) {
+    return false;
+  }
+  return nowMsValue - lastProbeAtMs >= intervalMs;
+}
+
+function probeNodeResultSucceeded(node: VpnNode, probeTypes: ProbeType[]): boolean {
+  for (const probeType of probeTypes) {
+    if (probeType === "real_connect") {
+      if (Number(node.probeRealConnectMs ?? 0) <= 0) {
+        return false;
+      }
+      continue;
+    }
+    if (Number(node.latencyMs ?? 0) <= 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function splitProbeTargetsByCache(
+  sourceSnapshot: DaemonSnapshot,
+  targetNodes: VpnNode[],
+  probeTypes: ProbeType[],
+): {
+  freshTargetNodes: VpnNode[];
+  cachedTargetNodes: VpnNode[];
+  summary: ProbeNodesSummary;
+} {
+  const freshTargetNodes: VpnNode[] = [];
+  const cachedTargetNodes: VpnNode[] = [];
+  const probeIntervalMin = normalizeProbeSettings(sourceSnapshot).probeIntervalMin;
+  const currentNowMs = nowMs();
+  let cachedSucceeded = 0;
+  let cachedFailed = 0;
+  for (const node of targetNodes) {
+    const requiresFreshProbe = probeTypes.some((probeType) =>
+      shouldExecuteProbeByInterval(node, probeType, probeIntervalMin, currentNowMs),
+    );
+    if (requiresFreshProbe) {
+      freshTargetNodes.push(node);
+      continue;
+    }
+    cachedTargetNodes.push(node);
+    if (probeNodeResultSucceeded(node, probeTypes)) {
+      cachedSucceeded += 1;
+    } else {
+      cachedFailed += 1;
+    }
+  }
+  return {
+    freshTargetNodes,
+    cachedTargetNodes,
+    summary: {
+      requested: targetNodes.length,
+      succeeded: cachedSucceeded,
+      failed: cachedFailed,
+      cachedResultCount: cachedTargetNodes.length,
+      freshProbeCount: freshTargetNodes.length,
+      skippedRealConnectDueToLatency: 0,
+      reprobedLatencyBeforeRealConnect: 0,
+    },
+  };
+}
+
+function mergeProbeSummaryWithCache(
+  cachedSummary: ProbeNodesSummary,
+  freshSummary: ProbeNodesSummary,
+): ProbeNodesSummary {
+  return {
+    requested: Math.max(
+      0,
+      Number(cachedSummary.requested ?? 0),
+      Number(freshSummary.requested ?? 0) + Number(cachedSummary.cachedResultCount ?? 0),
+    ),
+    succeeded:
+      Math.max(0, Number(cachedSummary.succeeded ?? 0)) +
+      Math.max(0, Number(freshSummary.succeeded ?? 0)),
+    failed:
+      Math.max(0, Number(cachedSummary.failed ?? 0)) +
+      Math.max(0, Number(freshSummary.failed ?? 0)),
+    cachedResultCount: Math.max(0, Number(cachedSummary.cachedResultCount ?? 0)),
+    freshProbeCount: Math.max(0, Number(cachedSummary.freshProbeCount ?? 0)),
+    skippedRealConnectDueToLatency: Math.max(
+      0,
+      Number(freshSummary.skippedRealConnectDueToLatency ?? 0),
+    ),
+    reprobedLatencyBeforeRealConnect: Math.max(
+      0,
+      Number(freshSummary.reprobedLatencyBeforeRealConnect ?? 0),
+    ),
+  };
+}
+
+function uniqueNonEmptyStrings(values: string[] | undefined): string[] {
+  const result: string[] = [];
+  const seen = new Set<string>();
+  for (const rawValue of values ?? []) {
+    const value = String(rawValue ?? "").trim();
+    if (value === "") {
+      continue;
+    }
+    const key = value.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    result.push(value);
+  }
+  return result;
+}
+
+function sameStringList(left: string[], right: string[]): boolean {
+  if (left.length !== right.length) {
+    return false;
+  }
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] !== right[index]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function resolveActiveGroupNodes(snapshot: DaemonSnapshot): VpnNode[] {
+  const groups = snapshot.groups ?? [];
+  if (groups.length === 0) {
+    return [];
+  }
+  const activeGroup = groups.find((group) => group.id === snapshot.activeGroupId) ?? groups[0];
+  return [...(activeGroup?.nodes ?? [])];
+}
+
+function isRulePoolNodeAvailableByProbe(node: VpnNode): boolean {
+  return (
+    Number(node.latencyMs ?? 0) > 0 &&
+    Number(node.probeRealConnectMs ?? 0) > 0 &&
+    Number(node.probeScore ?? 0) > 0
+  );
+}
+
+function buildRulePoolTopAvailableNodeIds(
+  snapshot: DaemonSnapshot,
+  nodePool: DaemonSnapshot["ruleConfigV2"]["policyGroups"][number]["nodePool"] | undefined,
+): string[] {
+  if (!nodePool || nodePool.enabled === false) {
+    return [];
+  }
+  const activeNodes = resolveActiveGroupNodes(snapshot);
+  const candidateIDs = resolveNodePoolRefsToNodeIds(nodePool.nodes, activeNodes);
+  if (candidateIDs.length === 0) {
+    return [];
+  }
+  const nodeById = new Map(activeNodes.map((node) => [node.id, node]));
+  const candidates: VpnNode[] = [];
+  candidateIDs.forEach((id) => {
+    const node = nodeById.get(id);
+    if (!node || !isRulePoolNodeAvailableByProbe(node)) {
+      return;
+    }
+    candidates.push(node);
+  });
+  candidates.sort((left, right) => {
+    const scoreDiff = (Number(right.probeScore ?? 0) - Number(left.probeScore ?? 0));
+    if (Math.abs(scoreDiff) > 0.0001) {
+      return scoreDiff;
+    }
+    const realConnectDiff = Number(left.probeRealConnectMs ?? 0) - Number(right.probeRealConnectMs ?? 0);
+    if (realConnectDiff !== 0) {
+      return realConnectDiff;
+    }
+    return Number(left.latencyMs ?? 0) - Number(right.latencyMs ?? 0);
+  });
+  return uniqueNonEmptyStrings(candidates.slice(0, 5).map((node) => node.id));
+}
+
+function resolveActiveRuleGroupOnMissMode(
+  config: DaemonSnapshot["ruleConfigV2"],
+): "proxy" | "direct" {
+  const fallback = String(config.onMissMode ?? "").trim().toLowerCase() === "proxy" ? "proxy" : "direct";
+  const groups = config.groups ?? [];
+  if (groups.length === 0) {
+    return fallback;
+  }
+  let activeGroup = groups[0];
+  const activeGroupId = String(config.activeGroupId ?? "").trim();
+  if (activeGroupId !== "") {
+    activeGroup = groups.find((group) => group.id === activeGroupId) ?? activeGroup;
+  }
+  return String(activeGroup?.onMissMode ?? "").trim().toLowerCase() === "proxy" ? "proxy" : fallback;
+}
+
+function resolveActiveRuleItems(
+  config: DaemonSnapshot["ruleConfigV2"],
+): NonNullable<DaemonSnapshot["ruleConfigV2"]["rules"]> {
+  const groups = config.groups ?? [];
+  if (groups.length > 0) {
+    const activeGroupId = String(config.activeGroupId ?? "").trim();
+    const activeGroup = activeGroupId !== ""
+      ? (groups.find((group) => group.id === activeGroupId) ?? groups[0])
+      : groups[0];
+    if (activeGroup?.rules) {
+      return activeGroup.rules;
+    }
+  }
+  return config.rules ?? [];
+}
+
+function collectReferencedPolicyIds(config: DaemonSnapshot["ruleConfigV2"]): Set<string> {
+  const referenced = new Set<string>();
+  referenced.add(resolveActiveRuleGroupOnMissMode(config));
+  for (const rule of resolveActiveRuleItems(config)) {
+    if (!rule.enabled || String(rule.action?.type ?? "").trim().toLowerCase() !== "route") {
+      continue;
+    }
+    referenced.add(String(rule.action?.targetPolicy ?? "").trim() || "proxy");
+  }
+  return referenced;
+}
+
+function collectReferencedRulePoolCandidateNodeIds(
+  snapshot: DaemonSnapshot,
+  options: {
+    excludeNodeIds?: string[];
+  } = {},
+): string[] {
+  const referencedPolicies = collectReferencedPolicyIds(snapshot.ruleConfigV2);
+  const activeNodes = resolveActiveGroupNodes(snapshot);
+  if (activeNodes.length === 0) {
+    return [];
+  }
+  const excluded = new Set(
+    uniqueNonEmptyStrings(options.excludeNodeIds).map((item) => item.toLowerCase()),
+  );
+  const result: string[] = [];
+  const seen = new Set<string>();
+  const appendNodeId = (nodeId: string) => {
+    const value = String(nodeId ?? "").trim();
+    if (value === "") {
+      return;
+    }
+    const key = value.toLowerCase();
+    if (excluded.has(key) || seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    result.push(value);
+  };
+  for (const group of snapshot.ruleConfigV2.policyGroups ?? []) {
+    if (!referencedPolicies.has(group.id)) {
+      continue;
+    }
+    if (group.type !== "node_pool" || !group.nodePool || group.nodePool.enabled === false) {
+      continue;
+    }
+    const candidateNodeIds = resolveNodePoolRefsToNodeIds(group.nodePool.nodes, activeNodes);
+    candidateNodeIds.forEach(appendNodeId);
+  }
+  return result;
+}
+
+function refreshReferencedRulePoolAvailableNodeIds(snapshot: DaemonSnapshot): number {
+  const referencedPolicies = collectReferencedPolicyIds(snapshot.ruleConfigV2);
+  let updatedCount = 0;
+  for (const group of snapshot.ruleConfigV2.policyGroups ?? []) {
+    if (!referencedPolicies.has(group.id)) {
+      continue;
+    }
+    if (group.type !== "node_pool" || !group.nodePool) {
+      continue;
+    }
+    const currentAvailable = uniqueNonEmptyStrings(group.nodePool.availableNodeIds);
+    const nextAvailable = buildRulePoolTopAvailableNodeIds(snapshot, group.nodePool);
+    if (sameStringList(currentAvailable, nextAvailable)) {
+      continue;
+    }
+    group.nodePool.availableNodeIds = nextAvailable;
+    updatedCount += 1;
+  }
+  return updatedCount;
 }
 
 function createTransportStatus(hostStatus: WaterayMobileHostStatus | null): TransportStatus {
@@ -440,12 +968,234 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
   let revision = Math.max(1, Number(snapshot.stateRevision ?? 1) || 1);
   let transportStatus = createTransportStatus(null);
   let statusSubscriptionDispose: (() => void) | null = null;
+  let taskQueueSubscriptionDispose: (() => void) | null = null;
+  let probePatchSubscriptionDispose: (() => void) | null = null;
   let latestHostStatus: WaterayMobileHostStatus | null = null;
+  let nativeNodeProbeTaskStatusById = new Map<string, string>();
+  let trafficMonitorTimer: number | null = null;
+  let trafficMonitorGeneration = 0;
+  let trafficMonitorIntervalSec = 0;
+  let trafficMonitorEnabled = false;
+  let trafficMonitorPolling = false;
+  let trafficSampleState: MobileTrafficSampleState | null = null;
 
   const emit = (event: DaemonPushEvent) => {
     listeners.forEach((listener) => {
       listener(event);
     });
+  };
+
+  const emitTrafficTickEvent = (traffic: TrafficTickPayload) => {
+    emit({
+      kind: "traffic_tick",
+      timestampMs: nowMs(),
+      revision,
+      payload: {
+        traffic,
+      },
+    });
+  };
+
+  const emitZeroTrafficTick = (sampleIntervalSec = 0) => {
+    emitTrafficTickEvent({
+      sampleIntervalSec,
+      uploadBytes: 0,
+      downloadBytes: 0,
+      uploadDeltaBytes: 0,
+      downloadDeltaBytes: 0,
+      uploadRateBps: 0,
+      downloadRateBps: 0,
+      nodeUploadRateBps: 0,
+      nodeDownloadRateBps: 0,
+      totalConnections: 0,
+      tcpConnections: 0,
+      udpConnections: 0,
+      activeNodeCount: 0,
+      nodes: [],
+    });
+  };
+
+  const buildTrafficTickPayload = (
+    current: MobileTrafficSnapshot,
+    sampleIntervalSec: number,
+  ): TrafficTickPayload => {
+    const sampledAtMs = nowMs();
+    const previous = trafficSampleState;
+    const nextNodeCounters = new Map<string, MobileTrafficNodeCounter>();
+    const nextNodeTotals = new Map(previous?.nodeTotals ?? []);
+    const payload: TrafficTickPayload = {
+      sampleIntervalSec,
+      uploadBytes: current.uploadBytes,
+      downloadBytes: current.downloadBytes,
+      totalConnections: current.totalConnections,
+      tcpConnections: current.tcpConnections,
+      udpConnections: current.udpConnections,
+      activeNodeCount: current.activeNodeCount,
+      nodes: [],
+    };
+    let elapsedSec = sampleIntervalSec;
+    if (previous) {
+      const deltaMs = sampledAtMs - previous.sampledAtMs;
+      if (deltaMs > 0) {
+        elapsedSec = deltaMs / 1000;
+      }
+    }
+    if (!Number.isFinite(elapsedSec) || elapsedSec <= 0) {
+      elapsedSec = sampleIntervalSec > 0 ? sampleIntervalSec : 1;
+    }
+    if (previous) {
+      payload.uploadDeltaBytes = Math.max(0, current.uploadBytes - previous.uploadBytes);
+      payload.downloadDeltaBytes = Math.max(0, current.downloadBytes - previous.downloadBytes);
+      payload.uploadRateBps = Math.max(0, Math.trunc(payload.uploadDeltaBytes / elapsedSec));
+      payload.downloadRateBps = Math.max(0, Math.trunc(payload.downloadDeltaBytes / elapsedSec));
+    } else {
+      payload.uploadDeltaBytes = 0;
+      payload.downloadDeltaBytes = 0;
+      payload.uploadRateBps = 0;
+      payload.downloadRateBps = 0;
+    }
+    let nodeUploadRateTotal = 0;
+    let nodeDownloadRateTotal = 0;
+    payload.nodes = current.nodes.map((node) => {
+      nextNodeCounters.set(node.nodeId, {
+        uploadBytes: node.uploadBytes,
+        downloadBytes: node.downloadBytes,
+      });
+      const previousCounter = previous?.nodeCounters.get(node.nodeId);
+      const uploadDeltaBytes = previousCounter
+        ? Math.max(0, node.uploadBytes - previousCounter.uploadBytes)
+        : 0;
+      const downloadDeltaBytes = previousCounter
+        ? Math.max(0, node.downloadBytes - previousCounter.downloadBytes)
+        : 0;
+      const uploadRateBps = Math.max(0, Math.trunc(uploadDeltaBytes / elapsedSec));
+      const downloadRateBps = Math.max(0, Math.trunc(downloadDeltaBytes / elapsedSec));
+      nodeUploadRateTotal += uploadRateBps;
+      nodeDownloadRateTotal += downloadRateBps;
+      const previousTotals = nextNodeTotals.get(node.nodeId) ?? {
+        uploadBytes: 0,
+        downloadBytes: 0,
+      };
+      const nextTotals = {
+        uploadBytes: previousTotals.uploadBytes + uploadDeltaBytes,
+        downloadBytes: previousTotals.downloadBytes + downloadDeltaBytes,
+      };
+      nextNodeTotals.set(node.nodeId, nextTotals);
+      return {
+        nodeId: node.nodeId,
+        connections: node.connections,
+        uploadBytes: node.uploadBytes,
+        downloadBytes: node.downloadBytes,
+        uploadDeltaBytes,
+        downloadDeltaBytes,
+        uploadRateBps,
+        downloadRateBps,
+        totalUploadBytes: nextTotals.uploadBytes,
+        totalDownloadBytes: nextTotals.downloadBytes,
+      };
+    });
+    payload.nodeUploadRateBps = nodeUploadRateTotal;
+    payload.nodeDownloadRateBps = nodeDownloadRateTotal;
+    trafficSampleState = {
+      sampledAtMs,
+      uploadBytes: current.uploadBytes,
+      downloadBytes: current.downloadBytes,
+      nodeCounters: nextNodeCounters,
+      nodeTotals: nextNodeTotals,
+    };
+    return payload;
+  };
+
+  const fetchTrafficSnapshot = async (): Promise<MobileTrafficSnapshot> => {
+    const controller = new AbortController();
+    pendingControllers.add(controller);
+    try {
+      const response = await tauriFetch(`${defaultMobileClashApiControllerUrl}/connections`, {
+        method: "GET",
+        headers: {
+          Accept: "application/json",
+        },
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        throw new Error(`流量监控采样失败：HTTP ${response.status}`);
+      }
+      const body = await response.text();
+      return buildTrafficSnapshotFromConnectionsPayload(JSON.parse(body));
+    } finally {
+      pendingControllers.delete(controller);
+    }
+  };
+
+  const pollTrafficMonitor = async (generation: number): Promise<void> => {
+    if (trafficMonitorPolling || generation !== trafficMonitorGeneration) {
+      return;
+    }
+    if (!trafficMonitorEnabled || trafficMonitorIntervalSec <= 0) {
+      return;
+    }
+    if (latestHostStatus?.serviceRunning !== true || latestHostStatus.state !== "running") {
+      return;
+    }
+    trafficMonitorPolling = true;
+    try {
+      const trafficSnapshot = await fetchTrafficSnapshot();
+      if (generation !== trafficMonitorGeneration || !trafficMonitorEnabled) {
+        return;
+      }
+      emitTrafficTickEvent(buildTrafficTickPayload(trafficSnapshot, trafficMonitorIntervalSec));
+    } catch {
+      // Ignore transient controller read failures and wait for the next interval.
+    } finally {
+      trafficMonitorPolling = false;
+    }
+  };
+
+  const refreshTrafficMonitorState = (options?: {
+    immediate?: boolean;
+  }) => {
+    const intervalSec = Math.max(0, Math.trunc(Number(snapshot.trafficMonitorIntervalSec ?? 0)));
+    const shouldEnable =
+      intervalSec > 0 &&
+      latestHostStatus?.serviceRunning === true &&
+      latestHostStatus.state === "running";
+    if (!shouldEnable) {
+      const wasEnabled = trafficMonitorEnabled || trafficSampleState !== null;
+      trafficMonitorEnabled = false;
+      trafficMonitorIntervalSec = 0;
+      trafficMonitorGeneration += 1;
+      if (trafficMonitorTimer !== null) {
+        window.clearInterval(trafficMonitorTimer);
+        trafficMonitorTimer = null;
+      }
+      trafficSampleState = null;
+      if (wasEnabled) {
+        emitZeroTrafficTick(intervalSec);
+      }
+      return;
+    }
+    const shouldRestartTimer =
+      !trafficMonitorEnabled || trafficMonitorTimer === null || trafficMonitorIntervalSec !== intervalSec;
+    trafficMonitorEnabled = true;
+    trafficMonitorIntervalSec = intervalSec;
+    if (shouldRestartTimer) {
+      trafficMonitorGeneration += 1;
+      const generation = trafficMonitorGeneration;
+      trafficSampleState = null;
+      if (trafficMonitorTimer !== null) {
+        window.clearInterval(trafficMonitorTimer);
+      }
+      trafficMonitorTimer = window.setInterval(() => {
+        void pollTrafficMonitor(generation);
+      }, intervalSec * 1000);
+      if (options?.immediate !== false) {
+        void pollTrafficMonitor(generation);
+      }
+      return;
+    }
+    if (options?.immediate === true) {
+      void pollTrafficMonitor(trafficMonitorGeneration);
+    }
   };
 
   const persistCurrentSnapshot = () => {
@@ -481,6 +1231,7 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
     snapshot.stateRevision = revision;
     snapshot.activePushSubscribers = listeners.size;
     persistCurrentSnapshot();
+    refreshTrafficMonitorState();
     if (emitChange) {
       emitSnapshot();
     }
@@ -500,6 +1251,117 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
     const draft = deepClone(snapshot);
     updater(draft);
     return ensureGroupSelection(draft);
+  };
+
+  const updateBuiltInRuleSetCache = (statuses: MobileBuiltInRuleSetStatus[]): void => {
+    for (const item of statuses) {
+      const tag = String(item.tag ?? "").trim();
+      if (tag === "") {
+        continue;
+      }
+      const localPath = String(item.localPath ?? "").trim();
+      if (item.exists && localPath !== "") {
+        mobileBuiltInRuleSetLocalPathByTag.set(tag, localPath);
+        continue;
+      }
+      mobileBuiltInRuleSetLocalPathByTag.delete(tag);
+    }
+  };
+
+  const resolveBuiltInRuleSetRequest = (input?: {
+    geoip?: string[];
+    geosite?: string[];
+    config?: RuleConfigV2;
+  }): {
+    geoip: string[];
+    geosite: string[];
+  } => {
+    const requestedGeoIP = (input?.geoip ?? [])
+      .map((value) => normalizeGeoRuleSetValue(String(value ?? "")))
+      .filter((value) => value !== "" && value !== "private");
+    const requestedGeoSite = (input?.geosite ?? [])
+      .map((value) => normalizeGeoRuleSetValue(String(value ?? "")))
+      .filter((value) => value !== "");
+    if (requestedGeoIP.length > 0 || requestedGeoSite.length > 0) {
+      return {
+        geoip: Array.from(new Set(requestedGeoIP)).sort(),
+        geosite: Array.from(new Set(requestedGeoSite)).sort(),
+      };
+    }
+    return collectBuiltInRuleSetValues(input?.config ?? snapshot.ruleConfigV2);
+  };
+
+  const queryBuiltInRuleSetStatuses = async (input?: {
+    geoip?: string[];
+    geosite?: string[];
+    config?: RuleConfigV2;
+  }): Promise<MobileBuiltInRuleSetStatus[]> => {
+    const request = resolveBuiltInRuleSetRequest(input);
+    if (request.geoip.length === 0 && request.geosite.length === 0) {
+      return [];
+    }
+    const host = requireMobileHost();
+    const result = await host.getBuiltInRuleSetStatuses(request);
+    const statuses = (result.statuses ?? []) as MobileBuiltInRuleSetStatus[];
+    updateBuiltInRuleSetCache(statuses);
+    return statuses;
+  };
+
+  const ensureBuiltInRuleSetCache = async (config?: RuleConfigV2): Promise<void> => {
+    const request = resolveBuiltInRuleSetRequest({ config });
+    if (request.geoip.length === 0 && request.geosite.length === 0) {
+      return;
+    }
+    try {
+      await queryBuiltInRuleSetStatuses(request);
+    } catch {
+      // Keep runtime start/save flow resilient on transient status read failures.
+    }
+  };
+
+  const stripBuiltInRuleSetStatuses = (
+    statuses: MobileBuiltInRuleSetStatus[],
+  ): RuleSetLocalStatus[] =>
+    statuses.map((item) => ({
+      kind: item.kind,
+      value: item.value,
+      tag: item.tag,
+      exists: item.exists,
+      updatedAtMs: item.updatedAtMs,
+    }));
+
+  const updateBuiltInRuleSets = async (input: {
+    geoip?: string[];
+    geosite?: string[];
+    downloadMode: RuleSetDownloadMode;
+  }): Promise<{
+    snapshot: DaemonSnapshot;
+    summary: RuleSetUpdateSummary;
+    error?: string;
+    statuses: RuleSetLocalStatus[];
+  }> => {
+    const request = resolveBuiltInRuleSetRequest(input);
+    const host = requireMobileHost();
+    const currentStatus = mobileHost ? await mobileHost.getStatus() : latestHostStatus ?? null;
+    if (currentStatus) {
+      syncHostStatus(currentStatus);
+    }
+    const proxyActive = currentStatus?.serviceRunning === true;
+    const result = await host.updateBuiltInRuleSets({
+      geoip: request.geoip,
+      geosite: request.geosite,
+      downloadMode: input.downloadMode,
+      proxyUrl: proxyActive ? buildMobileMixedProxyUrl(snapshot) : undefined,
+      proxyViaTun: currentStatus?.tunReady === true,
+    });
+    const statuses = (result.statuses ?? []) as MobileBuiltInRuleSetStatus[];
+    updateBuiltInRuleSetCache(statuses);
+    return {
+      snapshot,
+      summary: result.summary,
+      error: result.error,
+      statuses: stripBuiltInRuleSetStatuses(statuses),
+    };
   };
 
   const upsertBackgroundTaskInDraft = (
@@ -557,6 +1419,30 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
     draft.probeRuntimeTasks = (draft.probeRuntimeTasks ?? []).filter((item) => item.taskId !== taskId);
   };
 
+  const mergeNativeProbeTasks = (
+    currentTasks: BackgroundTask[] | undefined,
+    nativeTasks: BackgroundTask[],
+  ): BackgroundTask[] => {
+    const preservedLocalTasks = (currentTasks ?? []).filter((item) => item.type !== "node_probe");
+    return [...nativeTasks, ...preservedLocalTasks].slice(0, maxBackgroundTaskHistory);
+  };
+
+  const serializeProbeRuntimeTasks = (tasks: ProbeRuntimeTask[] | undefined): string =>
+    JSON.stringify(tasks ?? []);
+
+  const emitTaskQueueEvent = (tasks: BackgroundTask[]) => {
+    emit({
+      kind: "task_queue",
+      timestampMs: nowMs(),
+      revision,
+      payload: {
+        taskQueue: {
+          tasks,
+        },
+      },
+    });
+  };
+
   const requireMobileHost = (): WaterayMobileHostApi => {
     if (!mobileHost) {
       throw new Error("移动端代理宿主尚未接入");
@@ -564,9 +1450,10 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
     return mobileHost;
   };
 
-  const syncHostStatus = (status: WaterayMobileHostStatus) => {
-    latestHostStatus = status;
-    transportStatus = createTransportStatus(status);
+  const applyHostStatusToDraft = (
+    draft: DaemonSnapshot,
+    status: WaterayMobileHostStatus,
+  ) => {
     const runtimeMode = normalizeModeForMobile(status.runtimeMode);
     const stage =
       status.state === "running"
@@ -578,30 +1465,116 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
             : status.state === "error"
               ? "error"
               : "idle";
+    draft.connectionStage = stage;
+    draft.proxyMode =
+      status.state === "running" || status.state === "starting" ? runtimeMode : "off";
+    draft.tunEnabled = status.tunReady;
+    draft.systemProxyEnabled = false;
+    draft.proxyStartedAtMs = status.startedAtMs ?? undefined;
+    draft.runtimeLabel = status.profileName?.trim() || draft.runtimeLabel;
+  };
+
+  const syncHostStatus = (status: WaterayMobileHostStatus) => {
+    const wasRunning = latestHostStatus?.serviceRunning === true && latestHostStatus.state === "running";
+    latestHostStatus = status;
+    transportStatus = createTransportStatus(status);
     updateSnapshot((draft) => {
-      draft.connectionStage = stage;
-      draft.proxyMode =
-        status.state === "running" || status.state === "starting" ? runtimeMode : "off";
-      draft.tunEnabled = status.tunReady;
-      draft.systemProxyEnabled = false;
-      draft.proxyStartedAtMs = status.startedAtMs ?? undefined;
-      draft.runtimeLabel = status.profileName?.trim() || draft.runtimeLabel;
+      applyHostStatusToDraft(draft, status);
+    });
+    refreshTrafficMonitorState({
+      immediate: !wasRunning && status.serviceRunning === true && status.state === "running",
     });
     emitTransport();
   };
 
+  const applyNativeProbeResultPatch = (payload: ProbeResultPatchPayload) => {
+    const nextSnapshot = applyProbeResultPatchToSnapshot(snapshot, payload);
+    if (nextSnapshot !== snapshot) {
+      commitSnapshot(nextSnapshot, false);
+    }
+    emit({
+      kind: "probe_result_patch",
+      timestampMs: nowMs(),
+      revision,
+      payload: {
+        probeResultPatch: payload,
+      },
+    });
+  };
+
+  const syncNativeTaskQueue = (
+    result: WaterayMobileTaskQueueResult,
+    options: {
+      emitTaskQueue?: boolean;
+      emitSnapshotForProbeTasks?: boolean;
+      processCompletions?: boolean;
+    } = {},
+  ) => {
+    const previousProbeTaskSignature = serializeProbeRuntimeTasks(snapshot.probeRuntimeTasks);
+    const previousTaskStatusById = nativeNodeProbeTaskStatusById;
+    const nextTasks = mergeNativeProbeTasks(snapshot.backgroundTasks, result.tasks);
+    const nextProbeTasks = result.probeTasks ?? [];
+    let nextSnapshot = snapshot;
+    for (const patch of result.probeResultPatches ?? []) {
+      nextSnapshot = applyProbeResultPatchToSnapshot(nextSnapshot, patch);
+    }
+    const patchChanged = nextSnapshot !== snapshot;
+    updateSnapshot((draft) => {
+      if (nextSnapshot !== snapshot) {
+        draft.groups = nextSnapshot.groups;
+        draft.probeRuntimeTasks = nextSnapshot.probeRuntimeTasks;
+      }
+      draft.backgroundTasks = nextTasks;
+      draft.probeRuntimeTasks = nextProbeTasks;
+    }, false);
+    nativeNodeProbeTaskStatusById = new Map(
+      result.tasks.map((task) => [task.id, String(task.status ?? "")]),
+    );
+    if (options.emitTaskQueue !== false) {
+      emitTaskQueueEvent(nextTasks);
+    }
+    if (
+      options.emitSnapshotForProbeTasks !== false &&
+      (patchChanged || previousProbeTaskSignature !== serializeProbeRuntimeTasks(nextProbeTasks))
+    ) {
+      emitSnapshot();
+    }
+    if (options.processCompletions !== false) {
+      void maybeApplyProbeTaskCompletionRuntimeUpdate(previousTaskStatusById, result.tasks);
+    }
+  };
+
   const ensureStatusSubscription = async () => {
-    if (statusSubscriptionDispose || !mobileHost) {
+    if (!mobileHost) {
       return;
     }
-    statusSubscriptionDispose = await mobileHost.onStatusChanged((status) => {
-      syncHostStatus(status);
-    });
+    if (!statusSubscriptionDispose) {
+      statusSubscriptionDispose = await mobileHost.onStatusChanged((status) => {
+        syncHostStatus(status);
+      });
+    }
+    if (!taskQueueSubscriptionDispose) {
+      let initializingTaskQueue = true;
+      taskQueueSubscriptionDispose = await mobileHost.onTaskQueueChanged((result) => {
+        syncNativeTaskQueue(result, {
+          emitTaskQueue: !initializingTaskQueue,
+          emitSnapshotForProbeTasks: !initializingTaskQueue,
+          processCompletions: !initializingTaskQueue,
+        });
+      });
+      initializingTaskQueue = false;
+    }
+    if (!probePatchSubscriptionDispose) {
+      probePatchSubscriptionDispose = await mobileHost.onProbeResultPatch((payload) => {
+        applyNativeProbeResultPatch(payload);
+      });
+    }
     const currentStatus = await mobileHost.getStatus();
     syncHostStatus(currentStatus);
   };
 
   void ensureStatusSubscription();
+  void ensureBuiltInRuleSetCache(snapshot.ruleConfigV2);
 
   const waitForHostStartupResult = async (
     host: WaterayMobileHostApi,
@@ -627,21 +1600,25 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
   const reloadRunningSnapshot = async (
     nextSnapshot: DaemonSnapshot,
     status?: WaterayMobileHostStatus | null,
+    options: {
+      commit?: boolean;
+    } = {},
   ): Promise<DaemonSnapshot> => {
     const host = requireMobileHost();
     const currentStatus = status ?? await host.getStatus();
     syncHostStatus(currentStatus);
     if (!currentStatus.serviceRunning) {
-      return commitSnapshot(nextSnapshot);
+      return options.commit === false ? nextSnapshot : commitSnapshot(nextSnapshot);
     }
     const targetMode = normalizeModeForMobile(nextSnapshot.configuredProxyMode);
     if (targetMode === "off") {
-      return commitSnapshot(nextSnapshot);
+      return options.commit === false ? nextSnapshot : commitSnapshot(nextSnapshot);
     }
+    await ensureBuiltInRuleSetCache(nextSnapshot.ruleConfigV2);
     const runtimeConfig = buildMobileRuntimeConfig(
       nextSnapshot,
       targetMode,
-      createMobileResolverContext(currentStatus),
+      await createMobileResolverContext(currentStatus),
     );
     await host.checkConfig(runtimeConfig.configJson);
     await host.start({
@@ -658,8 +1635,230 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
         : "idle";
     nextSnapshot.proxyStartedAtMs = startupStatus.startedAtMs ?? undefined;
     nextSnapshot.selectedNodeId = runtimeConfig.selectedNodeId;
-    return commitSnapshot(nextSnapshot);
+    return options.commit === false ? nextSnapshot : commitSnapshot(nextSnapshot);
   };
+
+  const switchRunningSelectors = async (
+    nextSnapshot: DaemonSnapshot,
+    selections: Array<{
+      selectorTag: string;
+      outboundTag: string;
+    }>,
+    status: WaterayMobileHostStatus | null,
+    options: {
+      operation: RuntimeApplyOperation;
+      changeSetSummary: string;
+      closeConnections?: boolean;
+      commit?: boolean;
+      markRuntimeApply?: boolean;
+    },
+  ): Promise<DaemonSnapshot> => {
+    if (status?.serviceRunning !== true) {
+      return options.commit === false ? nextSnapshot : commitSnapshot(nextSnapshot);
+    }
+    const host = requireMobileHost();
+    const switchResult = await host.switchSelectors({
+      selections,
+      closeConnections: options.closeConnections === true,
+    });
+    latestHostStatus = switchResult.status;
+    transportStatus = createTransportStatus(switchResult.status);
+    applyHostStatusToDraft(nextSnapshot, switchResult.status);
+    if (options.markRuntimeApply !== false) {
+      nextSnapshot.lastRuntimeApply = buildRuntimeApplyStatus({
+        operation: options.operation,
+        strategy: "hot_patch",
+        result: "hot_applied",
+        changeSetSummary: options.changeSetSummary,
+        success: true,
+      });
+    }
+    return options.commit === false ? nextSnapshot : commitSnapshot(nextSnapshot);
+  };
+
+  const applyProbeDrivenRuntimeUpdate = async (
+    nextSnapshot: DaemonSnapshot,
+    status: WaterayMobileHostStatus | null,
+    options: {
+      changeSetSummary: string;
+      failureMessage: string;
+    },
+  ): Promise<DaemonSnapshot> => {
+    const targetMode = normalizeModeForMobile(nextSnapshot.configuredProxyMode);
+    if (status?.serviceRunning !== true || targetMode === "off") {
+      return commitSnapshot(nextSnapshot);
+    }
+    await ensureBuiltInRuleSetCache(nextSnapshot.ruleConfigV2);
+    const resolverContext = await createMobileResolverContext(status);
+    let currentConfigJson = "";
+    try {
+      const currentMode = normalizeModeForMobile(snapshot.configuredProxyMode);
+      if (currentMode !== "off") {
+        currentConfigJson = buildMobileRuntimeConfig(snapshot, currentMode, resolverContext).configJson;
+      }
+    } catch {
+      currentConfigJson = "";
+    }
+    let nextConfigJson = "";
+    try {
+      nextConfigJson = buildMobileRuntimeConfig(nextSnapshot, targetMode, resolverContext).configJson;
+    } catch (error) {
+      nextSnapshot.lastRuntimeApply = buildRuntimeApplyStatus({
+        operation: "set_rule_config",
+        strategy: "fast_restart",
+        result: "apply_failed",
+        changeSetSummary: options.changeSetSummary,
+        success: false,
+        restartRequired: true,
+        error: formatErrorMessage(error, options.failureMessage),
+      });
+      return commitSnapshot(nextSnapshot);
+    }
+    if (currentConfigJson !== "" && currentConfigJson === nextConfigJson) {
+      return commitSnapshot(nextSnapshot);
+    }
+    try {
+      const selectorSelections = buildMobileSelectorSelections(nextSnapshot, {
+        includeProxySelector: false,
+      });
+      if (selectorSelections.length > 0) {
+        return await switchRunningSelectors(nextSnapshot, selectorSelections, status, {
+          operation: "set_rule_config",
+          changeSetSummary: options.changeSetSummary,
+          closeConnections: true,
+        });
+      }
+    } catch {
+      // Fall through to fast restart when selector hot switch cannot cover the change.
+    }
+    try {
+      const appliedSnapshot = await reloadRunningSnapshot(nextSnapshot, status, {
+        commit: false,
+      });
+      appliedSnapshot.lastRuntimeApply = buildRuntimeApplyStatus({
+        operation: "set_rule_config",
+        strategy: "fast_restart",
+        result: "hot_applied",
+        changeSetSummary: options.changeSetSummary,
+        success: true,
+      });
+      return commitSnapshot(appliedSnapshot);
+    } catch (error) {
+      nextSnapshot.lastRuntimeApply = buildRuntimeApplyStatus({
+        operation: "set_rule_config",
+        strategy: "fast_restart",
+        result: "apply_failed",
+        changeSetSummary: options.changeSetSummary,
+        success: false,
+        restartRequired: true,
+        error: formatErrorMessage(error, options.failureMessage),
+      });
+      return commitSnapshot(nextSnapshot);
+    }
+  };
+
+  async function maybeApplyProbeTaskCompletionRuntimeUpdate(
+    previousTaskStatusById: Map<string, string>,
+    nextNativeTasks: BackgroundTask[],
+  ): Promise<void> {
+    const hasNewlyCompletedProbeTask = nextNativeTasks.some(
+      (task) =>
+        task.type === "node_probe" &&
+        task.status === "success" &&
+        previousTaskStatusById.get(task.id) !== "success",
+    );
+    if (!hasNewlyCompletedProbeTask) {
+      return;
+    }
+    let refreshedRulePoolCount = 0;
+    const nextSnapshot = createWorkingSnapshot((draft) => {
+      refreshedRulePoolCount = refreshReferencedRulePoolAvailableNodeIds(draft);
+    });
+    if (refreshedRulePoolCount <= 0) {
+      return;
+    }
+    const currentStatus = mobileHost ? await mobileHost.getStatus() : latestHostStatus ?? null;
+    if (currentStatus) {
+      latestHostStatus = currentStatus;
+      transportStatus = createTransportStatus(currentStatus);
+      applyHostStatusToDraft(nextSnapshot, currentStatus);
+    }
+    await applyProbeDrivenRuntimeUpdate(nextSnapshot, currentStatus ?? null, {
+      changeSetSummary: "mobile_rule_pool_probe_refresh",
+      failureMessage: "移动端节点探测后自动热更失败",
+    });
+    emitTransport();
+  }
+
+  const refreshReferencedNodePoolsInBackground = async (input?: {
+    excludeNodeIds?: string[];
+    status?: WaterayMobileHostStatus | null;
+  }): Promise<DaemonSnapshot> => {
+    let currentStatus = input?.status ?? (mobileHost ? await mobileHost.getStatus() : latestHostStatus ?? null);
+    if (currentStatus) {
+      syncHostStatus(currentStatus);
+    }
+
+    let nextSnapshot = snapshot;
+    let refreshedRulePoolCount = 0;
+    const cachedRefreshSnapshot = createWorkingSnapshot((draft) => {
+      refreshedRulePoolCount = refreshReferencedRulePoolAvailableNodeIds(draft);
+    });
+    if (refreshedRulePoolCount > 0) {
+      if (currentStatus?.serviceRunning === true) {
+        nextSnapshot = await applyProbeDrivenRuntimeUpdate(cachedRefreshSnapshot, currentStatus, {
+          changeSetSummary: "mobile_rule_pool_cached_refresh",
+          failureMessage: "移动端节点池缓存优选热更失败",
+        });
+      } else {
+        nextSnapshot = commitSnapshot(cachedRefreshSnapshot);
+      }
+    }
+
+    const targetNodeIds = collectReferencedRulePoolCandidateNodeIds(nextSnapshot, {
+      excludeNodeIds: input?.excludeNodeIds,
+    });
+    if (targetNodeIds.length <= 0) {
+      return nextSnapshot;
+    }
+
+    currentStatus = mobileHost ? await mobileHost.getStatus() : currentStatus;
+    if (currentStatus) {
+      syncHostStatus(currentStatus);
+    }
+    if (currentStatus?.serviceRunning !== true || currentStatus.tunReady !== true) {
+      return nextSnapshot;
+    }
+
+    const probeResult = await startBackgroundProbe({
+      groupId: String(nextSnapshot.activeGroupId ?? "").trim(),
+      nodeIds: targetNodeIds,
+      probeTypes: ["real_connect"],
+      background: true,
+    });
+    return probeResult.snapshot;
+  };
+
+  const buildRuntimeApplyStatus = (input: {
+    operation: RuntimeApplyOperation;
+    strategy: RuntimeApplyStrategy;
+    result: RuntimeApplyResult;
+    changeSetSummary: string;
+    success: boolean;
+    rollbackApplied?: boolean;
+    restartRequired?: boolean;
+    error?: string;
+  }): DaemonSnapshot["lastRuntimeApply"] => ({
+    operation: input.operation,
+    strategy: input.strategy,
+    result: input.result,
+    changeSetSummary: input.changeSetSummary,
+    success: input.success,
+    rollbackApplied: input.rollbackApplied === true,
+    restartRequired: input.restartRequired,
+    error: input.error,
+    timestampMs: nowMs(),
+  });
 
   const requestState = (): DaemonResponsePayload =>
     createSnapshotResponse(snapshot, transportStatus);
@@ -688,25 +1887,39 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
     }
   };
 
+  const normalizeSubscriptionGroupUrl = (rawUrl: string): string => rawUrl.trim();
+
   const addSubscription = (name: string, url: string): DaemonSnapshot =>
     updateSnapshot((draft) => {
-      const subscriptionId = createId("sub");
       const groupId = createId("group");
-      draft.subscriptions.push({
-        id: subscriptionId,
-        name: name.trim() || "新订阅",
-        url: url.trim(),
-        status: "",
-        lastUpdatedMs: 0,
-        enabled: true,
-      });
-      draft.groups.push({
-        id: groupId,
-        name: name.trim() || "新订阅",
-        kind: "subscription",
-        nodes: [],
-        subscriptionId,
-      });
+      const normalizedName = name.trim() || "新分组";
+      const normalizedUrl = normalizeSubscriptionGroupUrl(url);
+      if (normalizedUrl === "") {
+        draft.groups.push({
+          id: groupId,
+          name: normalizedName,
+          kind: "manual",
+          nodes: [],
+          subscriptionId: "",
+        });
+      } else {
+        const subscriptionId = createId("sub");
+        draft.subscriptions.push({
+          id: subscriptionId,
+          name: normalizedName,
+          url: normalizedUrl,
+          status: "",
+          lastUpdatedMs: 0,
+          enabled: true,
+        });
+        draft.groups.push({
+          id: groupId,
+          name: normalizedName,
+          kind: "subscription",
+          nodes: [],
+          subscriptionId,
+        });
+      }
       ensureGroupSelection(draft);
     });
 
@@ -716,13 +1929,46 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
       if (!group) {
         throw new Error("目标分组不存在");
       }
-      group.name = payload.name.trim() || group.name;
-      if (group.kind === "subscription" && group.subscriptionId) {
-        const subscription = draft.subscriptions.find((item) => item.id === group.subscriptionId);
-        if (subscription) {
-          subscription.name = group.name;
-          subscription.url = payload.url.trim();
+      const normalizedName = payload.name.trim() || group.name;
+      const normalizedUrl = normalizeSubscriptionGroupUrl(payload.url);
+      group.name = normalizedName;
+      if (normalizedUrl === "") {
+        if (group.subscriptionId) {
+          draft.subscriptions = draft.subscriptions.filter((item) => item.id !== group.subscriptionId);
         }
+        group.kind = "manual";
+        group.subscriptionId = "";
+        return;
+      }
+      if (!group.subscriptionId) {
+        const subscriptionId = createId("sub");
+        draft.subscriptions.push({
+          id: subscriptionId,
+          name: normalizedName,
+          url: normalizedUrl,
+          status: "",
+          lastUpdatedMs: 0,
+          enabled: true,
+        });
+        group.kind = "subscription";
+        group.subscriptionId = subscriptionId;
+        return;
+      }
+      group.kind = "subscription";
+      const subscription = draft.subscriptions.find((item) => item.id === group.subscriptionId);
+      if (subscription) {
+        subscription.name = normalizedName;
+        subscription.url = normalizedUrl;
+        subscription.enabled = true;
+      } else {
+        draft.subscriptions.push({
+          id: group.subscriptionId,
+          name: normalizedName,
+          url: normalizedUrl,
+          status: "",
+          lastUpdatedMs: 0,
+          enabled: true,
+        });
       }
     });
 
@@ -782,6 +2028,7 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
     });
 
   const selectNode = async (groupId: string, nodeId: string): Promise<DaemonSnapshot> => {
+    const previousActiveGroupId = snapshot.activeGroupId;
     const nextSnapshot = createWorkingSnapshot((draft) => {
       const targetGroup = groupId.trim() !== ""
         ? resolveGroupById(draft, groupId)
@@ -796,7 +2043,50 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
       draft.activeGroupId = targetGroup.id;
       draft.selectedNodeId = node.id;
     });
-    return reloadRunningSnapshot(nextSnapshot);
+    const targetMode = normalizeModeForMobile(nextSnapshot.configuredProxyMode);
+    if (targetMode === "off") {
+      return commitSnapshot(nextSnapshot);
+    }
+    const host = requireMobileHost();
+    const currentStatus = await host.getStatus();
+    syncHostStatus(currentStatus);
+    if (!currentStatus.serviceRunning) {
+      return commitSnapshot(nextSnapshot);
+    }
+    if (nextSnapshot.activeGroupId !== previousActiveGroupId) {
+      return reloadRunningSnapshot(nextSnapshot, currentStatus);
+    }
+    await ensureBuiltInRuleSetCache(nextSnapshot.ruleConfigV2);
+    const resolverContext = await createMobileResolverContext(currentStatus);
+    let currentConfigJson = "";
+    try {
+      const currentMode = normalizeModeForMobile(snapshot.configuredProxyMode);
+      if (currentMode !== "off") {
+        currentConfigJson = buildMobileRuntimeConfig(snapshot, currentMode, resolverContext).configJson;
+      }
+    } catch {
+      currentConfigJson = "";
+    }
+    const nextRuntimeConfig = buildMobileRuntimeConfig(nextSnapshot, targetMode, resolverContext);
+    if (currentConfigJson !== "" && currentConfigJson === nextRuntimeConfig.configJson) {
+      return commitSnapshot(nextSnapshot);
+    }
+    try {
+      const proxySelection = buildMobileSelectorSelections(nextSnapshot).find(
+        (item) => item.selectorTag === "proxy",
+      );
+      if (!proxySelection) {
+        throw new Error("移动端当前未生成可用的主 selector 热切目标");
+      }
+      return await switchRunningSelectors(nextSnapshot, [proxySelection], currentStatus, {
+        operation: "set_settings",
+        changeSetSummary: "mobile_select_node",
+        closeConnections: true,
+        markRuntimeApply: false,
+      });
+    } catch {
+      return reloadRunningSnapshot(nextSnapshot, currentStatus);
+    }
   };
 
   const addManualNode = (payload: AddManualNodeRequestPayload): DaemonSnapshot =>
@@ -858,6 +2148,33 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
         throw new Error("目标分组不存在");
       }
       group.nodes = group.nodes.filter((node) => node.id !== nodeId);
+      ensureGroupSelection(draft);
+    });
+
+  const removeNodes = (payload: RemoveNodesRequestPayload): DaemonSnapshot =>
+    updateSnapshot((draft) => {
+      const groupNodeSet = new Map<string, Set<string>>();
+      for (const item of payload.items ?? []) {
+        const groupId = String(item?.groupId ?? "").trim();
+        const nodeId = String(item?.nodeId ?? "").trim();
+        if (groupId === "" || nodeId === "") {
+          throw new Error("groupId 和 nodeId 不能为空");
+        }
+        const group = resolveGroupById(draft, groupId);
+        if (!group) {
+          throw new Error("目标分组不存在");
+        }
+        const nodeSet = groupNodeSet.get(groupId) ?? new Set<string>();
+        nodeSet.add(nodeId);
+        groupNodeSet.set(groupId, nodeSet);
+      }
+      draft.groups.forEach((group) => {
+        const nodeSet = groupNodeSet.get(group.id);
+        if (!nodeSet || nodeSet.size === 0) {
+          return;
+        }
+        group.nodes = group.nodes.filter((node) => !nodeSet.has(node.id));
+      });
       ensureGroupSelection(draft);
     });
 
@@ -931,18 +2248,47 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
       });
     });
 
-  const removeBackgroundTask = (taskId: string): DaemonSnapshot =>
+  const resetTrafficStats = (payload: ResetTrafficStatsRequestPayload): DaemonSnapshot =>
     updateSnapshot((draft) => {
-      const targetTask = (draft.backgroundTasks ?? []).find((item) => item.id === taskId);
-      if (!targetTask) {
-        throw new Error("目标后台任务不存在");
-      }
-      if (targetTask.status === "running") {
-        throw new Error("运行中的后台任务暂不支持移除");
-      }
+      const targetGroupIds = payload.groupId ? new Set([payload.groupId]) : null;
+      const targetNodeIds = new Set(payload.nodeIds ?? []);
+      draft.groups.forEach((group) => {
+        if (targetGroupIds && !targetGroupIds.has(group.id)) {
+          return;
+        }
+        group.nodes.forEach((node) => {
+          if (targetNodeIds.size > 0 && !targetNodeIds.has(node.id)) {
+            return;
+          }
+          node.totalDownloadMb = 0;
+          node.totalUploadMb = 0;
+          node.todayDownloadMb = 0;
+          node.todayUploadMb = 0;
+        });
+      });
+    });
+
+  const removeBackgroundTask = async (taskId: string): Promise<DaemonSnapshot> => {
+    const targetTask = (snapshot.backgroundTasks ?? []).find((item) => item.id === taskId);
+    if (!targetTask) {
+      throw new Error("目标后台任务不存在");
+    }
+    if (targetTask.type === "node_probe" && mobileHost) {
+      const result = await mobileHost.probeCancel(taskId);
+      syncNativeTaskQueue(result, {
+        emitTaskQueue: false,
+        emitSnapshotForProbeTasks: false,
+      });
+      return snapshot;
+    }
+    if (targetTask.status === "running") {
+      throw new Error("运行中的后台任务暂不支持移除");
+    }
+    return updateSnapshot((draft) => {
       clearProbeRuntimeTaskInDraft(draft, taskId);
       removeBackgroundTaskInDraft(draft, taskId);
     });
+  };
 
   const buildProbeSummary = (
     requested: number,
@@ -956,16 +2302,6 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
     skippedRealConnectDueToLatency: 0,
     reprobedLatencyBeforeRealConnect: 0,
   });
-
-  const buildProbeTaskTitle = (probeTypes: ProbeType[]): string => {
-    if (probeTypes.length === 1 && probeTypes[0] === "node_latency") {
-      return "一键探测延迟";
-    }
-    if (probeTypes.length === 1 && probeTypes[0] === "real_connect") {
-      return "一键评分";
-    }
-    return "一键探测与评分";
-  };
 
   const buildProbeTaskCompletionText = (
     probeTypes: ProbeType[],
@@ -981,7 +2317,7 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
     return `探测任务完成：可用 ${available}`;
   };
 
-  const resolveProbeRequest = async (payload: ProbeNodesRequestPayload) => {
+  const resolveProbeRequest = async (payload: MobileProbeNodesRequestPayload) => {
     const host = requireMobileHost();
     const currentStatus = await host.getStatus();
     syncHostStatus(currentStatus);
@@ -1011,6 +2347,7 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
     if (targetNodes.length === 0) {
       throw new Error("没有需要探测的节点");
     }
+    const cacheResolution = splitProbeTargetsByCache(snapshot, targetNodes, probeTypes);
     return {
       host,
       currentStatus,
@@ -1020,6 +2357,9 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
       latencyUrl,
       realConnectUrl,
       targetNodes,
+      freshTargetNodes: cacheResolution.freshTargetNodes,
+      cachedTargetNodes: cacheResolution.cachedTargetNodes,
+      cachedSummary: cacheResolution.summary,
     };
   };
 
@@ -1027,14 +2367,14 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
     resolved: Awaited<ReturnType<typeof resolveProbeRequest>>,
   ) => {
     const configs = [];
-    for (let index = 0; index < resolved.targetNodes.length; index += 1) {
-      const node = resolved.targetNodes[index];
+    for (let index = 0; index < resolved.freshTargetNodes.length; index += 1) {
+      const node = resolved.freshTargetNodes[index];
       configs.push({
         nodeId: node.id,
         configJson: buildMobileProbeConfig(
           resolved.sourceSnapshot,
           node,
-          createMobileResolverContext(resolved.currentStatus),
+          await createMobileResolverContext(resolved.currentStatus),
         ),
       });
       if ((index + 1) % probeConfigBuildYieldInterval === 0) {
@@ -1089,101 +2429,139 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
         }
       });
     });
-    return buildProbeSummary(execution.resolved.targetNodes.length, succeeded);
+    return buildProbeSummary(execution.resolved.freshTargetNodes.length, succeeded);
+  };
+
+  const buildProbeResultSnapshot = (
+    execution: Awaited<ReturnType<typeof executeProbeNodes>>,
+    options?: {
+      taskId?: string;
+    },
+  ): {
+    snapshot: DaemonSnapshot;
+    summary: ProbeNodesSummary;
+    refreshedRulePoolCount: number;
+    activeGroupChanged: boolean;
+  } => {
+    let summary = buildProbeSummary(0, 0);
+    let refreshedRulePoolCount = 0;
+    const activeGroupChanged =
+      String(snapshot.activeGroupId ?? "").trim() !==
+      String(execution.resolved.sourceSnapshot.activeGroupId ?? "").trim();
+    const nextSnapshot = createWorkingSnapshot((draft) => {
+      summary = applyProbeResultsInDraft(draft, execution);
+      if (!activeGroupChanged) {
+        refreshedRulePoolCount = refreshReferencedRulePoolAvailableNodeIds(draft);
+      }
+      if (options?.taskId) {
+        clearProbeRuntimeTaskInDraft(draft, options.taskId);
+        updateBackgroundTaskInDraft(draft, options.taskId, (currentTask) => ({
+          ...currentTask,
+          status: "success",
+          finishedAtMs: nowMs(),
+          progressText: activeGroupChanged
+            ? `${buildProbeTaskCompletionText(execution.resolved.probeTypes, summary)}；当前活动分组已变化，已跳过节点池热更`
+            : refreshedRulePoolCount > 0
+              ? `${buildProbeTaskCompletionText(execution.resolved.probeTypes, summary)}；节点池已自动刷新`
+              : buildProbeTaskCompletionText(execution.resolved.probeTypes, summary),
+          errorMessage: undefined,
+        }));
+      }
+    });
+    return {
+      snapshot: nextSnapshot,
+      summary,
+      refreshedRulePoolCount,
+      activeGroupChanged,
+    };
   };
 
   const startBackgroundProbe = async (
-    payload: ProbeNodesRequestPayload,
-  ): Promise<{ snapshot: DaemonSnapshot; task: BackgroundTask }> => {
-    const existingTask = (snapshot.backgroundTasks ?? []).find(
-      (item) => item.type === "node_probe" && item.status === "running",
-    );
-    if (existingTask) {
+    payload: MobileProbeNodesRequestPayload,
+  ): Promise<{ snapshot: DaemonSnapshot; task?: BackgroundTask; summary: ProbeNodesSummary }> => {
+    const resolved = await resolveProbeRequest(payload);
+    if (resolved.freshTargetNodes.length <= 0) {
       return {
         snapshot,
-        task: existingTask,
+        summary: resolved.cachedSummary,
       };
     }
-    const resolved = await resolveProbeRequest(payload);
-    const task: BackgroundTask = {
-      id: createId("bg-task"),
-      type: "node_probe",
-      title: buildProbeTaskTitle(resolved.probeTypes),
-      status: "running",
-      progressText: `正在处理 ${resolved.targetNodes.length} 个节点`,
-      startedAtMs: nowMs(),
-    };
+    const startResult = await resolved.host.probeStart({
+      groupId: String(payload.groupId ?? snapshot.activeGroupId ?? "").trim(),
+      configs: resolved.freshTargetNodes.map((node) => ({
+        nodeId: node.id,
+        configJson: "",
+      })),
+      probeTypes: resolved.probeTypes,
+      latencyUrl: resolved.latencyUrl,
+      realConnectUrl: resolved.realConnectUrl,
+      timeoutMs: resolved.timeoutMs,
+    });
+    const task = startResult.task;
+    if (!task) {
+      throw new Error("移动端原生任务中心未返回任务信息");
+    }
     const nextSnapshot = updateSnapshot((draft) => {
       upsertBackgroundTaskInDraft(draft, task);
       setProbeRuntimeTaskInDraft(
         draft,
         task.id,
         task.title,
-        resolved.targetNodes.map((node) => node.id),
+        resolved.freshTargetNodes.map((node) => node.id),
         resolved.probeTypes,
       );
-    });
-    window.setTimeout(() => {
-      void (async () => {
-        await delay(0);
-        try {
-          const execution = await executeProbeNodes(resolved);
-          updateSnapshot((draft) => {
-            const summary = applyProbeResultsInDraft(draft, execution);
-            clearProbeRuntimeTaskInDraft(draft, task.id);
-            updateBackgroundTaskInDraft(draft, task.id, (currentTask) => ({
-              ...currentTask,
-              status: "success",
-              finishedAtMs: nowMs(),
-              progressText: buildProbeTaskCompletionText(
-                execution.resolved.probeTypes,
-                summary,
-              ),
-              errorMessage: undefined,
-            }));
-          });
-        } catch (error) {
-          updateSnapshot((draft) => {
-            clearProbeRuntimeTaskInDraft(draft, task.id);
-            updateBackgroundTaskInDraft(draft, task.id, (currentTask) => ({
-              ...currentTask,
-              status: "failed",
-              finishedAtMs: nowMs(),
-              errorMessage: formatErrorMessage(error, `${currentTask.title}失败`),
-            }));
-          });
-        }
-      })();
-    }, 0);
+    }, false);
     return {
       snapshot: nextSnapshot,
       task,
+      summary: resolved.cachedSummary,
     };
   };
 
   const probeNodes = async (
-    payload: ProbeNodesRequestPayload,
+    payload: MobileProbeNodesRequestPayload,
   ): Promise<{ snapshot: DaemonSnapshot; summary: ProbeNodesSummary }> => {
     const resolved = await resolveProbeRequest(payload);
+    if (resolved.freshTargetNodes.length <= 0) {
+      return {
+        snapshot,
+        summary: resolved.cachedSummary,
+      };
+    }
     const execution = await executeProbeNodes(resolved);
-    let summary = buildProbeSummary(0, 0);
-    const nextSnapshot = updateSnapshot((draft) => {
-      summary = applyProbeResultsInDraft(draft, execution);
-    });
+    const prepared = buildProbeResultSnapshot(execution);
+    const runtimeStatus = mobileHost
+      ? await mobileHost.getStatus()
+      : latestHostStatus ?? execution.resolved.currentStatus;
+    if (runtimeStatus) {
+      latestHostStatus = runtimeStatus;
+      transportStatus = createTransportStatus(runtimeStatus);
+      applyHostStatusToDraft(prepared.snapshot, runtimeStatus);
+    }
+    const nextSnapshot = prepared.activeGroupChanged
+      ? commitSnapshot(prepared.snapshot)
+      : await applyProbeDrivenRuntimeUpdate(prepared.snapshot, runtimeStatus ?? null, {
+        changeSetSummary:
+          prepared.refreshedRulePoolCount > 0
+            ? "mobile_rule_pool_probe_refresh"
+            : "mobile_probe_runtime_refresh",
+        failureMessage: "移动端节点探测后自动热更失败",
+      });
+    emitTransport();
     return {
       snapshot: nextSnapshot,
-      summary,
+      summary: mergeProbeSummaryWithCache(resolved.cachedSummary, prepared.summary),
     };
   };
 
-  const setSettings = (
+  const setSettings = async (
     payload: Partial<DaemonSnapshot> & {
       applyRuntime?: boolean;
       proxyMode?: ProxyMode;
       probeSettings?: ProbeSettings;
     },
-  ): DaemonSnapshot =>
-    updateSnapshot((draft) => {
+  ): Promise<DaemonSnapshot> => {
+    const nextSnapshot = createWorkingSnapshot((draft) => {
       if (payload.proxyMode) {
         draft.configuredProxyMode = normalizeModeForMobile(payload.proxyMode);
       }
@@ -1226,6 +2604,9 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
       if (typeof payload.localProxyPort === "number") {
         draft.localProxyPort = payload.localProxyPort;
       }
+      if (typeof payload.allowExternalConnections === "boolean") {
+        draft.allowExternalConnections = payload.allowExternalConnections;
+      }
       if (typeof payload.tunMtu === "number") {
         draft.tunMtu = payload.tunMtu;
       }
@@ -1238,33 +2619,104 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
       if (payload.probeSettings) {
         draft.probeSettings = deepClone(payload.probeSettings);
       }
-      draft.lastRuntimeApply = {
+    });
+    const currentRuntimeStatus = mobileHost ? await mobileHost.getStatus() : latestHostStatus ?? null;
+    if (currentRuntimeStatus) {
+      syncHostStatus(currentRuntimeStatus);
+    }
+    const shouldApplyRuntime =
+      currentRuntimeStatus?.serviceRunning === true && payload.applyRuntime === true;
+    if (!shouldApplyRuntime) {
+      nextSnapshot.lastRuntimeApply = buildRuntimeApplyStatus({
         operation: "set_settings",
         strategy: "noop",
-        result: latestHostStatus?.serviceRunning && payload.applyRuntime
-          ? "restart_required"
-          : "saved_only",
+        result: "saved_only",
         changeSetSummary: "mobile_settings",
         success: true,
-        rollbackApplied: false,
-        timestampMs: nowMs(),
-      };
+      });
+      return commitSnapshot(nextSnapshot);
+    }
+    try {
+      const appliedSnapshot = await reloadRunningSnapshot(nextSnapshot, currentRuntimeStatus, {
+        commit: false,
+      });
+      appliedSnapshot.lastRuntimeApply = buildRuntimeApplyStatus({
+        operation: "set_settings",
+        strategy: "fast_restart",
+        result: "hot_applied",
+        changeSetSummary: "mobile_settings",
+        success: true,
+      });
+      return commitSnapshot(appliedSnapshot);
+    } catch (error) {
+      nextSnapshot.lastRuntimeApply = buildRuntimeApplyStatus({
+        operation: "set_settings",
+        strategy: "fast_restart",
+        result: "apply_failed",
+        changeSetSummary: "mobile_settings",
+        success: false,
+        restartRequired: true,
+        error: formatErrorMessage(error, "移动端设置热更失败"),
+      });
+      return commitSnapshot(nextSnapshot);
+    }
+  };
+
+  const setRuleConfig = async (
+    config: DaemonSnapshot["ruleConfigV2"] | undefined,
+  ): Promise<DaemonSnapshot> => {
+    const nextSnapshot = createWorkingSnapshot((draft) => {
+      if (config) {
+        draft.ruleConfigV2 = deepClone(config);
+      }
     });
+    const currentRuntimeStatus = mobileHost ? await mobileHost.getStatus() : latestHostStatus ?? null;
+    if (currentRuntimeStatus) {
+      syncHostStatus(currentRuntimeStatus);
+    }
+    const shouldApplyRuntime = currentRuntimeStatus?.serviceRunning === true;
+    if (!shouldApplyRuntime) {
+      nextSnapshot.lastRuntimeApply = buildRuntimeApplyStatus({
+        operation: "set_rule_config",
+        strategy: "noop",
+        result: "saved_only",
+        changeSetSummary: "mobile_rule_config",
+        success: true,
+      });
+      return commitSnapshot(nextSnapshot);
+    }
+    try {
+      const appliedSnapshot = await reloadRunningSnapshot(nextSnapshot, currentRuntimeStatus, {
+        commit: false,
+      });
+      appliedSnapshot.lastRuntimeApply = buildRuntimeApplyStatus({
+        operation: "set_rule_config",
+        strategy: "fast_restart",
+        result: "hot_applied",
+        changeSetSummary: "mobile_rule_config",
+        success: true,
+      });
+      const committedSnapshot = commitSnapshot(appliedSnapshot);
+      return await refreshReferencedNodePoolsInBackground({
+        status: currentRuntimeStatus,
+      }).catch(() => committedSnapshot);
+    } catch (error) {
+      nextSnapshot.lastRuntimeApply = buildRuntimeApplyStatus({
+        operation: "set_rule_config",
+        strategy: "fast_restart",
+        result: "apply_failed",
+        changeSetSummary: "mobile_rule_config",
+        success: false,
+        restartRequired: true,
+        error: formatErrorMessage(error, "移动端规则热更失败"),
+      });
+      return commitSnapshot(nextSnapshot);
+    }
+  };
 
   const checkStartPreconditions = (): StartPrecheckResult => {
     const blockers: StartPrecheckIssue[] = [];
     const warnings: StartPrecheckIssue[] = [];
-    if (
-      normalizeModeForMobile(snapshot.configuredProxyMode) === "system" &&
-      (!Number.isFinite(snapshot.localProxyPort) ||
-        snapshot.localProxyPort < 1 ||
-        snapshot.localProxyPort > 65535)
-    ) {
-      blockers.push({
-        code: "listen_port_unavailable",
-        message: "系统代理模式需要有效的本地监听端口（1~65535）。",
-      });
-    }
     const selectedNode = resolveSelectedNode(snapshot);
     if (!selectedNode) {
       blockers.push({
@@ -1310,10 +2762,11 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
         syncHostStatus(currentStatus);
       }
     }
+    await ensureBuiltInRuleSetCache(snapshot.ruleConfigV2);
     const runtimeConfig = buildMobileRuntimeConfig(
       snapshot,
       targetMode,
-      createMobileResolverContext(currentStatus),
+      await createMobileResolverContext(currentStatus),
     );
     await host.checkConfig(runtimeConfig.configJson);
     await host.start({
@@ -1361,6 +2814,17 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
     });
   };
 
+  const clearMobileDnsCache = async (
+    status?: WaterayMobileHostStatus | null,
+  ): Promise<WaterayMobileHostStatus> => {
+    const host = requireMobileHost();
+    const currentStatus = status ?? await host.getStatus();
+    syncHostStatus(currentStatus);
+    const nextStatus = await host.clearDnsCache();
+    syncHostStatus(nextStatus);
+    return nextStatus;
+  };
+
   const restartConnection = async (): Promise<DaemonSnapshot> => {
     const host = requireMobileHost();
     const targetMode = normalizeModeForMobile(snapshot.configuredProxyMode);
@@ -1388,10 +2852,28 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
         syncHostStatus(currentStatus);
       }
     }
+    if (snapshot.clearDNSCacheOnRestart === true) {
+      try {
+        currentStatus = await clearMobileDnsCache(currentStatus);
+      } catch (error) {
+        const message = formatErrorMessage(error, "重启前清理 DNS 缓存失败");
+        return updateSnapshot((draft) => {
+          draft.lastRuntimeApply = buildRuntimeApplyStatus({
+            operation: "restart_connection",
+            strategy: "noop",
+            result: "apply_failed",
+            changeSetSummary: "mobile_restart,clear_dns_cache_before_restart",
+            success: false,
+            error: message,
+          });
+        });
+      }
+    }
+    await ensureBuiltInRuleSetCache(snapshot.ruleConfigV2);
     const runtimeConfig = buildMobileRuntimeConfig(
       snapshot,
       targetMode,
-      createMobileResolverContext(currentStatus),
+      await createMobileResolverContext(currentStatus),
     );
     await host.checkConfig(runtimeConfig.configJson);
     await host.start({
@@ -1457,11 +2939,12 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
               transportStatus,
             );
           case "POST /v1/nodes/probe": {
-            const probePayload = (payload.body ?? {}) as ProbeNodesRequestPayload;
+            const probePayload = (payload.body ?? {}) as MobileProbeNodesRequestPayload;
             if (probePayload.background === true) {
               const result = await startBackgroundProbe(probePayload);
               return createSnapshotResponse(result.snapshot, transportStatus, {
                 task: result.task,
+                probeSummary: result.summary,
               });
             }
             const result = await probeNodes(probePayload);
@@ -1474,9 +2957,14 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
               clearProbeData((payload.body ?? {}) as ClearProbeDataRequestPayload),
               transportStatus,
             );
+          case "POST /v1/nodes/traffic/reset":
+            return createSnapshotResponse(
+              resetTrafficStats((payload.body ?? {}) as ResetTrafficStatsRequestPayload),
+              transportStatus,
+            );
           case "DELETE /v1/tasks/background":
             return createSnapshotResponse(
-              removeBackgroundTask(url.searchParams.get("taskId") ?? ""),
+              await removeBackgroundTask(url.searchParams.get("taskId") ?? ""),
               transportStatus,
             );
           case "POST /v1/dns/health": {
@@ -1488,7 +2976,7 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
               domain: typeof payload.body?.domain === "string" ? payload.body.domain : "",
               timeoutMs:
                 typeof payload.body?.timeoutMs === "number" ? payload.body.timeoutMs : undefined,
-            }, createMobileResolverContext(currentStatus), mobileHost ?? undefined);
+            }, await createMobileResolverContext(currentStatus), mobileHost ?? undefined, currentStatus ?? undefined);
             return {
               ok: result.error === undefined,
               snapshot,
@@ -1498,30 +2986,57 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
             };
           }
           case "POST /v1/dns/cache/clear":
+            await clearMobileDnsCache(latestHostStatus);
             return createSnapshotResponse(snapshot, transportStatus);
           case "POST /v1/settings":
             return createSnapshotResponse(
-              setSettings((payload.body ?? {}) as Partial<DaemonSnapshot>),
+              await setSettings((payload.body ?? {}) as Partial<DaemonSnapshot>),
               transportStatus,
             );
           case "POST /v1/rules/config":
             return createSnapshotResponse(
-              updateSnapshot((draft) => {
-                if (payload.body?.config) {
-                  draft.ruleConfigV2 = deepClone(payload.body.config as DaemonSnapshot["ruleConfigV2"]);
-                }
-                draft.lastRuntimeApply = {
-                  operation: "set_rule_config",
-                  strategy: "noop",
-                  result: latestHostStatus?.serviceRunning ? "restart_required" : "saved_only",
-                  changeSetSummary: "mobile_rule_config",
-                  success: true,
-                  rollbackApplied: false,
-                  timestampMs: nowMs(),
-                };
+              await setRuleConfig(payload.body?.config as DaemonSnapshot["ruleConfigV2"] | undefined),
+              transportStatus,
+            );
+          case "POST /v1/rules/node-pools/refresh":
+            return createSnapshotResponse(
+              await refreshReferencedNodePoolsInBackground({
+                excludeNodeIds: Array.isArray(payload.body?.excludeNodeIds)
+                  ? (payload.body.excludeNodeIds as string[])
+                  : [],
               }),
               transportStatus,
             );
+          case "POST /v1/rulesets/status": {
+            const statuses = await queryBuiltInRuleSetStatuses({
+              geoip: Array.isArray(payload.body?.geoip) ? (payload.body.geoip as string[]) : [],
+              geosite: Array.isArray(payload.body?.geosite) ? (payload.body.geosite as string[]) : [],
+            });
+            return {
+              ok: true,
+              snapshot,
+              ruleSetStatuses: stripBuiltInRuleSetStatuses(statuses),
+              transport: transportStatus,
+            };
+          }
+          case "POST /v1/rulesets/update": {
+            const result = await updateBuiltInRuleSets({
+              geoip: Array.isArray(payload.body?.geoip) ? (payload.body.geoip as string[]) : [],
+              geosite: Array.isArray(payload.body?.geosite) ? (payload.body.geosite as string[]) : [],
+              downloadMode:
+                typeof payload.body?.downloadMode === "string"
+                  ? (payload.body.downloadMode as RuleSetDownloadMode)
+                  : "auto",
+            });
+            return {
+              ok: !result.error,
+              snapshot: result.snapshot,
+              ruleSetUpdate: result.summary,
+              ruleSetStatuses: result.statuses,
+              error: result.error,
+              transport: transportStatus,
+            };
+          }
           case "POST /v1/routing/mode":
             return createSnapshotResponse(
               updateSnapshot((draft) => {
@@ -1597,6 +3112,11 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
                 url.searchParams.get("groupId") ?? "",
                 url.searchParams.get("nodeId") ?? "",
               ),
+              transportStatus,
+            );
+          case "POST /v1/nodes/manual/delete":
+            return createSnapshotResponse(
+              removeNodes((payload.body ?? {}) as RemoveNodesRequestPayload),
               transportStatus,
             );
           case "POST /v1/groups/reorder":

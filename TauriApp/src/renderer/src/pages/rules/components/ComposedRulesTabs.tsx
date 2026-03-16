@@ -1,5 +1,6 @@
 import {
   Button,
+  Collapse,
   Form,
   Input,
   Modal,
@@ -23,6 +24,12 @@ import { SwitchWithLabel } from "../../../components/form/SwitchWithLabel";
 import { useAppNotice } from "../../../components/notify/AppNoticeProvider";
 import { useDraftNavLock } from "../../../hooks/useDraftNavLock";
 import { useDraftNotice } from "../../../hooks/useDraftNotice";
+import { isMobileRuntime } from "../../../platform/runtimeStore";
+import {
+  dispatchRulesUiState,
+  listenRulesUiAction,
+} from "../../../services/rulesUiEvents";
+import { MobileSwipeActionCard } from "../../subscriptions/MobileSwipeActionCard";
 
 import type {
   RuleGroup,
@@ -624,6 +631,7 @@ export function ComposedRulesTabs({
 }: ComposedRulesTabsProps) {
   const notice = useAppNotice();
   const draftNotice = useDraftNotice();
+  const isMobileView = isMobileRuntime();
   const sourceGroups = useMemo(() => normalizeGroups(groups), [groups]);
   const sourceActiveGroupID = useMemo(() => {
     if (sourceGroups.some((group) => group.id === activeGroupId)) {
@@ -635,11 +643,14 @@ export function ComposedRulesTabs({
   const [draftGroups, setDraftGroups] = useState<RuleGroup[]>(sourceGroups);
   const [draftActiveGroupID, setDraftActiveGroupID] = useState<string>(sourceActiveGroupID);
   const [draftTouched, setDraftTouched] = useState(false);
-  const [openedGroupID, setOpenedGroupID] = useState<string>(sourceActiveGroupID);
+  const [openedGroupID, setOpenedGroupID] = useState<string>(() =>
+    isMobileView ? "" : sourceActiveGroupID,
+  );
   const hasUserSwitchedTabRef = useRef(false);
   const [savingDraft, setSavingDraft] = useState(false);
   const [selectedRowKeys, setSelectedRowKeys] = useState<string[]>([]);
   const [copiedRules, setCopiedRules] = useState<RuleItemV2[]>([]);
+  const [mobileSortMode, setMobileSortMode] = useState(false);
   const draggingRuleIDsRef = useRef<string[]>([]);
   const draggingGroupIDRef = useRef<string>("");
   const [rulePointerSortingActive, setRulePointerSortingActive] = useState(false);
@@ -701,12 +712,18 @@ export function ComposedRulesTabs({
     setDraftGroups(sourceGroups);
     setDraftActiveGroupID(sourceActiveGroupID);
     setOpenedGroupID((previous) => {
+      if (isMobileView && previous === "") {
+        return "";
+      }
       if (sourceGroups.some((group) => group.id === previous)) {
         return previous;
       }
+      if (isMobileView) {
+        return "";
+      }
       return sourceActiveGroupID;
     });
-  }, [hasVisibleDraftChanges, sourceGroups, sourceActiveGroupID]);
+  }, [hasVisibleDraftChanges, isMobileView, sourceGroups, sourceActiveGroupID]);
 
   useEffect(() => {
     if (!hasDraftChanges && draftTouched) {
@@ -716,6 +733,12 @@ export function ComposedRulesTabs({
 
   useEffect(() => {
     setOpenedGroupID((previous) => {
+      if (isMobileView) {
+        if (previous !== "" && normalizedGroups.some((group) => group.id === previous)) {
+          return previous;
+        }
+        return "";
+      }
       if (
         !hasUserSwitchedTabRef.current &&
         normalizedGroups.some((group) => group.id === draftActiveGroupID)
@@ -730,7 +753,7 @@ export function ComposedRulesTabs({
       }
       return normalizedGroups[0]?.id ?? "default";
     });
-  }, [draftActiveGroupID, normalizedGroups]);
+  }, [draftActiveGroupID, isMobileView, normalizedGroups]);
 
   const clearRulePointerSorting = () => {
     draggingRuleIDsRef.current = [];
@@ -788,6 +811,33 @@ export function ComposedRulesTabs({
     }
     return normalizedGroups[0]?.id ?? "default";
   }, [draftActiveGroupID, normalizedGroups]);
+  const resolvedActiveGroup = useMemo(
+    () =>
+      normalizedGroups.find((group) => group.id === resolvedActiveGroupID) ??
+      normalizedGroups[0] ??
+      null,
+    [normalizedGroups, resolvedActiveGroupID],
+  );
+  const resolvedActiveGroupName = String(
+    resolvedActiveGroup?.name ?? resolvedActiveGroup?.id ?? "未设置",
+  ).trim() || "未设置";
+
+  useEffect(() => {
+    if (!isMobileView) {
+      dispatchRulesUiState({});
+      return;
+    }
+    dispatchRulesUiState({
+      activeGroupId: resolvedActiveGroupID,
+      activeGroupName: resolvedActiveGroupName,
+    });
+  }, [isMobileView, resolvedActiveGroupID, resolvedActiveGroupName]);
+
+  useEffect(() => {
+    return () => {
+      dispatchRulesUiState({});
+    };
+  }, []);
 
   const commitGroups = async (nextGroups: RuleGroup[], nextActiveGroupID: string) => {
     const normalized = normalizeGroups(nextGroups);
@@ -798,13 +848,100 @@ export function ComposedRulesTabs({
     setDraftGroups(normalized);
     setDraftActiveGroupID(resolvedActive);
     setOpenedGroupID((previous) => {
+      if (isMobileView && previous === "") {
+        return "";
+      }
       if (normalized.some((group) => group.id === previous)) {
         return previous;
+      }
+      if (isMobileView) {
+        return "";
       }
       return resolvedActive;
     });
     return true;
   };
+
+  const exitMobileSortMode = () => {
+    setMobileSortMode(false);
+  };
+
+  const enterMobileSortMode = () => {
+    if (currentGroupLocked) {
+      notice.warning("当前分组已锁定，无法调整规则顺序");
+      return;
+    }
+    if ((currentGroup.rules?.length ?? 0) < 2) {
+      notice.warning("没有规则或规则少于 2 条时，无法进入排序模式");
+      return;
+    }
+    setMobileSortMode(true);
+    notice.info("已进入排序模式，点击卡片左侧上下箭头即可移动规则", {
+      title: "排序模式",
+      durationMs: 1800,
+      placement: "top-center",
+    });
+  };
+
+  const copySingleRule = (rule: RuleItemV2) => {
+    setCopiedRules([cloneRuleItem(rule)]);
+    notice.success(`已复制规则：${rule.name || rule.id}`);
+  };
+
+  const removeSingleRule = (rule: RuleItemV2) => {
+    if (currentGroupLocked) {
+      notice.warning("当前分组已锁定，无法删除规则");
+      return;
+    }
+    const nextGroups = normalizedGroups.map((group) =>
+      group.id === currentGroup.id
+        ? {
+            ...group,
+            rules: (group.rules ?? []).filter((item) => item.id !== rule.id),
+          }
+        : group,
+    );
+    void commitGroups(nextGroups, resolvedActiveGroupID);
+    setSelectedRowKeys((current) => current.filter((selectedID) => selectedID !== rule.id));
+  };
+
+  const moveCurrentGroupRule = (ruleID: string, direction: "up" | "down") => {
+    const sourceRules = currentGroup.rules ?? [];
+    const sourceOrder = sourceRules.map((item) => item.id);
+    const currentIndex = sourceOrder.indexOf(ruleID);
+    if (currentIndex < 0) {
+      return;
+    }
+    const targetIndex = direction === "up" ? currentIndex - 1 : currentIndex + 1;
+    if (targetIndex < 0 || targetIndex >= sourceOrder.length) {
+      return;
+    }
+    const targetRuleID = sourceOrder[targetIndex] ?? "";
+    if (targetRuleID === "") {
+      return;
+    }
+    const nextOrder = reorderListByMove(sourceOrder, [ruleID], targetRuleID, direction === "down");
+    if (sameStringArray(sourceOrder, nextOrder)) {
+      return;
+    }
+    const ruleByID = new Map(sourceRules.map((item) => [item.id, item]));
+    const nextRules = nextOrder
+      .map((ruleID) => ruleByID.get(ruleID))
+      .filter((item): item is RuleItemV2 => Boolean(item));
+    const nextGroups = normalizedGroups.map((group) =>
+      group.id === currentGroup.id
+        ? {
+            ...group,
+            rules: nextRules,
+          }
+        : group,
+    );
+    void commitGroups(nextGroups, resolvedActiveGroupID);
+  };
+
+  useEffect(() => {
+    setMobileSortMode(false);
+  }, [openedGroupID, isMobileView]);
 
   const activateRuleGroup = (groupID: string): void => {
     if (groupID === resolvedActiveGroupID) {
@@ -819,6 +956,18 @@ export function ComposedRulesTabs({
     groupNameForm.setFieldsValue({ groupName: "" });
     setGroupModalOpen(true);
   };
+
+  useEffect(() => {
+    if (!isMobileView) {
+      return;
+    }
+    return listenRulesUiAction((detail) => {
+      if (detail.action !== "open_add_group") {
+        return;
+      }
+      openAddGroupModal();
+    });
+  }, [isMobileView]);
 
   const openEditGroupModal = (group: RuleGroup) => {
     setGroupModalMode("edit");
@@ -883,8 +1032,14 @@ export function ComposedRulesTabs({
     setDraftGroups(sourceGroups);
     setDraftActiveGroupID(sourceActiveGroupID);
     setOpenedGroupID((previous) => {
+      if (isMobileView && previous === "") {
+        return "";
+      }
       if (sourceGroups.some((group) => group.id === previous)) {
         return previous;
+      }
+      if (isMobileView) {
+        return "";
       }
       return sourceActiveGroupID;
     });
@@ -1140,6 +1295,364 @@ export function ComposedRulesTabs({
     },
   ];
 
+  const currentGroupRules = currentGroup.rules ?? [];
+
+  const renderMobileCollapsedGroupHeaderActions = (group: RuleGroup) => (
+    <div className="subscriptions-mobile-group-header-actions">
+      {group.id !== resolvedActiveGroupID ? (
+        <Tooltip title="激活规则分组">
+          <Button
+            type="text"
+            size="small"
+            icon={<BiIcon name="check-circle" />}
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              activateRuleGroup(group.id);
+            }}
+          />
+        </Tooltip>
+      ) : null}
+      <Tooltip title="编辑分组">
+        <Button
+          type="text"
+          size="small"
+          icon={<BiIcon name="pencil-square" />}
+          onClick={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            openEditGroupModal(group);
+          }}
+        />
+      </Tooltip>
+      <Tooltip title="删除分组">
+        <Button
+          type="text"
+          size="small"
+          danger
+          icon={<BiIcon name="trash" />}
+          onClick={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            confirmRemoveGroup(group);
+          }}
+        />
+      </Tooltip>
+    </div>
+  );
+
+  const renderMobileExpandedGroupHeaderActions = (group: RuleGroup) => (
+    <div className="subscriptions-mobile-group-header-actions is-expanded">
+      {group.id !== resolvedActiveGroupID ? (
+        <Tooltip title="激活规则分组">
+          <Button
+            type="text"
+            size="small"
+            icon={<BiIcon name="check-circle-fill" />}
+            onClick={() => {
+              activateRuleGroup(group.id);
+            }}
+          />
+        </Tooltip>
+      ) : null}
+      <Tooltip title="编辑分组">
+        <Button
+          type="text"
+          size="small"
+          icon={<BiIcon name="pencil-square" />}
+          onClick={() => {
+            openEditGroupModal(group);
+          }}
+        />
+      </Tooltip>
+      <Tooltip title="删除分组">
+        <Button
+          type="text"
+          size="small"
+          danger
+          icon={<BiIcon name="trash" />}
+          onClick={() => {
+            confirmRemoveGroup(group);
+          }}
+        />
+      </Tooltip>
+    </div>
+  );
+
+  const renderMobileExpandedGroupToolbar = (group: RuleGroup) => {
+    const missMode = normalizeGroupOnMissMode(group.onMissMode);
+    return (
+      <div className="rules-mobile-group-toolbar">
+        <div className="rules-mobile-group-toolbar-actions">
+          <Tooltip title="添加规则">
+            <Button
+              type="text"
+              size="small"
+              icon={<BiIcon name="plus-lg" />}
+              disabled={Boolean(group.locked)}
+              onClick={() => {
+                setEditingRuleID("");
+                setRuleDraft(buildRuleDraft());
+                setRuleModalOpen(true);
+              }}
+            />
+          </Tooltip>
+          <Tooltip title={copiedRules.length > 0 ? `粘贴 ${copiedRules.length} 条规则` : "当前没有可粘贴规则"}>
+            <Button
+              type="text"
+              size="small"
+              icon={<BiIcon name="file-earmark-text" />}
+              disabled={copiedRules.length === 0 || Boolean(group.locked)}
+              onClick={() => {
+                if (group.locked) {
+                  notice.warning("当前分组已锁定，无法粘贴规则");
+                  return;
+                }
+                if (copiedRules.length === 0) {
+                  notice.warning("当前没有可粘贴的规则");
+                  return;
+                }
+                const targetRules = group.rules ?? [];
+                const usedIDs = new Set(targetRules.map((item) => item.id.toLowerCase()));
+                const pastedRules = copiedRules.map((item) => {
+                  const copied = cloneRuleItem(item);
+                  copied.id = buildCopiedRuleID(copied.id, usedIDs);
+                  return copied;
+                });
+                const nextGroups = normalizedGroups.map((targetGroup) =>
+                  targetGroup.id === group.id
+                    ? {
+                        ...targetGroup,
+                        rules: [...(targetGroup.rules ?? []), ...pastedRules],
+                      }
+                    : targetGroup,
+                );
+                void commitGroups(nextGroups, resolvedActiveGroupID).then((committed) => {
+                  if (!committed) {
+                    return;
+                  }
+                  notice.success(`已粘贴 ${pastedRules.length} 条规则到分组：${group.name || group.id}`);
+                });
+              }}
+            />
+          </Tooltip>
+          <Tooltip title={mobileSortMode ? "退出排序模式" : "进入排序模式"}>
+            <Button
+              type="text"
+              size="small"
+              icon={<BiIcon name={mobileSortMode ? "x-lg" : "arrow-up-down"} />}
+              disabled={Boolean(group.locked) || (!mobileSortMode && currentGroupRules.length < 2)}
+              onClick={() => {
+                if (mobileSortMode) {
+                  exitMobileSortMode();
+                  return;
+                }
+                enterMobileSortMode();
+              }}
+            />
+          </Tooltip>
+          <Tooltip title={group.locked ? "解锁分组" : "锁定分组"}>
+            <Button
+              type="text"
+              size="small"
+              icon={<BiIcon name={group.locked ? "lock-fill" : "unlock-fill"} />}
+              onClick={() => {
+                const nextGroups = normalizedGroups.map((targetGroup) =>
+                  targetGroup.id === group.id
+                    ? { ...targetGroup, locked: !Boolean(targetGroup.locked) }
+                    : targetGroup,
+                );
+                void commitGroups(nextGroups, resolvedActiveGroupID).then((committed) => {
+                  if (!committed) {
+                    return;
+                  }
+                  notice.success(`${group.name || group.id} 已${group.locked ? "解除锁定" : "锁定"}`);
+                });
+              }}
+            />
+          </Tooltip>
+          <div
+            className={`rules-mobile-group-toolbar-miss ${missMode === "proxy" ? "is-proxy" : "is-direct"}`}
+          >
+            <HelpLabel
+              label={
+                <Typography.Text type="secondary" className="rules-mobile-group-toolbar-label">
+                  漏网之鱼
+                </Typography.Text>
+              }
+              helpTitle="漏网之鱼"
+              helpMaxWidth={320}
+              helpContent={{
+                effect: "当前分组内没有任何规则命中时，会按这里选择的方式继续处理连接。",
+                caution:
+                  "只有未命中规则才会触发。选择“直连”会直接放行，选择“代理”会交给代理链路。",
+              }}
+            />
+            {missMode === "direct" ? (
+              <span className="rules-mobile-miss-mode-text is-direct">直连</span>
+            ) : null}
+            <button
+              type="button"
+              className={`rules-mobile-miss-mode-switch ${missMode === "proxy" ? "is-proxy" : "is-direct"}`}
+              disabled={Boolean(group.locked)}
+              aria-label="切换漏网之鱼处理方式"
+              aria-pressed={missMode === "proxy"}
+              onClick={() => {
+                const nextMode: RuleMissMode = missMode === "proxy" ? "direct" : "proxy";
+                const nextGroups = normalizedGroups.map((targetGroup) =>
+                  targetGroup.id === group.id
+                    ? {
+                        ...targetGroup,
+                        onMissMode: nextMode,
+                      }
+                    : targetGroup,
+                );
+                void commitGroups(nextGroups, resolvedActiveGroupID);
+              }}
+            >
+              <span className="rules-mobile-miss-mode-switch-thumb" />
+            </button>
+            {missMode === "proxy" ? (
+              <span className="rules-mobile-miss-mode-text is-proxy">代理</span>
+            ) : null}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const renderMobileRuleCard = (rule: RuleItemV2, index: number) => {
+    const mode = inferActionMode(rule);
+    const policyID = String(rule.action?.targetPolicy ?? "").trim();
+    const policyName = policyNameByID.get(policyID) ?? "";
+    const canMoveUp = index > 0;
+    const canMoveDown = index < currentGroupRules.length - 1;
+    return (
+      <MobileSwipeActionCard
+        leadingActions={
+          mobileSortMode
+            ? []
+            : [
+                {
+                  key: "sort",
+                  label: "排序",
+                  icon: <BiIcon name="arrow-up-down" />,
+                  autoTriggerOnOpen: true,
+                  disabled: currentGroupLocked || currentGroupRules.length < 2,
+                  onClick: () => {
+                    enterMobileSortMode();
+                  },
+                },
+              ]
+        }
+        trailingActions={
+          mobileSortMode
+            ? []
+            : [
+                {
+                  key: "copy",
+                  label: "复制",
+                  icon: <BiIcon name="copy" />,
+                  onClick: () => {
+                    copySingleRule(rule);
+                  },
+                },
+                {
+                  key: "edit",
+                  label: currentGroupLocked ? "查看" : "编辑",
+                  icon: <BiIcon name="pencil-square" />,
+                  onClick: () => {
+                    setEditingRuleID(rule.id);
+                    setRuleDraft(buildRuleDraft(rule));
+                    setRuleModalOpen(true);
+                  },
+                },
+                {
+                  key: "delete",
+                  label: "删除",
+                  icon: <BiIcon name="trash" />,
+                  danger: true,
+                  disabled: currentGroupLocked,
+                  onClick: () => {
+                    removeSingleRule(rule);
+                  },
+                },
+              ]
+        }
+      >
+        <div
+          data-mobile-rule-id={rule.id}
+          className={`rules-mobile-rule-card${rule.enabled ? "" : " is-disabled"}`}
+        >
+          {mobileSortMode ? (
+            <div className="rules-mobile-rule-card-sort-controls">
+              <button
+                type="button"
+                className="rules-mobile-rule-card-sort-btn"
+                disabled={!canMoveUp}
+                onClick={() => {
+                  moveCurrentGroupRule(rule.id, "up");
+                }}
+              >
+                <BiIcon name="chevron-up" />
+              </button>
+              <button
+                type="button"
+                className="rules-mobile-rule-card-sort-btn"
+                disabled={!canMoveDown}
+                onClick={() => {
+                  moveCurrentGroupRule(rule.id, "down");
+                }}
+              >
+                <BiIcon name="chevron-down" />
+              </button>
+            </div>
+          ) : null}
+          <div className="rules-mobile-rule-card-body">
+            <div className="rules-mobile-rule-card-header">
+              <div className="rules-mobile-rule-card-title-wrap">
+                <Typography.Text strong className="rules-mobile-rule-card-title">
+                  {rule.name || rule.id}
+                </Typography.Text>
+                <Tag color={actionTagColor(mode)} className="rules-mobile-rule-card-action-tag">
+                  {actionLabel(mode, policyID, policyName)}
+                </Tag>
+              </div>
+              <div className="rules-mobile-rule-card-meta">
+                <Typography.Text type="secondary">#{index + 1}</Typography.Text>
+                <Switch
+                  size="small"
+                  checked={rule.enabled}
+                  disabled={currentGroupLocked}
+                  onChange={(checked) => {
+                    if (currentGroupLocked) {
+                      notice.warning("当前分组已锁定，无法修改规则");
+                      return;
+                    }
+                    const nextGroups = normalizedGroups.map((group) =>
+                      group.id === currentGroup.id
+                        ? {
+                            ...group,
+                            rules: (group.rules ?? []).map((item) =>
+                              item.id === rule.id ? { ...item, enabled: checked } : item,
+                            ),
+                          }
+                        : group,
+                    );
+                    void commitGroups(nextGroups, resolvedActiveGroupID);
+                  }}
+                />
+              </div>
+            </div>
+            <Typography.Text type="secondary" className="rules-mobile-rule-card-summary">
+              {summarizeRuleMatch(rule.match)}
+            </Typography.Text>
+          </div>
+        </div>
+      </MobileSwipeActionCard>
+    );
+  };
+
   return (
     <Space
       direction="vertical"
@@ -1165,7 +1678,111 @@ export function ComposedRulesTabs({
           onClick: discardRuleDraftChanges,
         }}
       />
-
+      {isMobileView ? (
+        <Space
+          direction="vertical"
+          size={12}
+          style={{ width: "100%" }}
+        >
+          {openedGroupID ? (
+            <div className="subscriptions-mobile-sticky-active-group">
+              <div className="subscriptions-mobile-active-group-panel rules-mobile-active-group-panel">
+                <div className="subscriptions-mobile-group-header is-sticky">
+                  <button
+                    type="button"
+                    className="subscriptions-mobile-group-header-main subscriptions-mobile-group-header-toggle"
+                    onClick={() => {
+                      exitMobileSortMode();
+                      hasUserSwitchedTabRef.current = true;
+                      setOpenedGroupID("");
+                    }}
+                  >
+                    <span className="subscriptions-mobile-group-collapse-icon">
+                      <BiIcon name="chevron-up" />
+                    </span>
+                    <div className="subscriptions-mobile-group-header-text">
+                      <span className="subscriptions-mobile-group-header-name-row">
+                        <Typography.Text strong className="subscriptions-mobile-group-header-name">
+                          {currentGroup.name || currentGroup.id}
+                        </Typography.Text>
+                        {currentGroup.id === resolvedActiveGroupID ? <span className="active-group-dot" /> : null}
+                      </span>
+                      <Typography.Text
+                        type="secondary"
+                        className="subscriptions-mobile-group-header-meta"
+                      >
+                        {currentGroup.id === resolvedActiveGroupID ? "当前活动规则分组" : "规则分组"} ·{" "}
+                        {currentGroupRules.length} 条规则
+                      </Typography.Text>
+                    </div>
+                  </button>
+                  {renderMobileExpandedGroupHeaderActions(currentGroup)}
+                </div>
+                {renderMobileExpandedGroupToolbar(currentGroup)}
+                <div className="rules-mobile-active-group-list-scroll">
+                  <div className="rules-mobile-rule-list">
+                    {currentGroupRules.length === 0 ? (
+                      <div className="subscriptions-mobile-empty-state is-panel-empty">
+                        <Typography.Text type="secondary">当前分组暂无规则。</Typography.Text>
+                      </div>
+                    ) : (
+                      currentGroupRules.map((rule, index) => (
+                        <div key={rule.id}>
+                          {renderMobileRuleCard(rule, index)}
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
+          ) : null}
+          <Collapse
+            accordion
+            className="subscriptions-mobile-group-collapse rules-mobile-group-collapse"
+            activeKey={openedGroupID ? [openedGroupID] : []}
+            onChange={(key) => {
+              const nextKey = Array.isArray(key)
+                ? (key[0] ? String(key[0]) : "")
+                : key
+                  ? String(key)
+                  : "";
+              exitMobileSortMode();
+              hasUserSwitchedTabRef.current = true;
+              setOpenedGroupID(nextKey);
+            }}
+            items={normalizedGroups
+              .filter((group) => group.id !== openedGroupID)
+              .map((group) => ({
+              key: group.id,
+              label: (
+                <div className="subscriptions-mobile-group-header">
+                  <div className="subscriptions-mobile-group-header-main">
+                    <div className="subscriptions-mobile-group-header-text">
+                      <span className="subscriptions-mobile-group-header-name-row">
+                        <Typography.Text strong className="subscriptions-mobile-group-header-name">
+                          {group.name || group.id}
+                        </Typography.Text>
+                        {group.id === resolvedActiveGroupID ? <span className="active-group-dot" /> : null}
+                      </span>
+                      <Typography.Text
+                        type="secondary"
+                        className="subscriptions-mobile-group-header-meta"
+                      >
+                        {group.id === resolvedActiveGroupID ? "当前活动规则分组" : "规则分组"} ·{" "}
+                        {(group.rules ?? []).length} 条规则
+                      </Typography.Text>
+                    </div>
+                  </div>
+                  {group.id === openedGroupID ? null : renderMobileCollapsedGroupHeaderActions(group)}
+                </div>
+              ),
+              children: null,
+            }))}
+          />
+        </Space>
+      ) : (
+        <>
       <Space style={{ width: "100%", justifyContent: "space-between" }}>
         <Space
           size={8}
@@ -1492,6 +2109,8 @@ export function ComposedRulesTabs({
           },
         ]}
       />
+        </>
+      )}
 
       <Modal
         title={groupModalMode === "add" ? "新增分组" : "编辑分组"}
@@ -1617,16 +2236,21 @@ export function ComposedRulesTabs({
           setRuleModalOpen(false);
           setEditingRuleID("");
         }}
-        width={980}
+        width={isMobileView ? "calc(100vw - 16px)" : 980}
         okText={isRuleModalReadonly ? "关闭" : "保存"}
         cancelText="取消"
+        styles={{
+          body: {
+            padding: isMobileView ? 12 : undefined,
+          },
+        }}
       >
-        <Form layout="vertical" requiredMark={false}>
+        <Form layout="vertical" requiredMark={false} size={isMobileView ? "small" : "middle"}>
           <div
             style={{
               display: "grid",
-              gridTemplateColumns: "320px minmax(0, 1fr)",
-              gap: 16,
+              gridTemplateColumns: isMobileView ? "minmax(0, 1fr)" : "320px minmax(0, 1fr)",
+              gap: isMobileView ? 12 : 16,
               alignItems: "start",
             }}
           >
@@ -1663,8 +2287,8 @@ export function ComposedRulesTabs({
               <div
                 style={{
                   display: "grid",
-                  gridTemplateColumns: "minmax(0, 1fr) 110px",
-                  gap: 12,
+                  gridTemplateColumns: isMobileView ? "minmax(0, 1fr)" : "minmax(0, 1fr) 110px",
+                  gap: isMobileView ? 10 : 12,
                   alignItems: "start",
                 }}
               >
@@ -1805,7 +2429,7 @@ export function ComposedRulesTabs({
                 <Input.TextArea
                   value={ruleDraft.content}
                   disabled={isRuleModalReadonly}
-                  rows={13}
+                  rows={isMobileView ? 10 : 13}
                   onChange={(event) =>
                     setRuleDraft((current) => ({ ...current, content: event.target.value }))
                   }

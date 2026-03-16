@@ -466,6 +466,24 @@ func registerHandlers(
 		writeResult(w, snapshot, err)
 	})
 
+	mux.HandleFunc("/v1/nodes/manual/delete", func(w http.ResponseWriter, r *http.Request) {
+		if !allowMethod(w, r, http.MethodPost) {
+			return
+		}
+		var req control.RemoveNodesRequest
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		snapshot, err := store.RemoveNodes(r.Context(), req)
+		logCoreAction(
+			store,
+			fmt.Sprintf("remove manual nodes count=%d", len(req.Items)),
+			err,
+		)
+		writeResult(w, snapshot, err)
+	})
+
 	mux.HandleFunc("/v1/nodes/transfer", func(w http.ResponseWriter, r *http.Request) {
 		if !allowMethod(w, r, http.MethodPost) {
 			return

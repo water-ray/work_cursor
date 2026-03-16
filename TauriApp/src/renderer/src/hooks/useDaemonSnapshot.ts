@@ -5,7 +5,9 @@ import { daemonApi } from "../services/daemonApi";
 import {
   daemonSnapshotRefreshEventName,
 } from "../services/daemonSnapshotRefresh";
+import { applyProbeResultPatchToSnapshot } from "../services/probeResultPatch";
 import { daemonTransportStore } from "../services/daemonTransportStore";
+import { getPlatformAdapter } from "../platform/runtimeStore";
 import { useDaemonTransport } from "./useDaemonTransport";
 
 type SnapshotAction = () => Promise<DaemonSnapshot>;
@@ -183,6 +185,22 @@ export function useDaemonSnapshot(options: UseDaemonSnapshotOptions = {}) {
       return;
     }
 
+    if (event.kind === "probe_result_patch") {
+      const probeResultPatch = event.payload?.probeResultPatch;
+      if (!probeResultPatch) {
+        return;
+      }
+      setSnapshot((current) => {
+        if (!current) {
+          return current;
+        }
+        return applyProbeResultPatchToSnapshot(current, probeResultPatch);
+      });
+      setError("");
+      setLoading(false);
+      return;
+    }
+
     if (event.kind === "runtime_apply") {
       const eventTimestamp = Number(event.timestampMs ?? 0);
       if (eventTimestamp > 0 && eventTimestamp < lastRuntimeApplyEventTsRef.current) {
@@ -299,7 +317,7 @@ export function useDaemonSnapshot(options: UseDaemonSnapshotOptions = {}) {
 
   useEffect(() => {
     void refresh();
-    const unsubscribe = window.waterayDesktop.daemon.onPushEvent((event) => {
+    const unsubscribe = getPlatformAdapter().daemon.onPushEvent((event) => {
       applyPushEvent(event);
     });
     const onRefreshRequest = () => {

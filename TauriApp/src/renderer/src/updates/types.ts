@@ -1,4 +1,6 @@
-type UpdatesApi = Window["waterayDesktop"]["updates"];
+import type { WaterayPlatformUpdatesApi } from "../platform/adapterTypes";
+
+type UpdatesApi = WaterayPlatformUpdatesApi;
 
 export type AppUpdateState = Awaited<ReturnType<UpdatesApi["getState"]>>;
 export type AppUpdateCandidate = NonNullable<AppUpdateState["candidate"]>;

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import type { BackgroundTask, DaemonSnapshot } from "../../../shared/daemon";
 import type { AppNoticeApi } from "../components/notify/AppNoticeProvider";
+import { isMobileRuntime } from "../platform/runtimeStore";
 
 function normalizeTasks(tasks: BackgroundTask[] | undefined): BackgroundTask[] {
   return Array.isArray(tasks) ? tasks.filter((task) => typeof task?.id === "string") : [];
@@ -33,6 +34,7 @@ export function useTaskCenter(
   tasks: BackgroundTask[] | undefined,
   notice: AppNoticeApi,
 ) {
+  const isMobileView = isMobileRuntime();
   const normalizedTasks = useMemo(() => normalizeTasks(tasks), [tasks]);
   const [open, setOpen] = useState(false);
   const [hasUnread, setHasUnread] = useState(false);
@@ -56,6 +58,9 @@ export function useTaskCenter(
     [normalizedTasks],
   );
   const scheduledTasks = useMemo<ScheduledTaskSummary[]>(() => {
+    if (isMobileView) {
+      return [];
+    }
     if (!snapshot?.probeSettings?.autoProbeOnActiveGroup) {
       return [];
     }
@@ -75,7 +80,7 @@ export function useTaskCenter(
           latestAutoProbeTask?.startedAtMs ?? latestAutoProbeTask?.finishedAtMs,
       },
     ];
-  }, [normalizedTasks, snapshot]);
+  }, [isMobileView, normalizedTasks, snapshot]);
 
   useEffect(() => {
     const nextStatusMap = new Map<string, string>();

@@ -1,6 +1,8 @@
+import type { RuntimeAppTarget, RuntimePlatformContractKind } from "./contracts/generated";
 import type { WaterayMobileHostApi } from "./mobileHost";
+import type { WaterayPlatformAdapter } from "./adapterTypes";
 
-export type RuntimePlatformKind = "desktop" | "android" | "ios";
+export type RuntimePlatformKind = RuntimePlatformContractKind;
 
 export interface RuntimePlatformInfo {
   kind: RuntimePlatformKind;
@@ -18,7 +20,9 @@ export interface RuntimePlatformInfo {
 export interface WaterayPlatformApi {
   info: RuntimePlatformInfo;
   kind: RuntimePlatformKind;
+  appTarget: RuntimeAppTarget;
   isDesktop: boolean;
   isMobile: boolean;
+  adapter: WaterayPlatformAdapter;
   mobileHost: WaterayMobileHostApi | null;
 }

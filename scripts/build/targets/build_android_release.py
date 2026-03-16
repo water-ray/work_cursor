@@ -10,8 +10,17 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-
 ROOT_DIR = Path(__file__).resolve().parents[3]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from scripts.build.common.version_sync import ensure_project_versions_synced
+from scripts.build.common.sync_default_rulesets import (
+    ensure_default_rule_sets_synced,
+    print_rule_set_sync_summary,
+)
+
+
 TAURI_DIR = ROOT_DIR / "TauriApp"
 VERSION_PATH = ROOT_DIR / "VERSION"
 ANDROID_APK_OUTPUT_DIR = (
@@ -61,10 +70,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def read_version() -> str:
-    text = VERSION_PATH.read_text(encoding="utf-8").strip()
-    if not text:
-        raise AndroidReleaseBuildError("VERSION 文件为空，无法构建 Android release")
-    return text
+    try:
+        return ensure_project_versions_synced()
+    except Exception as error:
+        raise AndroidReleaseBuildError(str(error)) from error
 
 
 def resolve_npx_command() -> str:
@@ -87,6 +96,8 @@ def prepare_android_environment() -> dict[str, str]:
 
     sdk_home_path.mkdir(parents=True, exist_ok=True)
     user_home_path.mkdir(parents=True, exist_ok=True)
+    env["WATERAY_APP_TARGET"] = "mobile"
+    env["VITE_WATERAY_APP_TARGET"] = "mobile"
     return env
 
 
@@ -338,6 +349,7 @@ def main() -> int:
         args = parse_args()
         version = read_version()
         env = prepare_android_environment()
+        print_rule_set_sync_summary(ensure_default_rule_sets_synced())
         apksigner_path = resolve_apksigner_path(env)
         signing_config = resolve_signing_config(env)
         reset_output_dir()

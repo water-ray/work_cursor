@@ -2,6 +2,7 @@ export const uiPreferenceKeys = {
   dragScrollEnabled: "wateray.ui.dragScrollEnabled.v1",
   closeBehavior: "wateray.ui.closeBehavior.v1",
   proxyStartupSmartOptimize: "wateray.ui.proxyStartupSmartOptimize.v1",
+  mobileLogsNavVisible: "wateray.ui.mobileLogsNavVisible.v1",
 } as const;
 
 export const uiPreferenceChangedEventName = "wateray:ui-preference-changed";
@@ -80,6 +81,19 @@ export function writeProxyStartupSmartOptimizePreference(
   const normalized = normalizeProxyStartupSmartOptimizePreference(value);
   window.localStorage.setItem(uiPreferenceKeys.proxyStartupSmartOptimize, normalized);
   dispatchPreferenceChanged("proxyStartupSmartOptimize", normalized);
+}
+
+export function readMobileLogsNavVisible(): boolean {
+  const raw = window.localStorage.getItem(uiPreferenceKeys.mobileLogsNavVisible);
+  if (raw == null) {
+    return false;
+  }
+  return raw === "1" || raw.toLowerCase() === "true";
+}
+
+export function writeMobileLogsNavVisible(value: boolean): void {
+  window.localStorage.setItem(uiPreferenceKeys.mobileLogsNavVisible, value ? "1" : "0");
+  dispatchPreferenceChanged("mobileLogsNavVisible", value);
 }
 
 function dispatchPreferenceChanged(

@@ -21,6 +21,7 @@ import type {
   ProxyMuxConfig,
   ProxyMode,
   ProxyTunStack,
+  RemoveNodesRequestPayload,
   RuleConfigV2,
   RuleSetLocalStatus,
   RuleSetDownloadMode,
@@ -35,6 +36,11 @@ import type {
   UpdateManualNodeRequestPayload,
 } from "../../../shared/daemon";
 import { daemonTransportStore } from "./daemonTransportStore";
+import { isMobileRuntime } from "../platform/runtimeStore";
+
+type ProbeNodesRequestInput = ProbeNodesRequestPayload & {
+  background?: boolean;
+};
 
 function shouldSkipUILog(path: string): boolean {
   return (
@@ -80,6 +86,21 @@ async function requestSnapshot(
     void appendUILog("info", `UI请求成功 ${payload.method} ${payload.path}`);
   }
   return response.snapshot;
+}
+
+function buildProbeNodesRequestBody(input: ProbeNodesRequestInput): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    groupId: input.groupId,
+    nodeIds: input.nodeIds,
+    url: input.url,
+    timeoutMs: input.timeoutMs,
+    probeType: input.probeType,
+    probeTypes: input.probeTypes,
+  };
+  if (isMobileRuntime() && input.background === true) {
+    body.background = true;
+  }
+  return body;
 }
 
 async function requestSnapshotWithImportSummary(payload: DaemonRequestPayload): Promise<{
@@ -151,12 +172,39 @@ export const daemonApi = {
       body: { name, url },
     });
   },
-  pullSubscriptionByGroup(groupId: string): Promise<DaemonSnapshot> {
-    return requestSnapshot({
+  async pullSubscriptionByGroupWithStatus(groupId: string): Promise<{
+    snapshot: DaemonSnapshot;
+    task?: BackgroundTask;
+    operation?: OperationStatus;
+  }> {
+    const payload: DaemonRequestPayload = {
       method: "POST",
       path: "/v1/subscriptions/pull",
       body: { groupId },
-    });
+    };
+    const trackUILog = !shouldSkipUILog(payload.path);
+    const response = await window.waterayDesktop.daemon.request(payload);
+    daemonTransportStore.mergeResponse(response);
+    if (!response.ok || !response.snapshot) {
+      if (trackUILog) {
+        void appendUILog(
+          "error",
+          `UI请求失败 ${payload.method} ${payload.path}: ${response.error ?? "daemon request failed"}`,
+        );
+      }
+      throw new Error(response.error ?? "daemon request failed");
+    }
+    if (trackUILog) {
+      void appendUILog("info", `UI请求成功 ${payload.method} ${payload.path}`);
+    }
+    return {
+      snapshot: response.snapshot,
+      task: response.task,
+      operation: response.operation,
+    };
+  },
+  pullSubscriptionByGroup(groupId: string): Promise<DaemonSnapshot> {
+    return daemonApi.pullSubscriptionByGroupWithStatus(groupId).then((result) => result.snapshot);
   },
   selectActiveGroup(
     groupId: string,
@@ -184,7 +232,7 @@ export const daemonApi = {
       body: { nodeId, groupId },
     });
   },
-  async probeNodesWithSummary(input: ProbeNodesRequestPayload): Promise<{
+  async probeNodesWithSummary(input: ProbeNodesRequestInput): Promise<{
     snapshot: DaemonSnapshot;
     summary?: ProbeNodesSummary;
     task?: BackgroundTask;
@@ -192,7 +240,7 @@ export const daemonApi = {
     const payload: DaemonRequestPayload = {
       method: "POST",
       path: "/v1/nodes/probe",
-      body: input,
+      body: buildProbeNodesRequestBody(input),
     };
     const trackUILog = !shouldSkipUILog(payload.path);
     const response = await window.waterayDesktop.daemon.request(payload);
@@ -215,7 +263,7 @@ export const daemonApi = {
       task: response.task,
     };
   },
-  async probeNodes(input: ProbeNodesRequestPayload): Promise<DaemonSnapshot> {
+  async probeNodes(input: ProbeNodesRequestInput): Promise<DaemonSnapshot> {
     const result = await daemonApi.probeNodesWithSummary(input);
     return result.snapshot;
   },
@@ -451,6 +499,13 @@ export const daemonApi = {
       path: `/v1/nodes/manual?groupId=${encodeURIComponent(groupId)}&nodeId=${encodeURIComponent(nodeId)}`,
     });
   },
+  removeNodes(input: RemoveNodesRequestPayload): Promise<DaemonSnapshot> {
+    return requestSnapshot({
+      method: "POST",
+      path: "/v1/nodes/manual/delete",
+      body: input,
+    });
+  },
   setRoutingMode(mode: RoutingMode): Promise<DaemonSnapshot> {
     return requestSnapshot({
       method: "POST",
@@ -463,6 +518,17 @@ export const daemonApi = {
       method: "POST",
       path: "/v1/rules/config",
       body: { config },
+    });
+  },
+  refreshReferencedNodePoolsInBackground(input?: {
+    excludeNodeIds?: string[];
+  }): Promise<DaemonSnapshot> {
+    return requestSnapshot({
+      method: "POST",
+      path: "/v1/rules/node-pools/refresh",
+      body: {
+        excludeNodeIds: input?.excludeNodeIds ?? [],
+      },
     });
   },
   async updateRuleSets(input: {

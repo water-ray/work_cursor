@@ -2,6 +2,7 @@ import {
   Button,
   Card,
   Checkbox,
+  Collapse,
   Divider,
   Modal,
   Progress,
@@ -25,12 +26,16 @@ import {
   type CloseBehavior,
   readCloseBehavior,
   readDragScrollEnabled,
+  readMobileLogsNavVisible,
   writeCloseBehavior,
   writeDragScrollEnabled,
+  writeMobileLogsNavVisible,
 } from "../../app/settings/uiPreferences";
+import { isMobileRuntime } from "../../platform/runtimeStore";
 import { daemonApi } from "../../services/daemonApi";
 import type { DaemonSnapshot, RuleSetLocalStatus } from "../../../../shared/daemon";
 import type { AppUpdateCandidate, AppUpdateStage } from "../../updates/types";
+import { ProxySettingsPanel } from "../proxy/ProxySettingsPanel";
 const geoIPRuleSetOptions = [
   { value: "cn", label: "cn（中国大陆）" },
   { value: "us", label: "us（美国）" },
@@ -135,6 +140,7 @@ function describeUpdateStage(stage: AppUpdateStage): string {
 }
 
 export function SettingsPage({ snapshot, loading, runAction }: DaemonPageProps) {
+  const isMobile = isMobileRuntime();
   const notice = useAppNotice();
   const draftNotice = useDraftNotice();
   const appUpdate = useAppUpdate();
@@ -143,6 +149,9 @@ export function SettingsPage({ snapshot, loading, runAction }: DaemonPageProps) 
   );
   const [dragScrollEnabled, setDragScrollEnabled] = useState<boolean>(() =>
     readDragScrollEnabled(),
+  );
+  const [showMobileLogsNav, setShowMobileLogsNav] = useState<boolean>(() =>
+    readMobileLogsNavVisible(),
   );
   const [appliedCloseBehavior, setAppliedCloseBehavior] = useState<CloseBehavior>(() =>
     readCloseBehavior(),
@@ -697,6 +706,44 @@ export function SettingsPage({ snapshot, loading, runAction }: DaemonPageProps) 
             onClick: revertSettingsDraft,
           }}
         />
+        {isMobile ? (
+          <Card size="small">
+            <Space direction="vertical" size={12} style={{ width: "100%" }}>
+              <SwitchWithLabel
+                checked={showMobileLogsNav}
+                onChange={(checked) => {
+                  setShowMobileLogsNav(checked);
+                  writeMobileLogsNavVisible(checked);
+                }}
+                label="显示日志菜单"
+                helpContent={{
+                  effect: "关闭时隐藏移动端底部导航中的“日志”；打开后重新显示并允许进入日志页。",
+                  recommendation: "默认关闭，排障时再临时打开。",
+                }}
+              />
+              <Collapse
+                className="proxy-settings-collapse"
+                defaultActiveKey={[]}
+                items={[
+                  {
+                    key: "mobile-proxy-settings",
+                    label: "代理设置",
+                    children: (
+                      <div className="proxy-settings-panel-body">
+                        <ProxySettingsPanel
+                          snapshot={snapshot}
+                          loading={loading}
+                          runAction={runAction}
+                          showKernelVersion
+                        />
+                      </div>
+                    ),
+                  },
+                ]}
+              />
+            </Space>
+          </Card>
+        ) : null}
         <Typography.Text strong>系统</Typography.Text>
         <Space
           direction="vertical"
@@ -721,54 +768,60 @@ export function SettingsPage({ snapshot, loading, runAction }: DaemonPageProps) 
               }}
             />
           </Space>
-          <Divider style={{ margin: "4px 0 2px" }} />
-          <HelpLabel
-            label="关闭按钮行为"
-            helpContent={{
-              scene: "定义点击窗口右上角关闭按钮后的默认行为。",
-              effect: "可在询问/最小化托盘/仅关闭面板/完全退出之间切换。",
-              caution: "选择“完全退出”会同时关闭内核；如需后台持续代理，建议用托盘或仅关闭面板。",
-            }}
-          />
-          <Radio.Group
-            value={closeBehavior}
-            onChange={(event) => {
-              setCloseBehavior(event.target.value as CloseBehavior);
-              setSettingsDraftTouched(true);
-            }}
-          >
-            <Space direction="vertical">
-              <Radio value="ask_every_time">每次弹出提示（默认）</Radio>
-              <Radio value="minimize_to_tray">最小化到托盘</Radio>
-              <Radio value="close_panel_keep_core">后台运行（仅关闭面板程序）</Radio>
-              <Radio value="exit_all">完全退出（关闭面板程序 + 内核程序）</Radio>
-            </Space>
-          </Radio.Group>
+          {!isMobile ? (
+            <>
+              <Divider style={{ margin: "4px 0 2px" }} />
+              <HelpLabel
+                label="关闭按钮行为"
+                helpContent={{
+                  scene: "定义点击窗口右上角关闭按钮后的默认行为。",
+                  effect: "可在询问/最小化托盘/仅关闭面板/完全退出之间切换。",
+                  caution: "选择“完全退出”会同时关闭内核；如需后台持续代理，建议用托盘或仅关闭面板。",
+                }}
+              />
+              <Radio.Group
+                value={closeBehavior}
+                onChange={(event) => {
+                  setCloseBehavior(event.target.value as CloseBehavior);
+                  setSettingsDraftTouched(true);
+                }}
+              >
+                <Space direction="vertical">
+                  <Radio value="ask_every_time">每次弹出提示（默认）</Radio>
+                  <Radio value="minimize_to_tray">最小化到托盘</Radio>
+                  <Radio value="close_panel_keep_core">后台运行（仅关闭面板程序）</Radio>
+                  <Radio value="exit_all">完全退出（关闭面板程序 + 内核程序）</Radio>
+                </Space>
+              </Radio.Group>
+            </>
+          ) : null}
         </Space>
-        <Space
-          size={10}
-          align="center"
-          wrap
-        >
-          <Button
-            type="primary"
-            loading={exemptingLoopback}
-            disabled={!canExemptLoopback}
-            onClick={() => {
-              void exemptWindowsLoopback();
-            }}
+        {!isMobile ? (
+          <Space
+            size={10}
+            align="center"
+            wrap
           >
-            解除回环限制
-          </Button>
-          <HelpLabel
-            label="回环豁免说明"
-            helpContent={{
-              scene: "UWP/商店应用在代理场景中出现回环受限时。",
-              effect: "调用系统能力为 AppContainer SID 配置回环豁免。",
-              caution: "仅 Windows 且内核进程具备管理员权限时可执行；其他平台或权限不足时按钮会禁用。",
-            }}
-          />
-        </Space>
+            <Button
+              type="primary"
+              loading={exemptingLoopback}
+              disabled={!canExemptLoopback}
+              onClick={() => {
+                void exemptWindowsLoopback();
+              }}
+            >
+              解除回环限制
+            </Button>
+            <HelpLabel
+              label="回环豁免说明"
+              helpContent={{
+                scene: "UWP/商店应用在代理场景中出现回环受限时。",
+                effect: "调用系统能力为 AppContainer SID 配置回环豁免。",
+                caution: "仅 Windows 且内核进程具备管理员权限时可执行；其他平台或权限不足时按钮会禁用。",
+              }}
+            />
+          </Space>
+        ) : null}
         <Divider style={{ margin: "4px 0 2px" }} />
         <HelpLabel
           label={<Typography.Text strong>版本与更新</Typography.Text>}

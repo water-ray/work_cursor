@@ -751,6 +751,15 @@ type ImportManualNodesTextRequest struct {
 	Content string `json:"content"`
 }
 
+type RemoveNodeItem struct {
+	GroupID string `json:"groupId"`
+	NodeID  string `json:"nodeId"`
+}
+
+type RemoveNodesRequest struct {
+	Items []RemoveNodeItem `json:"items"`
+}
+
 type TransferNodesRequest struct {
 	TargetGroupID string   `json:"targetGroupId"`
 	NodeIDs       []string `json:"nodeIds"`

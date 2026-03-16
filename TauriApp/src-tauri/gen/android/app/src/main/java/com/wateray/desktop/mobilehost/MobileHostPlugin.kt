@@ -45,11 +45,41 @@ class MobileHostProbeArgs {
 }
 
 @InvokeArg
+class MobileHostProbeStartArgs {
+  var groupId: String? = null
+  var configs: Array<MobileHostProbeConfigArgs>? = null
+  var probeTypes: Array<String>? = null
+  var latencyUrl: String? = null
+  var realConnectUrl: String? = null
+  var timeoutMs: Int? = null
+}
+
+@InvokeArg
+class MobileHostProbeCancelArgs {
+  lateinit var taskId: String
+}
+
+@InvokeArg
+class MobileHostSelectorSelectionArgs {
+  lateinit var selectorTag: String
+  lateinit var outboundTag: String
+}
+
+@InvokeArg
+class MobileHostSwitchSelectorsArgs {
+  var selections: Array<MobileHostSelectorSelectionArgs>? = null
+  var closeConnections: Boolean? = null
+}
+
+@InvokeArg
 class MobileHostDnsHealthArgs {
   lateinit var type: String
   lateinit var address: String
   var port: Int? = null
+  var path: String? = null
   lateinit var domain: String
+  var viaService: Boolean? = null
+  var serviceSocksPort: Int? = null
   var timeoutMs: Int? = null
 }
 
@@ -67,8 +97,20 @@ class MobileHostPlugin(private val activity: Activity) : Plugin(activity) {
   override fun load(webView: WebView) {
     Log.d(TAG, "plugin loaded")
     MobileHostBridge.refreshPermission(activity.applicationContext)
-    MobileHostBridge.attachEmitter { status ->
-      triggerObject("statusChanged", status)
+    MobileHostBridge.attachStatusEmitter { status ->
+      activity.runOnUiThread {
+        triggerObject("statusChanged", status)
+      }
+    }
+    MobileHostBridge.attachTaskQueueEmitter { taskQueue ->
+      activity.runOnUiThread {
+        triggerObject("taskQueueChanged", taskQueue)
+      }
+    }
+    MobileHostBridge.attachProbeResultEmitter { payload ->
+      activity.runOnUiThread {
+        triggerObject("probeResultPatch", payload)
+      }
     }
   }
 
@@ -81,7 +123,7 @@ class MobileHostPlugin(private val activity: Activity) : Plugin(activity) {
   override fun onDestroy() {
     clearPendingPrepare()
       ?.reject("VPN 授权请求已取消")
-    MobileHostBridge.clearEmitter()
+    MobileHostBridge.clearEmitters()
   }
 
   private fun canLaunchVpnPermission(): Boolean {
@@ -194,6 +236,19 @@ class MobileHostPlugin(private val activity: Activity) : Plugin(activity) {
     } else {
       "tun"
     }
+  }
+
+  private fun resolveProbeConfigs(
+    configArgs: Array<MobileHostProbeConfigArgs>?,
+    requireConfigJson: Boolean = true,
+  ): List<MobileProbeConfig> {
+    return configArgs
+      ?.map { MobileProbeConfig(nodeId = it.nodeId, configJson = it.configJson) }
+      ?.filter {
+        it.nodeId.trim().isNotEmpty() &&
+          (!requireConfigJson || it.configJson.trim().isNotEmpty())
+      }
+      .orEmpty()
   }
 
   @Command
@@ -323,14 +378,35 @@ class MobileHostPlugin(private val activity: Activity) : Plugin(activity) {
   }
 
   @Command
+  fun clearDnsCache(invoke: Invoke) {
+    Thread {
+      try {
+        val status = MobileHostBridge.snapshot()
+        val result = MobileRuntimeController.clearDnsCache(
+          context = activity.applicationContext,
+          flushFakeIp = status.serviceRunning,
+        )
+        if (result.cacheFileBusy) {
+          Log.w(
+            TAG,
+            "dns cache file is still in use, path=${result.cacheFilePath}",
+          )
+        }
+        invoke.resolveObject(MobileHostBridge.refreshPermission(activity.applicationContext))
+      } catch (ex: Exception) {
+        val message = ex.message ?: "移动端清理 DNS 缓存失败"
+        Log.e(TAG, message, ex)
+        invoke.reject(message, ex)
+      }
+    }.start()
+  }
+
+  @Command
   fun probe(invoke: Invoke) {
     Thread {
       try {
         val args = invoke.parseArgs(MobileHostProbeArgs::class.java)
-        val configs = args.configs
-          ?.map { MobileProbeConfig(nodeId = it.nodeId, configJson = it.configJson) }
-          ?.filter { it.nodeId.trim().isNotEmpty() && it.configJson.trim().isNotEmpty() }
-          .orEmpty()
+        val configs = resolveProbeConfigs(args.configs)
         if (configs.isEmpty()) {
           invoke.reject("移动端探测配置不能为空")
           return@Thread
@@ -362,16 +438,123 @@ class MobileHostPlugin(private val activity: Activity) : Plugin(activity) {
   }
 
   @Command
+  fun probeStart(invoke: Invoke) {
+    try {
+      val args = invoke.parseArgs(MobileHostProbeStartArgs::class.java)
+      val configs = resolveProbeConfigs(args.configs, requireConfigJson = false)
+      if (configs.isEmpty()) {
+        invoke.reject("移动端探测配置不能为空")
+        return
+      }
+      val status = MobileHostBridge.snapshot()
+      if (!status.serviceRunning || !status.tunReady) {
+        invoke.reject("安卓端仅支持在 VPN 代理已启动后执行节点探测")
+        return
+      }
+      val result = MobileTaskCenter.enqueueProbeTask(
+        context = activity.applicationContext,
+        request = MobileProbeTaskRequest(
+          groupId = args.groupId?.trim().orEmpty(),
+          configs = configs,
+          probeTypes = args.probeTypes?.toList().orEmpty(),
+          latencyUrl = args.latencyUrl,
+          realConnectUrl = args.realConnectUrl,
+          timeoutMs = args.timeoutMs,
+        ),
+      )
+      Log.i(TAG, "probeStart queued nodes=${configs.size} taskId=${result.task.id}")
+      invoke.resolveObject(result)
+    } catch (ex: Exception) {
+      val message = ex.message ?: "移动端后台节点探测启动失败"
+      Log.e(TAG, message, ex)
+      invoke.reject(message, ex)
+    }
+  }
+
+  @Command
+  fun probeCancel(invoke: Invoke) {
+    try {
+      val args = invoke.parseArgs(MobileHostProbeCancelArgs::class.java)
+      val result = MobileTaskCenter.cancelTask(args.taskId)
+      invoke.resolveObject(result)
+    } catch (ex: Exception) {
+      val message = ex.message ?: "移动端后台节点探测取消失败"
+      Log.e(TAG, message, ex)
+      invoke.reject(message, ex)
+    }
+  }
+
+  @Command
+  fun getTaskQueue(invoke: Invoke) {
+    invoke.resolveObject(MobileTaskCenter.queueSnapshot())
+  }
+
+  @Command
+  fun switchSelectors(invoke: Invoke) {
+    Thread {
+      try {
+        val args = invoke.parseArgs(MobileHostSwitchSelectorsArgs::class.java)
+        val selections = args.selections
+          ?.map {
+            MobileSelectorSwitchSelection(
+              selectorTag = it.selectorTag.trim(),
+              outboundTag = it.outboundTag.trim(),
+            )
+          }
+          ?.filter { it.selectorTag.isNotEmpty() && it.outboundTag.isNotEmpty() }
+          .orEmpty()
+        if (selections.isEmpty()) {
+          invoke.reject("移动端 selector 热切目标不能为空")
+          return@Thread
+        }
+        val status = MobileHostBridge.snapshot()
+        if (!status.serviceRunning) {
+          invoke.reject("移动端代理未运行，无法执行 selector 热切")
+          return@Thread
+        }
+
+        Log.d(TAG, "switchSelectors invoked, selections=${selections.size}")
+        WaterayVpnService.ensureLibboxSetup(activity.applicationContext)
+        val appliedCount = MobileSelectorSwitchRunner.run(
+          context = activity.applicationContext,
+          selections = selections,
+          closeConnections = args.closeConnections == true,
+        )
+        invoke.resolveObject(
+          SwitchSelectorsResult(
+            appliedCount = appliedCount,
+            status = MobileHostBridge.refreshPermission(activity.applicationContext),
+          ),
+        )
+      } catch (ex: Exception) {
+        val message = ex.message ?: "移动端 selector 热切失败"
+        Log.e(TAG, message, ex)
+        invoke.reject(message, ex)
+      }
+    }.start()
+  }
+
+  @Command
   fun dnsHealth(invoke: Invoke) {
     Thread {
       try {
         val args = invoke.parseArgs(MobileHostDnsHealthArgs::class.java)
+        if (args.viaService == true) {
+          val status = MobileHostBridge.snapshot()
+          if (!status.serviceRunning || !status.tunReady) {
+            invoke.reject("移动端代理未运行，无法通过活动服务执行 DNS 健康检查")
+            return@Thread
+          }
+        }
         val result = MobileDnsHealthRunner.run(
           MobileDnsHealthCheckConfig(
             type = args.type,
             address = args.address,
             port = args.port,
+            path = args.path,
             domain = args.domain,
+            viaService = args.viaService == true,
+            serviceSocksPort = args.serviceSocksPort,
             timeoutMs = args.timeoutMs,
           ),
         )

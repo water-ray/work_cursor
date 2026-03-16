@@ -11,6 +11,7 @@ import {
 import { createPortal } from "react-dom";
 
 import { BiIcon } from "../icons/BiIcon";
+import { isMobileRuntime } from "../../platform/runtimeStore";
 
 type AppNoticeLevel = "success" | "warning" | "error" | "info";
 export type AppNoticePlacement = "top-right" | "top-center";
@@ -87,6 +88,14 @@ export const appExternalNoticeEventName = "wateray:app-external-notice";
 const AppNoticeContext = createContext<AppNoticeApi | null>(null);
 const AppNoticeHistoryContext = createContext<AppNoticeHistoryApi | null>(null);
 
+function isMobileNoticeRuntime(): boolean {
+  try {
+    return isMobileRuntime();
+  } catch {
+    return false;
+  }
+}
+
 function levelIcon(level: AppNoticeLevel): string {
   switch (level) {
     case "success":
@@ -121,18 +130,19 @@ function resolveNoticeOptions(
   durationMs: number;
   placement: AppNoticePlacement;
 } {
+  const mobilePlacement: AppNoticePlacement = "top-center";
   if (typeof options === "number") {
     if (Number.isFinite(options)) {
       return {
         title: levelTitle(level),
         durationMs: Math.max(0, Math.round(options * 1000)),
-        placement: "top-right",
+        placement: isMobileNoticeRuntime() ? mobilePlacement : "top-right",
       };
     }
     return {
       title: levelTitle(level),
       durationMs: appNoticeDurationMs[level],
-      placement: "top-right",
+      placement: isMobileNoticeRuntime() ? mobilePlacement : "top-right",
     };
   }
   const title = String(options?.title ?? "").trim() || levelTitle(level);
@@ -144,7 +154,9 @@ function resolveNoticeOptions(
   return {
     title,
     durationMs,
-    placement: options?.placement === "top-center" ? "top-center" : "top-right",
+    placement: isMobileNoticeRuntime()
+      ? mobilePlacement
+      : (options?.placement === "top-center" ? "top-center" : "top-right"),
   };
 }
 

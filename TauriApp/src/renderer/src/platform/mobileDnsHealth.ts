@@ -7,14 +7,24 @@ import type {
   DNSResolverEndpoint,
 } from "../../../shared/daemon";
 import type { WaterayMobileHostApi } from "./mobileHost";
-import { materializeMobileDnsEndpoint, type MobileResolverContext } from "./mobileRuntimeConfig";
+import {
+  defaultMobileDnsHealthDirectSocksPort,
+  defaultMobileDnsHealthProxySocksPort,
+  materializeMobileDnsEndpoint,
+  type MobileResolverContext,
+} from "./mobileRuntimeConfig";
 
-const defaultDnsHealthDomain = "www.gstatic.com";
+const defaultDnsHealthDomain = "www.qq.com";
 const defaultDnsHealthTimeoutMs = 5000;
 const minDnsHealthTimeoutMs = 500;
 const maxDnsHealthTimeoutMs = 20000;
 const dnsTypeA = 1;
 const dnsTypeAAAA = 28;
+
+interface MobileDnsHealthRuntimeStatus {
+  serviceRunning?: boolean;
+  tunReady?: boolean;
+}
 
 function normalizeDnsHealthDomain(value: string | undefined): string {
   const domain = (value ?? "").trim();
@@ -259,23 +269,89 @@ function createHostUnavailableResult(
   };
 }
 
+function createServiceInactiveResult(
+  target: string,
+  serverTag: string,
+  latencyMs: number,
+): DNSHealthCheckResult {
+  return {
+    target,
+    serverTag,
+    reachable: false,
+    latencyMs,
+    error: "移动端仅支持在 VPN 代理运行中检测 remote/direct DNS 链路；未启动时系统 DNS 由 Android 接管",
+  };
+}
+
+function createActiveServiceUnsupportedResult(
+  target: string,
+  serverTag: string,
+  endpoint: DNSResolverEndpoint,
+  latencyMs: number,
+): DNSHealthCheckResult {
+  return {
+    target,
+    serverTag,
+    reachable: false,
+    latencyMs,
+    error: `移动端暂未支持通过运行中的 VPN 服务验证 ${endpoint.type} 类型 DNS`,
+  };
+}
+
+function shouldUseRunningServiceDns(
+  serverTag: string,
+  endpoint: DNSResolverEndpoint,
+  hostStatus: MobileDnsHealthRuntimeStatus | undefined,
+): boolean {
+  if (serverTag === "bootstrap") {
+    return false;
+  }
+  if (hostStatus?.serviceRunning !== true || hostStatus.tunReady !== true) {
+    return false;
+  }
+  return endpoint.type === "https" || endpoint.type === "tcp" || endpoint.type === "tls";
+}
+
+function resolveServiceSocksPort(serverTag: string, endpoint: DNSResolverEndpoint): number | undefined {
+  const detour = String(endpoint.detour ?? "").trim().toLowerCase();
+  if (detour === "proxy") {
+    return defaultMobileDnsHealthProxySocksPort;
+  }
+  if (detour === "direct") {
+    return defaultMobileDnsHealthDirectSocksPort;
+  }
+  if (serverTag === "remote") {
+    return defaultMobileDnsHealthProxySocksPort;
+  }
+  if (serverTag === "direct") {
+    return defaultMobileDnsHealthDirectSocksPort;
+  }
+  return undefined;
+}
+
 async function resolveDnsViaNative(params: {
   endpoint: DNSResolverEndpoint;
   domain: string;
   timeoutMs: number;
   host: Pick<WaterayMobileHostApi, "dnsHealth">;
+  viaService?: boolean;
+  serviceSocksPort?: number;
 }): Promise<{
   reachable: boolean;
   latencyMs: number;
   resolvedIp?: string[];
   error?: string | null;
 }> {
-  const { endpoint, domain, timeoutMs, host } = params;
+  const { endpoint, domain, timeoutMs, host, viaService, serviceSocksPort } = params;
   return host.dnsHealth({
     type: endpoint.type,
     address: String(endpoint.address ?? "").trim(),
     port: Number(endpoint.port ?? 0) > 0 ? Number(endpoint.port ?? 0) : undefined,
+    path: endpoint.path?.trim() || undefined,
     domain,
+    viaService: viaService === true,
+    serviceSocksPort:
+      Number(serviceSocksPort ?? 0) > 0 ? Number(serviceSocksPort ?? 0) : undefined,
     timeoutMs,
   });
 }
@@ -288,13 +364,56 @@ async function checkEndpoint(params: {
   timeoutMs: number;
   resolverContext: MobileResolverContext;
   host?: Pick<WaterayMobileHostApi, "dnsHealth"> | null;
+  hostStatus?: MobileDnsHealthRuntimeStatus;
 }): Promise<DNSHealthCheckResult> {
   const startedAt = Date.now();
-  const { target, serverTag, endpoint, domain, timeoutMs, resolverContext, host } = params;
+  const { target, serverTag, endpoint, domain, timeoutMs, resolverContext, host, hostStatus } = params;
   try {
     const resolvedEndpoint = materializeMobileDnsEndpoint(serverTag, endpoint, resolverContext);
+    const shouldUseRunningService = shouldUseRunningServiceDns(serverTag, resolvedEndpoint, hostStatus);
+    if (
+      serverTag !== "bootstrap"
+      && (hostStatus?.serviceRunning !== true || hostStatus.tunReady !== true)
+    ) {
+      return createServiceInactiveResult(
+        target,
+        serverTag,
+        Math.max(0, Date.now() - startedAt),
+      );
+    }
+    if (
+      serverTag !== "bootstrap"
+      && hostStatus?.serviceRunning === true
+      && hostStatus.tunReady === true
+      && !shouldUseRunningService
+    ) {
+      return createActiveServiceUnsupportedResult(
+        target,
+        serverTag,
+        resolvedEndpoint,
+        Math.max(0, Date.now() - startedAt),
+      );
+    }
     switch (resolvedEndpoint.type) {
       case "https": {
+        if (host) {
+          const result = await resolveDnsViaNative({
+            endpoint: resolvedEndpoint,
+            domain,
+            timeoutMs,
+            host,
+            viaService: shouldUseRunningService,
+            serviceSocksPort: resolveServiceSocksPort(serverTag, resolvedEndpoint),
+          });
+          return {
+            target,
+            serverTag,
+            reachable: result.reachable,
+            latencyMs: Math.max(0, Number(result.latencyMs ?? Date.now() - startedAt)),
+            resolvedIp: Array.isArray(result.resolvedIp) ? result.resolvedIp : undefined,
+            error: result.error ?? undefined,
+          };
+        }
         const resolvedIp = await resolveDnsOverHttps(resolvedEndpoint, domain, timeoutMs);
         return {
           target,
@@ -320,6 +439,8 @@ async function checkEndpoint(params: {
           domain,
           timeoutMs,
           host,
+          viaService: shouldUseRunningService,
+          serviceSocksPort: resolveServiceSocksPort(serverTag, resolvedEndpoint),
         });
         return {
           target,
@@ -358,6 +479,7 @@ export async function checkMobileDnsHealth(
   },
   resolverContext: MobileResolverContext = {},
   host?: Pick<WaterayMobileHostApi, "dnsHealth"> | null,
+  hostStatus?: MobileDnsHealthRuntimeStatus,
 ): Promise<{
   report: DNSHealthReport;
   error?: string;
@@ -373,6 +495,7 @@ export async function checkMobileDnsHealth(
       timeoutMs,
       resolverContext,
       host,
+      hostStatus,
     }),
     checkEndpoint({
       target: "direct",
@@ -382,6 +505,7 @@ export async function checkMobileDnsHealth(
       timeoutMs,
       resolverContext,
       host,
+      hostStatus,
     }),
     checkEndpoint({
       target: "bootstrap",
@@ -391,12 +515,14 @@ export async function checkMobileDnsHealth(
       timeoutMs,
       resolverContext,
       host,
+      hostStatus,
     }),
   ]);
   const passed = results.every((item) => item.reachable);
   const unsupportedTargets = results
     .filter((item) => (item.error ?? "").includes("暂未支持"))
     .map((item) => item.target);
+  const firstFailure = results.find((item) => !item.reachable && (item.error ?? "").trim() !== "");
   return {
     report: {
       domain,
@@ -409,6 +535,6 @@ export async function checkMobileDnsHealth(
       ? undefined
       : unsupportedTargets.length > 0
         ? `移动端 DNS 健康检查暂未完全覆盖当前 resolver 类型：${unsupportedTargets.join(", ")}`
-        : "dns health check failed",
+        : firstFailure?.error ?? "dns health check failed",
   };
 }

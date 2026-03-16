@@ -732,12 +732,16 @@ func (s *RuntimeStore) SnapshotPushEvent() DaemonPushEvent {
 	return newSnapshotChangedEvent(snapshot)
 }
 
+func normalizeSubscriptionGroupURL(raw string) string {
+	return strings.TrimSpace(raw)
+}
+
 func (s *RuntimeStore) AddSubscription(_ context.Context, req AddSubscriptionRequest) (StateSnapshot, error) {
 	name := strings.TrimSpace(req.Name)
 	if name == "" {
 		return StateSnapshot{}, errors.New("group name is required")
 	}
-	url := strings.TrimSpace(req.URL)
+	url := normalizeSubscriptionGroupURL(req.URL)
 	now := time.Now().UnixMilli()
 
 	s.mu.Lock()
@@ -790,7 +794,7 @@ func (s *RuntimeStore) UpdateGroup(_ context.Context, req UpdateGroupRequest) (S
 	if name == "" {
 		return StateSnapshot{}, errors.New("group name is required")
 	}
-	url := strings.TrimSpace(req.URL)
+	url := normalizeSubscriptionGroupURL(req.URL)
 	now := time.Now().UnixMilli()
 
 	s.mu.Lock()
@@ -5176,6 +5180,52 @@ func (s *RuntimeStore) RemoveNode(_ context.Context, groupID string, nodeID stri
 		}
 	}
 	s.state.Groups[groupIndex].Nodes = next
+	s.ensureValidLocked()
+	_ = s.saveLocked()
+	return cloneSnapshot(s.state), nil
+}
+
+func (s *RuntimeStore) RemoveNodes(_ context.Context, req RemoveNodesRequest) (StateSnapshot, error) {
+	if len(req.Items) == 0 {
+		return StateSnapshot{}, errors.New("items is required")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	groupNodeSet := make(map[string]map[string]struct{})
+	for _, item := range req.Items {
+		groupID := strings.TrimSpace(item.GroupID)
+		nodeID := strings.TrimSpace(item.NodeID)
+		if groupID == "" || nodeID == "" {
+			return StateSnapshot{}, errors.New("groupId and nodeId are required")
+		}
+		if s.indexGroupByIDLocked(groupID) < 0 {
+			return StateSnapshot{}, errors.New("group not found")
+		}
+		nodeSet, ok := groupNodeSet[groupID]
+		if !ok {
+			nodeSet = make(map[string]struct{})
+			groupNodeSet[groupID] = nodeSet
+		}
+		nodeSet[nodeID] = struct{}{}
+	}
+
+	for groupIndex, group := range s.state.Groups {
+		nodeSet, ok := groupNodeSet[group.ID]
+		if !ok || len(nodeSet) == 0 {
+			continue
+		}
+		next := make([]Node, 0, len(group.Nodes))
+		for _, node := range group.Nodes {
+			if _, shouldRemove := nodeSet[node.ID]; shouldRemove {
+				continue
+			}
+			next = append(next, node)
+		}
+		s.state.Groups[groupIndex].Nodes = next
+	}
+
 	s.ensureValidLocked()
 	_ = s.saveLocked()
 	return cloneSnapshot(s.state), nil

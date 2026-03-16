@@ -5,6 +5,7 @@ import { countryMetadataList } from "../../app/data/countryMetadata";
 import { CountryFlag } from "../../components/flag/CountryFlag";
 import { HelpLabel } from "../../components/form/HelpLabel";
 import type { HelpContent } from "../../components/form/HelpLabel";
+import { isMobileRuntime } from "../../platform/runtimeStore";
 import {
   decodeNodeToFormValues,
   encodeNodeFormToCreatePayload,
@@ -295,7 +296,7 @@ function renderEmptyPanel(text: string) {
   return <Typography.Text type="secondary">{text}</Typography.Text>;
 }
 
-const compactFormItemLayout = {
+const desktopCompactFormItemLayout = {
   labelCol: compactLabelCol,
   wrapperCol: compactWrapperCol,
 };
@@ -387,9 +388,22 @@ export function SubscriptionNodeEditorModal({
   onCancel,
   onSubmit,
 }: SubscriptionNodeEditorModalProps) {
+  const isMobileView = isMobileRuntime();
   const [form] = Form.useForm<SubscriptionNodeFormValues>();
   const initializedStateRef = useRef<string>("");
   const [transportHeadersExpanded, setTransportHeadersExpanded] = useState(false);
+  const compactFormItemLayout = isMobileView ? {} : desktopCompactFormItemLayout;
+  const mainFormLayout = isMobileView ? "vertical" : "horizontal";
+  const mainColumnSpan = isMobileView ? 24 : 10;
+  const sideColumnSpan = isMobileView ? 24 : 14;
+  const halfColumnSpan = isMobileView ? 24 : 12;
+  const modalGridGutter = isMobileView ? ([0, 12] as [number, number]) : ([12, 0] as [number, number]);
+  const compactGridGutter =
+    isMobileView ? ([0, 10] as [number, number]) : ([12, 0] as [number, number]);
+  const transportHeaderGutter =
+    isMobileView ? ([0, 8] as [number, number]) : ([8, 0] as [number, number]);
+  const transportHeaderEditorFlex = isMobileView ? "100%" : "auto";
+  const transportHeaderPresetFlex = isMobileView ? "100%" : "160px";
   const currentProtocol = Form.useWatch("protocol", form) ?? editingNode?.node.protocol ?? initialProtocol;
   const currentTransport = Form.useWatch("transport", form) ?? "";
   const currentTlsEnabled = Form.useWatch("tlsEnabled", form) ?? false;
@@ -484,12 +498,17 @@ export function SubscriptionNodeEditorModal({
     <Modal
       title={mode === "edit" ? "编辑节点" : "添加节点"}
       open={open}
-      width={1120}
+      width={isMobileView ? "calc(100vw - 16px)" : 1120}
       destroyOnHidden
       maskClosable={false}
       okText={mode === "edit" ? "保存" : "添加"}
       cancelText="取消"
       confirmLoading={submitting}
+      styles={{
+        body: {
+          padding: isMobileView ? 12 : undefined,
+        },
+      }}
       onCancel={onCancel}
       onOk={() => {
         void handleFinish();
@@ -504,12 +523,13 @@ export function SubscriptionNodeEditorModal({
         />
       ) : null}
       <Form<SubscriptionNodeFormValues>
-        layout="horizontal"
+        layout={mainFormLayout}
         colon={false}
         labelAlign="left"
-        labelCol={formLabelCol}
-        wrapperCol={formWrapperCol}
+        labelCol={isMobileView ? undefined : formLabelCol}
+        wrapperCol={isMobileView ? undefined : formWrapperCol}
         form={form}
+        size={isMobileView ? "small" : "middle"}
         style={{ marginTop: 8 }}
         onValuesChange={(changedValues, allValues) => {
           if ("protocol" in changedValues) {
@@ -579,8 +599,8 @@ export function SubscriptionNodeEditorModal({
         <Form.Item name="groupId" hidden>
           <Input />
         </Form.Item>
-        <Row gutter={12}>
-          <Col span={10}>
+        <Row gutter={modalGridGutter}>
+          <Col span={mainColumnSpan}>
             <Space direction="vertical" size={12} style={{ width: "100%" }}>
               <Card
                 size="small"
@@ -707,7 +727,7 @@ export function SubscriptionNodeEditorModal({
               </Card>
             </Space>
           </Col>
-          <Col span={14}>
+          <Col span={sideColumnSpan}>
             <Space direction="vertical" size={12} style={{ width: "100%" }}>
               <Card
                 size="small"
@@ -723,9 +743,9 @@ export function SubscriptionNodeEditorModal({
                   </Form.Item>
                 ) : null}
                 {supportsTransportHost(currentTransport) || supportsTransportPath(currentTransport) ? (
-                  <Row gutter={12}>
+                  <Row gutter={compactGridGutter}>
                     {supportsTransportHost(currentTransport) ? (
-                      <Col span={12}>
+                      <Col span={halfColumnSpan}>
                         <Form.Item
                           label={fieldLabel("host", "Host")}
                           name="host"
@@ -737,7 +757,7 @@ export function SubscriptionNodeEditorModal({
                       </Col>
                     ) : null}
                     {supportsTransportPath(currentTransport) ? (
-                      <Col span={12}>
+                      <Col span={halfColumnSpan}>
                         <Form.Item label={fieldLabel("path", "Path")} name="path" style={{ marginBottom: 12 }} {...compactFormItemLayout}>
                           <Input placeholder="例如：/ray" />
                         </Form.Item>
@@ -771,8 +791,8 @@ export function SubscriptionNodeEditorModal({
                     style={{ marginBottom: 12 }}
                     {...compactFormItemLayout}
                   >
-                    <Row gutter={8} align="top">
-                      <Col flex="auto">
+                    <Row gutter={transportHeaderGutter} align="top">
+                      <Col flex={transportHeaderEditorFlex}>
                         <Form.Item name="transportHeaders" noStyle>
                           <Input.TextArea
                             autoSize={
@@ -796,7 +816,7 @@ export function SubscriptionNodeEditorModal({
                           />
                         </Form.Item>
                       </Col>
-                      <Col flex="160px">
+                      <Col flex={transportHeaderPresetFlex}>
                         <Select
                           value={currentUserAgentPreset}
                           options={browserUserAgentOptions.map((option) => ({
@@ -816,8 +836,8 @@ export function SubscriptionNodeEditorModal({
                   </Form.Item>
                 ) : null}
                 {supportsWSEarlyData(currentTransport) ? (
-                  <Row gutter={12}>
-                    <Col span={12}>
+                  <Row gutter={compactGridGutter}>
+                    <Col span={halfColumnSpan}>
                       <Form.Item
                         label={fieldLabel("wsMaxEarlyData", "ED大小", "Early Data Size")}
                         name="wsMaxEarlyData"
@@ -827,7 +847,7 @@ export function SubscriptionNodeEditorModal({
                         <InputNumber min={0} style={{ width: "100%" }} placeholder="例如：2048" />
                       </Form.Item>
                     </Col>
-                    <Col span={12}>
+                    <Col span={halfColumnSpan}>
                       <Form.Item
                         label={fieldLabel("wsEarlyDataHeaderName", "ED头", "Early Data Header")}
                         name="wsEarlyDataHeaderName"
@@ -840,8 +860,8 @@ export function SubscriptionNodeEditorModal({
                   </Row>
                 ) : null}
                 {supportsHTTPTimeouts(currentTransport) ? (
-                  <Row gutter={12}>
-                    <Col span={12}>
+                  <Row gutter={compactGridGutter}>
+                    <Col span={halfColumnSpan}>
                       <Form.Item
                         label={fieldLabel("httpIdleTimeout", "空闲超时", "HTTP Idle Timeout")}
                         name="httpIdleTimeout"
@@ -851,7 +871,7 @@ export function SubscriptionNodeEditorModal({
                         <Input placeholder="例如：15s" />
                       </Form.Item>
                     </Col>
-                    <Col span={12}>
+                    <Col span={halfColumnSpan}>
                       <Form.Item
                         label={fieldLabel("httpPingTimeout", "Ping超时", "HTTP Ping Timeout")}
                         name="httpPingTimeout"
@@ -865,8 +885,8 @@ export function SubscriptionNodeEditorModal({
                 ) : null}
                 {supportsGRPCKeepalive(currentTransport) ? (
                   <>
-                    <Row gutter={12}>
-                      <Col span={12}>
+                    <Row gutter={compactGridGutter}>
+                      <Col span={halfColumnSpan}>
                         <Form.Item
                           label={fieldLabel("grpcIdleTimeout", "空闲超时", "gRPC Idle Timeout")}
                           name="grpcIdleTimeout"
@@ -876,7 +896,7 @@ export function SubscriptionNodeEditorModal({
                           <Input placeholder="例如：15s" />
                         </Form.Item>
                       </Col>
-                      <Col span={12}>
+                      <Col span={halfColumnSpan}>
                         <Form.Item
                           label={fieldLabel("grpcPingTimeout", "Ping超时", "gRPC Ping Timeout")}
                           name="grpcPingTimeout"
@@ -887,8 +907,8 @@ export function SubscriptionNodeEditorModal({
                         </Form.Item>
                       </Col>
                     </Row>
-                    <Row gutter={12}>
-                      <Col span={12}>
+                    <Row gutter={compactGridGutter}>
+                      <Col span={halfColumnSpan}>
                         <Form.Item
                           label={fieldLabel("grpcPermitWithoutStream", "空闲保活", "gRPC Permit Without Stream")}
                           name="grpcPermitWithoutStream"
@@ -903,9 +923,9 @@ export function SubscriptionNodeEditorModal({
                   </>
                 ) : null}
                 {protocolSpec.tlsFields.includes("tlsEnabled") || (protocolSpec.tlsFields.includes("tlsMode") && currentTlsEnabled) ? (
-                  <Row gutter={12}>
+                  <Row gutter={compactGridGutter}>
                     {protocolSpec.tlsFields.includes("tlsEnabled") ? (
-                      <Col span={12}>
+                      <Col span={halfColumnSpan}>
                         <Form.Item
                           label={fieldLabel("tlsEnabled", "启用 TLS")}
                           name="tlsEnabled"
@@ -918,7 +938,7 @@ export function SubscriptionNodeEditorModal({
                       </Col>
                     ) : null}
                     {protocolSpec.tlsFields.includes("tlsMode") && currentTlsEnabled ? (
-                      <Col span={12}>
+                      <Col span={halfColumnSpan}>
                         <Form.Item
                           label={fieldLabel("tlsMode", "TLS 模式")}
                           name="tlsMode"
@@ -932,14 +952,14 @@ export function SubscriptionNodeEditorModal({
                   </Row>
                 ) : null}
                 {protocolSpec.tlsFields.includes("sni") && currentTlsEnabled ? (
-                  <Row gutter={12}>
-                    <Col span={12}>
+                  <Row gutter={compactGridGutter}>
+                    <Col span={halfColumnSpan}>
                       <Form.Item label={fieldLabel("sni", "SNI")} name="sni" style={{ marginBottom: 12 }} {...compactFormItemLayout}>
                         <Input placeholder="例如：www.google.com" />
                       </Form.Item>
                     </Col>
                     {protocolSpec.tlsFields.includes("insecure") ? (
-                      <Col span={12}>
+                      <Col span={halfColumnSpan}>
                         <Form.Item
                           label={fieldLabel("insecure", "跳过证书校验")}
                           name="insecure"

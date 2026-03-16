@@ -225,7 +225,7 @@ class WaterayVpnService : VpnService(), CommandServerHandler, PlatformInterface 
           ?: DEFAULT_PROFILE_NAME
         currentRuntimeMode = normalizeRuntimeMode(intent?.getStringExtra(EXTRA_RUNTIME_MODE))
         lastConfigJson = configJson
-        enterForeground("正在启动移动端原生代理")
+        enterForeground(foregroundNotificationText())
         MobileHostBridge.setStarting(currentProfileName, configJson, currentRuntimeMode)
         Thread {
           startNative(configJson, currentProfileName, currentRuntimeMode)
@@ -266,7 +266,7 @@ class WaterayVpnService : VpnService(), CommandServerHandler, PlatformInterface 
       server.startOrReloadService(configJson, OverrideOptions())
       MobileHostBridge.setRunning(profileName, configJson, tunConnection != null, runtimeMode)
       MobileHostBridge.refreshPermission(this)
-      updateNotification("移动端原生代理运行中")
+      updateNotification(foregroundNotificationText())
       Log.i(TAG, "startNative success, mode=$runtimeMode, tunReady=${tunConnection != null}")
     } catch (ex: Exception) {
       val message = ex.message ?: "移动端原生代理启动失败"
@@ -384,6 +384,10 @@ class WaterayVpnService : VpnService(), CommandServerHandler, PlatformInterface 
       builder.setContentIntent(pendingIntent)
     }
     return builder.build()
+  }
+
+  private fun foregroundNotificationText(): String {
+    return "Wateray 正在运行移动端 VPN 服务"
   }
 
   private fun updateNotification(contentText: String) {
@@ -681,7 +685,7 @@ class WaterayVpnService : VpnService(), CommandServerHandler, PlatformInterface 
       tunConnection = connection
       MobileHostBridge.setTunReady(true)
       MobileHostBridge.refreshPermission(this)
-      updateNotification("Android VPN 隧道已建立")
+      updateNotification(foregroundNotificationText())
       Log.i(TAG, "Android VPN tunnel established")
       return connection.fd
     }
@@ -692,11 +696,11 @@ class WaterayVpnService : VpnService(), CommandServerHandler, PlatformInterface 
   }
 
   override fun sendNotification(notification: io.nekohasekai.libbox.Notification) {
-    val contentText = listOf(notification.title, notification.body)
-      .mapNotNull { it?.trim()?.takeIf { text -> text.isNotEmpty() } }
-      .joinToString(" · ")
-      .ifEmpty { "移动端原生代理运行中" }
-    updateNotification(contentText)
+    Log.d(
+      TAG,
+      "suppress libbox system notification title=${notification.title.orEmpty()} body=${notification.body.orEmpty()}",
+    )
+    updateNotification(foregroundNotificationText())
   }
 
   override fun startDefaultInterfaceMonitor(listener: InterfaceUpdateListener) {

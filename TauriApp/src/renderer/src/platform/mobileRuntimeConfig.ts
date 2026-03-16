@@ -7,13 +7,25 @@ import type {
   NodeGroup,
   ProxyMode,
   ProxyTunStack,
+  RuleConfigV2,
+  RuleGroup,
+  RuleMatchV2,
+  RuleNodePool,
+  RuleNodeRef,
   VpnNode,
 } from "../../../shared/daemon";
 
 type UnknownRecord = Record<string, unknown>;
 
+export interface MobileSelectorSwitchSelection {
+  selectorTag: string;
+  outboundTag: string;
+}
+
 export interface MobileResolverContext {
   systemDnsServers?: string[];
+  builtInRuleSetPaths?: Record<string, string>;
+  dnsCacheFilePath?: string;
 }
 
 const defaultTunInterfaceName = "wateray-tun";
@@ -24,6 +36,7 @@ const defaultLocalMixedListenPort = 1088;
 
 const bootstrapDnsServerTag = "bootstrap";
 const localDnsServerTag = "local-resolver";
+const dnsHostsOverrideServerTag = "hosts-override";
 const dnsDirectOutboundTag = "dns-direct";
 const proxySelectorTag = "proxy";
 const proxyUrlTestTag = "proxy-auto";
@@ -32,15 +45,69 @@ const defaultUrlTestInterval = "3m";
 const defaultUrlTestIdleTimeout = "30m";
 const defaultUrlTestToleranceMs = 50;
 const defaultSniffTimeoutMs = 1000;
+const defaultRuleSetUpdateInterval = "1d";
+const geoIPRuleSetURLTemplate = "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-%s.srs";
+const geoSiteRuleSetURLTemplate = "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-%s.srs";
 
 const defaultProbeSocksListenAddress = "127.0.0.1";
 export const defaultMobileProbeSocksPort = 39091;
+const dnsHealthProxyInboundTag = "dns-health-proxy-in";
+const dnsHealthDirectInboundTag = "dns-health-direct-in";
+export const defaultMobileDnsHealthProxySocksPort = 39092;
+export const defaultMobileDnsHealthDirectSocksPort = 39093;
+const defaultMobileClashAPIController = "127.0.0.1:39081";
+const defaultMobileDnsCacheFilePath = "singbox-cache.db";
+const defaultMobileDnsCacheRDRCTimeout = "7d";
+
+const countryAliases: Record<string, string> = {
+  hk: "HK",
+  "hong kong": "HK",
+  hongkong: "HK",
+  "香港": "HK",
+  mo: "MO",
+  macau: "MO",
+  macao: "MO",
+  "澳门": "MO",
+  jp: "JP",
+  japan: "JP",
+  "日本": "JP",
+  sg: "SG",
+  singapore: "SG",
+  "新加坡": "SG",
+  tw: "TW",
+  taiwan: "TW",
+  "台湾": "TW",
+  kr: "KR",
+  korea: "KR",
+  "south korea": "KR",
+  "韩国": "KR",
+  us: "US",
+  usa: "US",
+  "united states": "US",
+  "美国": "US",
+  gb: "GB",
+  uk: "GB",
+  "united kingdom": "GB",
+  "英国": "GB",
+  de: "DE",
+  germany: "DE",
+  "德国": "DE",
+  fr: "FR",
+  france: "FR",
+  "法国": "FR",
+  ca: "CA",
+  canada: "CA",
+  "加拿大": "CA",
+  au: "AU",
+  australia: "AU",
+  "澳大利亚": "AU",
+};
 
 const defaultDnsConfig: DNSConfig = {
   version: 2,
   remote: {
     type: "https",
-    address: "dns.google",
+    address: "doh.pub",
     port: 443,
     path: "/dns-query",
     detour: "proxy",
@@ -239,6 +306,834 @@ function normalizeSystemDnsServers(value: string[] | undefined): string[] {
         .map((item) => item.trim())
         .filter((item) => item !== ""),
     ),
+  );
+}
+
+function uniqueNonEmptyStrings(values: string[] | undefined): string[] {
+  const result: string[] = [];
+  const seen = new Set<string>();
+  for (const rawValue of values ?? []) {
+    const value = String(rawValue ?? "").trim();
+    if (value === "") {
+      continue;
+    }
+    const key = value.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    result.push(value);
+  }
+  return result;
+}
+
+function normalizeDnsHostsText(raw: string | undefined): string {
+  return String(raw ?? "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim();
+}
+
+function isValidDnsHostIpAddress(value: string): boolean {
+  const trimmed = value.trim();
+  if (trimmed === "") {
+    return false;
+  }
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(trimmed)) {
+    const octets = trimmed.split(".").map((item) => Number(item));
+    return octets.every((item) => item >= 0 && item <= 255);
+  }
+  return trimmed.includes(":") && /^[0-9a-fA-F:]+$/.test(trimmed);
+}
+
+function normalizeDnsHostsDomain(raw: string): string {
+  const value = raw.trim().toLowerCase().replace(/\.$/, "");
+  if (value === "" || /\s/.test(value) || value.startsWith("#")) {
+    return "";
+  }
+  return value;
+}
+
+function buildCustomDnsHostsEntries(raw: string | undefined): Record<string, string[]> {
+  const normalized = normalizeDnsHostsText(raw);
+  if (normalized === "") {
+    return {};
+  }
+  const entries: Record<string, string[]> = {};
+  for (const rawLine of normalized.split("\n")) {
+    let line = rawLine.trim();
+    if (line === "" || line.startsWith("#")) {
+      continue;
+    }
+    const commentIndex = line.indexOf("#");
+    if (commentIndex >= 0) {
+      line = line.slice(0, commentIndex).trim();
+      if (line === "") {
+        continue;
+      }
+    }
+    const fields = line.split(/\s+/).filter((item) => item !== "");
+    if (fields.length < 2) {
+      continue;
+    }
+    const ip = String(fields[0] ?? "").trim();
+    if (!isValidDnsHostIpAddress(ip)) {
+      continue;
+    }
+    for (const rawHost of fields.slice(1)) {
+      const host = normalizeDnsHostsDomain(rawHost);
+      if (host === "") {
+        continue;
+      }
+      entries[host] = uniqueNonEmptyStrings([...(entries[host] ?? []), ip]);
+    }
+  }
+  return entries;
+}
+
+function normalizeIPCIDRPatterns(patterns: string[] | undefined): string[] {
+  const result: string[] = [];
+  const seen = new Set<string>();
+  for (const rawPattern of patterns ?? []) {
+    let value = String(rawPattern ?? "").trim();
+    if (value === "") {
+      continue;
+    }
+    if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(value)) {
+      value = `${value}/32`;
+    } else if (!value.includes("/") && value.includes(":")) {
+      value = `${value}/128`;
+    } else if (!value.includes("/")) {
+      continue;
+    }
+    const key = value.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    result.push(value);
+  }
+  return result;
+}
+
+function normalizeRuleMissMode(value: string | undefined): "proxy" | "direct" {
+  return String(value ?? "").trim().toLowerCase() === "proxy" ? "proxy" : "direct";
+}
+
+function resolveRuleGroupOnMissMode(
+  group: Pick<RuleGroup, "onMissMode"> | undefined,
+  fallback: string | undefined,
+): "proxy" | "direct" {
+  if (String(group?.onMissMode ?? "").trim() === "") {
+    return normalizeRuleMissMode(fallback);
+  }
+  return normalizeRuleMissMode(group?.onMissMode);
+}
+
+function resolveActiveRuleGroupOnMissMode(config: RuleConfigV2): "proxy" | "direct" {
+  const fallback = normalizeRuleMissMode(config.onMissMode);
+  const groups = config.groups ?? [];
+  if (groups.length === 0) {
+    return fallback;
+  }
+  let activeGroup = groups[0];
+  const activeGroupId = String(config.activeGroupId ?? "").trim();
+  if (activeGroupId !== "") {
+    activeGroup = groups.find((group) => group.id === activeGroupId) ?? activeGroup;
+  }
+  return resolveRuleGroupOnMissMode(activeGroup, fallback);
+}
+
+function buildPolicyGroupSelectorTag(policyId: string, index: number): string {
+  const fallbackTag = `policy-${index + 1}`;
+  const normalized = policyId.trim().toLowerCase() || fallbackTag;
+  const tag = normalized.replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || fallbackTag;
+  return `policy-pool-${tag}-${index + 1}`;
+}
+
+function resolveRegionalIndicatorCountry(value: string): string {
+  const runes = Array.from(value.trim());
+  for (let index = 0; index < runes.length - 1; index += 1) {
+    const first = runes[index] ?? "";
+    const second = runes[index + 1] ?? "";
+    const firstCode = first.codePointAt(0) ?? 0;
+    const secondCode = second.codePointAt(0) ?? 0;
+    if (
+      firstCode >= 0x1f1e6 &&
+      firstCode <= 0x1f1ff &&
+      secondCode >= 0x1f1e6 &&
+      secondCode <= 0x1f1ff
+    ) {
+      return String.fromCharCode(
+        65 + firstCode - 0x1f1e6,
+        65 + secondCode - 0x1f1e6,
+      );
+    }
+  }
+  return "";
+}
+
+function normalizeCountryValue(value: string): string {
+  const flagCode = resolveRegionalIndicatorCountry(value);
+  if (flagCode !== "") {
+    return flagCode;
+  }
+  const normalized = value
+    .trim()
+    .toLowerCase()
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ");
+  if (/^[a-z]{2}$/.test(normalized)) {
+    return normalized.toUpperCase();
+  }
+  if (normalized in countryAliases) {
+    return countryAliases[normalized] ?? "";
+  }
+  for (const [alias, code] of Object.entries(countryAliases)) {
+    if (normalized.includes(alias)) {
+      return code;
+    }
+  }
+  return "";
+}
+
+function normalizeRuleNodeRefType(rawType: string): string {
+  const normalized = rawType.trim().toLowerCase();
+  switch (normalized) {
+    case "序号":
+    case "index":
+    case "idx":
+    case "number":
+    case "no":
+      return "index";
+    case "国家":
+    case "country":
+    case "region":
+      return "country";
+    case "名称":
+    case "name":
+    case "node_name":
+      return "name";
+    case "id":
+    case "node":
+    case "nodeid":
+    case "节点":
+    case "节点id":
+      return "id";
+    default:
+      return normalized || "id";
+  }
+}
+
+function parseRuleNodeIndex(raw: string): number | null {
+  const value = raw.trim();
+  if (!/^\d+$/.test(value)) {
+    return null;
+  }
+  const index = Number.parseInt(value, 10);
+  return index > 0 ? index : null;
+}
+
+export function resolveNodePoolRefsToNodeIds(
+  refs: RuleNodeRef[] | undefined,
+  activeNodes: VpnNode[],
+): string[] {
+  if (activeNodes.length === 0) {
+    return [];
+  }
+  if ((refs ?? []).length === 0) {
+    return uniqueNonEmptyStrings(activeNodes.map((node) => node.id));
+  }
+  const result: string[] = [];
+  const seen = new Set<string>();
+  const appendNodeId = (nodeId: string) => {
+    const value = nodeId.trim();
+    if (value === "") {
+      return;
+    }
+    const key = value.toLowerCase();
+    if (seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    result.push(value);
+  };
+  for (const ref of refs ?? []) {
+    const refValue = String(ref.node ?? "").trim();
+    if (refValue === "") {
+      continue;
+    }
+    switch (normalizeRuleNodeRefType(String(ref.type ?? ""))) {
+      case "index": {
+        const index = parseRuleNodeIndex(refValue);
+        if (!index || index > activeNodes.length) {
+          continue;
+        }
+        appendNodeId(activeNodes[index - 1]?.id ?? "");
+        break;
+      }
+      case "country": {
+        const queryCountry = normalizeCountryValue(refValue);
+        const queryRaw = refValue.toLowerCase();
+        for (const node of activeNodes) {
+          const countrySource = node.country || node.region || node.name;
+          const country = normalizeCountryValue(countrySource);
+          if (queryCountry !== "") {
+            if (country === queryCountry) {
+              appendNodeId(node.id);
+            }
+            continue;
+          }
+          const nodeRaw = (node.country || node.region || node.name).trim().toLowerCase();
+          if (queryRaw !== "" && nodeRaw.includes(queryRaw)) {
+            appendNodeId(node.id);
+          }
+        }
+        break;
+      }
+      case "name": {
+        const queryName = refValue.toLowerCase();
+        if (queryName === "") {
+          continue;
+        }
+        for (const node of activeNodes) {
+          if (node.name.toLowerCase().includes(queryName)) {
+            appendNodeId(node.id);
+          }
+        }
+        break;
+      }
+      default:
+        for (const node of activeNodes) {
+          if (node.id.trim().toLowerCase() === refValue.toLowerCase()) {
+            appendNodeId(node.id);
+          }
+        }
+        break;
+    }
+  }
+  return result;
+}
+
+function resolveRulePoolFallbackOutboundTag(pool: RuleNodePool | undefined): string {
+  if (!pool) {
+    return "block";
+  }
+  return String(pool.fallbackMode ?? "").trim().toLowerCase() === "active_node"
+    ? proxySelectorTag
+    : "block";
+}
+
+function resolveRulePoolCandidateNodeIds(pool: RuleNodePool | undefined, activeNodes: VpnNode[]): string[] {
+  if (!pool) {
+    return [];
+  }
+  const resolvedByRefs = resolveNodePoolRefsToNodeIds(pool.nodes, activeNodes);
+  const availableNodeIds = uniqueNonEmptyStrings(pool.availableNodeIds ?? []);
+  if (availableNodeIds.length === 0) {
+    return resolvedByRefs;
+  }
+  if (resolvedByRefs.length === 0) {
+    return [];
+  }
+  const allowed = new Set(resolvedByRefs.map((item) => item.toLowerCase()));
+  const filtered: string[] = [];
+  const seen = new Set<string>();
+  for (const rawNodeId of availableNodeIds) {
+    const nodeId = rawNodeId.trim();
+    const key = nodeId.toLowerCase();
+    if (!allowed.has(key) || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    filtered.push(nodeId);
+  }
+  return filtered;
+}
+
+function isRulePoolNodeAvailableByProbe(node: VpnNode): boolean {
+  return (
+    Number(node.latencyMs ?? 0) > 0 &&
+    Number(node.probeRealConnectMs ?? 0) > 0 &&
+    Number(node.probeScore ?? 0) > 0
+  );
+}
+
+function pickFirstRulePoolNodeIdByProbe(
+  nodeIds: string[],
+  nodeById: Record<string, VpnNode>,
+): string {
+  for (const nodeId of nodeIds) {
+    const node = nodeById[nodeId];
+    if (node && isRulePoolNodeAvailableByProbe(node)) {
+      return nodeId;
+    }
+  }
+  return "";
+}
+
+function pickFirstRulePoolNodeIdByLatency(
+  nodeIds: string[],
+  nodeById: Record<string, VpnNode>,
+): string {
+  for (const nodeId of nodeIds) {
+    const node = nodeById[nodeId];
+    if (node && Number(node.latencyMs ?? 0) > 0) {
+      return nodeId;
+    }
+  }
+  return "";
+}
+
+function pickBestRulePoolNodeId(nodeIds: string[], nodeById: Record<string, VpnNode>): string {
+  let bestNodeId = "";
+  let bestLatency = 0;
+  for (const nodeId of nodeIds) {
+    const node = nodeById[nodeId];
+    const latency = Number(node?.latencyMs ?? 0);
+    if (!node || latency <= 0) {
+      continue;
+    }
+    if (bestNodeId === "" || latency < bestLatency) {
+      bestNodeId = nodeId;
+      bestLatency = latency;
+    }
+  }
+  return bestNodeId;
+}
+
+function resolveRulePoolDecision(
+  pool: RuleNodePool | undefined,
+  activeNodes: VpnNode[],
+  nodeById: Record<string, VpnNode>,
+): {
+  candidateNodeIds: string[];
+  selectedNodeId: string;
+  fallbackOutboundTag: string;
+} {
+  const decision = {
+    candidateNodeIds: [] as string[],
+    selectedNodeId: "",
+    fallbackOutboundTag: resolveRulePoolFallbackOutboundTag(pool),
+  };
+  if (!pool || pool.enabled === false) {
+    return decision;
+  }
+  const candidateNodeIds = resolveRulePoolCandidateNodeIds(pool, activeNodes);
+  decision.candidateNodeIds = candidateNodeIds;
+  if (candidateNodeIds.length === 0) {
+    return decision;
+  }
+  const hasAvailableNodeHints = uniqueNonEmptyStrings(pool.availableNodeIds ?? []).length > 0;
+  if (hasAvailableNodeHints) {
+    decision.selectedNodeId = pickFirstRulePoolNodeIdByProbe(candidateNodeIds, nodeById);
+    return decision;
+  }
+  if (String(pool.nodeSelectStrategy ?? "").trim().toLowerCase() === "first") {
+    decision.selectedNodeId = pickFirstRulePoolNodeIdByLatency(candidateNodeIds, nodeById);
+    return decision;
+  }
+  decision.selectedNodeId = pickBestRulePoolNodeId(candidateNodeIds, nodeById);
+  return decision;
+}
+
+function buildPolicyGroupRuntimeOutbounds(
+  config: RuleConfigV2,
+  activeNodes: VpnNode[],
+  nodeTagsById: Record<string, string>,
+  nodeById: Record<string, VpnNode>,
+): {
+  policyOutboundTag: Record<string, string>;
+  policyOutbounds: UnknownRecord[];
+  selectorSelections: MobileSelectorSwitchSelection[];
+} {
+  const policyOutboundTag: Record<string, string> = {
+    direct: "direct",
+    proxy: proxySelectorTag,
+    reject: "block",
+  };
+  const policyOutbounds: UnknownRecord[] = [];
+  const selectorSelections: MobileSelectorSwitchSelection[] = [];
+  for (const [index, group] of (config.policyGroups ?? []).entries()) {
+    switch (String(group.type ?? "").trim().toLowerCase()) {
+      case "builtin":
+        switch (String(group.builtin ?? "").trim().toLowerCase()) {
+          case "direct":
+            policyOutboundTag[group.id] = "direct";
+            break;
+          case "reject":
+            policyOutboundTag[group.id] = "block";
+            break;
+          default:
+            policyOutboundTag[group.id] = proxySelectorTag;
+            break;
+        }
+        break;
+      case "node_pool": {
+        if (!group.nodePool) {
+          policyOutboundTag[group.id] = proxySelectorTag;
+          break;
+        }
+        const decision = resolveRulePoolDecision(group.nodePool, activeNodes, nodeById);
+        const nodeTags: string[] = [];
+        const seenTags = new Set<string>();
+        for (const nodeId of decision.candidateNodeIds) {
+          const tag = nodeTagsById[nodeId];
+          if (!tag || seenTags.has(tag)) {
+            continue;
+          }
+          seenTags.add(tag);
+          nodeTags.push(tag);
+        }
+        const fallbackTag = decision.fallbackOutboundTag.trim() || "block";
+        let defaultTag = fallbackTag;
+        if (decision.selectedNodeId !== "") {
+          defaultTag = nodeTagsById[decision.selectedNodeId] ?? fallbackTag;
+        }
+        const selectorOutbounds = [...nodeTags];
+        if (!seenTags.has(fallbackTag)) {
+          selectorOutbounds.push(fallbackTag);
+        }
+        if (selectorOutbounds.length === 0) {
+          selectorOutbounds.push(fallbackTag);
+        }
+        const selectorTag = buildPolicyGroupSelectorTag(group.id, index);
+        policyOutboundTag[group.id] = selectorTag;
+        selectorSelections.push({
+          selectorTag,
+          outboundTag: defaultTag,
+        });
+        policyOutbounds.push({
+          type: "selector",
+          tag: selectorTag,
+          outbounds: selectorOutbounds,
+          default: defaultTag,
+          interrupt_exist_connections: true,
+        });
+        break;
+      }
+      default:
+        break;
+    }
+  }
+  return {
+    policyOutboundTag,
+    policyOutbounds,
+    selectorSelections,
+  };
+}
+
+function resolvePolicyOutboundTag(
+  policyId: string | undefined,
+  mapping: Record<string, string>,
+): string {
+  const value = String(policyId ?? "").trim();
+  if (value === "") {
+    return "";
+  }
+  if (value in mapping) {
+    return mapping[value] ?? "";
+  }
+  switch (value.toLowerCase()) {
+    case "direct":
+      return "direct";
+    case "reject":
+    case "block":
+      return "block";
+    default:
+      return proxySelectorTag;
+  }
+}
+
+function normalizeGeoRuleSetValue(rawValue: string): string {
+  const value = rawValue.trim().toLowerCase();
+  if (value === "") {
+    return "";
+  }
+  const normalized = value
+    .replace(/[^a-z0-9\-_.!@]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .replace(/_/g, "-");
+  return normalized;
+}
+
+function buildGeoRuleSetRefs(
+  match: RuleMatchV2,
+  generatedRuleSets: Record<string, UnknownRecord>,
+  resolverContext: MobileResolverContext = {},
+): {
+  ruleSetRefs: string[];
+  matchPrivateIp: boolean;
+} {
+  const ruleSetRefs: string[] = [];
+  let matchPrivateIp = false;
+  const appendGeoRefs = (values: string[] | undefined, kind: "geoip" | "geosite") => {
+    for (const rawValue of values ?? []) {
+      const value = normalizeGeoRuleSetValue(rawValue);
+      if (value === "") {
+        continue;
+      }
+      if (kind === "geoip" && value === "private") {
+        matchPrivateIp = true;
+        continue;
+      }
+      const tag = `wateray-${kind}-${value}`;
+      if (!generatedRuleSets[tag]) {
+        const localPath = String(resolverContext.builtInRuleSetPaths?.[tag] ?? "").trim();
+        generatedRuleSets[tag] = localPath
+          ? {
+              tag,
+              type: "local",
+              format: "binary",
+              path: localPath,
+            }
+          : {
+              tag,
+              type: "remote",
+              format: "binary",
+              url: (kind === "geoip" ? geoIPRuleSetURLTemplate : geoSiteRuleSetURLTemplate).replace("%s", value),
+              download_detour: "direct",
+              update_interval: defaultRuleSetUpdateInterval,
+            };
+      }
+      ruleSetRefs.push(tag);
+    }
+  };
+  appendGeoRefs(match.geoip, "geoip");
+  appendGeoRefs(match.geosite, "geosite");
+  return {
+    ruleSetRefs: uniqueNonEmptyStrings(ruleSetRefs),
+    matchPrivateIp,
+  };
+}
+
+function buildRouteRuleSetDefinitions(config: RuleConfigV2): UnknownRecord[] {
+  const definitions: UnknownRecord[] = [];
+  const seen = new Set<string>();
+  for (const provider of config.providers?.ruleSets ?? []) {
+    const tag = String(provider.id ?? "").trim();
+    if (tag === "") {
+      continue;
+    }
+    const key = tag.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    const entry: UnknownRecord = {
+      tag,
+      format: String(provider.format ?? "").trim() || "source",
+    };
+    const behavior = String(provider.behavior ?? "").trim();
+    if (behavior !== "") {
+      entry.behavior = behavior;
+    }
+    const sourceType = String(provider.source?.type ?? "").trim().toLowerCase();
+    if (sourceType === "local") {
+      const path = String(provider.source?.path ?? "").trim();
+      if (path === "") {
+        continue;
+      }
+      entry.type = "local";
+      entry.path = path;
+      definitions.push(entry);
+      continue;
+    }
+    const url = String(provider.source?.url ?? "").trim();
+    if (url === "") {
+      continue;
+    }
+    entry.type = "remote";
+    entry.url = url;
+    entry.download_detour = "direct";
+    entry.update_interval = Number(provider.updateIntervalSec ?? 0) > 0
+      ? `${Math.trunc(Number(provider.updateIntervalSec ?? 0))}s`
+      : defaultRuleSetUpdateInterval;
+    definitions.push(entry);
+  }
+  return definitions;
+}
+
+function mergeRouteRuleSetDefinitions(
+  base: UnknownRecord[],
+  extra: UnknownRecord[],
+): UnknownRecord[] {
+  if (base.length === 0) {
+    return [...extra];
+  }
+  if (extra.length === 0) {
+    return [...base];
+  }
+  const merged = [...base];
+  const seen = new Set<string>();
+  for (const item of base) {
+    const tag = String(item.tag ?? "").trim().toLowerCase();
+    if (tag !== "") {
+      seen.add(tag);
+    }
+  }
+  for (const item of extra) {
+    const tag = String(item.tag ?? "").trim().toLowerCase();
+    if (tag === "" || seen.has(tag)) {
+      continue;
+    }
+    seen.add(tag);
+    merged.push(item);
+  }
+  return merged;
+}
+
+function convertRuleSetDefinitionMapToList(
+  definitions: Record<string, UnknownRecord>,
+): UnknownRecord[] {
+  return Object.keys(definitions)
+    .sort()
+    .map((tag) => definitions[tag])
+    .filter((item): item is UnknownRecord => Boolean(item));
+}
+
+function compileRuleMatchV2(
+  match: RuleMatchV2,
+  outboundTag: string,
+  generatedRuleSets: Record<string, UnknownRecord>,
+  resolverContext: MobileResolverContext = {},
+): UnknownRecord | null {
+  if (outboundTag.trim() === "") {
+    return null;
+  }
+  const rule: UnknownRecord = {
+    action: "route",
+    outbound: outboundTag,
+  };
+  const domain = uniqueNonEmptyStrings(match.domain?.exact);
+  if (domain.length > 0) {
+    rule.domain = domain;
+  }
+  const domainSuffix = uniqueNonEmptyStrings(match.domain?.suffix);
+  if (domainSuffix.length > 0) {
+    rule.domain_suffix = domainSuffix;
+  }
+  const domainKeyword = uniqueNonEmptyStrings(match.domain?.keyword);
+  if (domainKeyword.length > 0) {
+    rule.domain_keyword = domainKeyword;
+  }
+  const domainRegex = uniqueNonEmptyStrings(match.domain?.regex);
+  if (domainRegex.length > 0) {
+    rule.domain_regex = domainRegex;
+  }
+  const ipCIDR = normalizeIPCIDRPatterns(match.ipCidr);
+  if (ipCIDR.length > 0) {
+    rule.ip_cidr = ipCIDR;
+  }
+  let ruleSetRefs = uniqueNonEmptyStrings(match.ruleSetRefs);
+  const geoRuleSets = buildGeoRuleSetRefs(match, generatedRuleSets, resolverContext);
+  if (geoRuleSets.matchPrivateIp) {
+    rule.ip_is_private = true;
+  }
+  if (geoRuleSets.ruleSetRefs.length > 0) {
+    ruleSetRefs = uniqueNonEmptyStrings([...ruleSetRefs, ...geoRuleSets.ruleSetRefs]);
+  }
+  if (ruleSetRefs.length > 0) {
+    rule.rule_set = ruleSetRefs;
+  }
+  // Android 端不沿用桌面进程路径匹配，避免平台能力差异导致规则编译失真。
+  if (Object.keys(rule).length <= 2) {
+    return null;
+  }
+  return rule;
+}
+
+function buildTrafficRuleRuntime(
+  config: RuleConfigV2,
+  activeNodes: VpnNode[],
+  nodeTagsById: Record<string, string>,
+  nodeById: Record<string, VpnNode>,
+  resolverContext: MobileResolverContext = {},
+): {
+  routeRules: UnknownRecord[];
+  policyOutbounds: UnknownRecord[];
+  selectorSelections: MobileSelectorSwitchSelection[];
+  finalOutbound: string;
+  generatedRuleSetDefinitions: UnknownRecord[];
+} {
+  const { policyOutboundTag, policyOutbounds, selectorSelections } = buildPolicyGroupRuntimeOutbounds(
+    config,
+    activeNodes,
+    nodeTagsById,
+    nodeById,
+  );
+  const defaultMatchPolicy = "proxy";
+  const defaultMissPolicy = resolveActiveRuleGroupOnMissMode(config) === "proxy" ? "proxy" : "direct";
+  let matchOutbound = resolvePolicyOutboundTag(defaultMatchPolicy, policyOutboundTag);
+  if (matchOutbound.trim() === "") {
+    matchOutbound = proxySelectorTag;
+  }
+  let finalOutbound = resolvePolicyOutboundTag(defaultMissPolicy, policyOutboundTag);
+  if (finalOutbound.trim() === "") {
+    finalOutbound = "direct";
+  }
+  const routeRules: UnknownRecord[] = [];
+  const generatedRuleSets: Record<string, UnknownRecord> = {};
+  for (const item of config.rules ?? []) {
+    if (!item.enabled) {
+      continue;
+    }
+    const actionType = String(item.action?.type ?? "").trim().toLowerCase();
+    let outboundTag = matchOutbound;
+    switch (actionType) {
+      case "reject":
+        outboundTag = "block";
+        break;
+      case "route": {
+        const policyId = String(item.action?.targetPolicy ?? "").trim() || defaultMatchPolicy;
+        const resolvedOutbound = resolvePolicyOutboundTag(policyId, policyOutboundTag);
+        if (resolvedOutbound.trim() !== "") {
+          outboundTag = resolvedOutbound;
+        }
+        break;
+      }
+      default:
+        break;
+    }
+    const compiledRule = compileRuleMatchV2(
+      item.match,
+      outboundTag,
+      generatedRuleSets,
+      resolverContext,
+    );
+    if (compiledRule) {
+      routeRules.push(compiledRule);
+    }
+  }
+  return {
+    routeRules,
+    policyOutbounds,
+    selectorSelections,
+    finalOutbound,
+    generatedRuleSetDefinitions: convertRuleSetDefinitionMapToList(generatedRuleSets),
+  };
+}
+
+export function buildMobileSelectorSelections(
+  snapshot: DaemonSnapshot,
+  options: {
+    includeProxySelector?: boolean;
+  } = {},
+): MobileSelectorSwitchSelection[] {
+  const runtimeNodes = resolveMobileRuntimeNodes(snapshot);
+  const trafficRuntime = buildTrafficRuleRuntime(
+    snapshot.ruleConfigV2,
+    runtimeNodes.supportedNodes,
+    runtimeNodes.nodeTagsById,
+    runtimeNodes.nodeById,
+    {},
+  );
+  const selections = [...trafficRuntime.selectorSelections];
+  if (options.includeProxySelector !== false) {
+    selections.unshift({
+      selectorTag: proxySelectorTag,
+      outboundTag: runtimeNodes.selectedTag,
+    });
+  }
+  return selections.filter(
+    (item) => item.selectorTag.trim() !== "" && item.outboundTag.trim() !== "",
   );
 }
 
@@ -587,6 +1482,64 @@ function resolveSelectedNode(snapshot: DaemonSnapshot, group: NodeGroup): VpnNod
   return group.nodes.find((node) => node.id === snapshot.selectedNodeId) ?? group.nodes[0] ?? null;
 }
 
+function resolveMobileRuntimeNodes(snapshot: DaemonSnapshot): {
+  group: NodeGroup;
+  selectedNode: VpnNode;
+  selectedTag: string;
+  nodeOutbounds: UnknownRecord[];
+  nodeTags: string[];
+  supportedNodes: VpnNode[];
+  nodeTagsById: Record<string, string>;
+  nodeById: Record<string, VpnNode>;
+} {
+  const group = resolveActiveGroup(snapshot);
+  if (!group || group.nodes.length === 0) {
+    throw new Error("当前没有可用节点，无法启动移动端代理");
+  }
+  const selectedNode = resolveSelectedNode(snapshot, group);
+  if (!selectedNode) {
+    throw new Error("当前没有可用节点，无法启动移动端代理");
+  }
+
+  const nodeOutbounds: UnknownRecord[] = [];
+  const nodeTags: string[] = [];
+  const supportedNodes: VpnNode[] = [];
+  const nodeTagsById: Record<string, string> = {};
+  for (const node of group.nodes) {
+    const tag = runtimeNodeTag(node.id);
+    try {
+      nodeOutbounds.push(buildNodeOutbound(node, tag));
+      nodeTags.push(tag);
+      supportedNodes.push(node);
+      nodeTagsById[node.id] = tag;
+    } catch (error) {
+      if (node.id === selectedNode.id) {
+        throw error;
+      }
+    }
+  }
+  const selectedTag = runtimeNodeTag(selectedNode.id);
+  if (!nodeTags.includes(selectedTag)) {
+    throw new Error(`当前选中节点 ${selectedNode.name} 暂不支持移动端启动`);
+  }
+
+  const nodeById: Record<string, VpnNode> = {};
+  for (const node of supportedNodes) {
+    nodeById[node.id] = node;
+  }
+
+  return {
+    group,
+    selectedNode,
+    selectedTag,
+    nodeOutbounds,
+    nodeTags,
+    supportedNodes,
+    nodeTagsById,
+    nodeById,
+  };
+}
+
 function resolveDnsServerTag(server: string | undefined, fakeipEnabled = true): string {
   switch (String(server ?? "").trim().toLowerCase()) {
     case "direct":
@@ -707,6 +1660,10 @@ function buildDnsConfig(
 ): UnknownRecord {
   const dnsConfig = deepClone(snapshot.dns ?? defaultDnsConfig);
   const fakeipEnabled = options?.fakeipEnabled ?? (dnsConfig.fakeip?.enabled ?? false);
+  const customHostsEntries =
+    dnsConfig.hosts?.useCustomHosts === true
+      ? buildCustomDnsHostsEntries(dnsConfig.hosts.customHosts)
+      : {};
   const servers: UnknownRecord[] = [
     { type: "local", tag: localDnsServerTag },
     buildStructuredDnsServer(
@@ -734,6 +1691,18 @@ function buildDnsConfig(
   const rules = (dnsConfig.rules ?? [])
     .map((item) => buildStructuredDnsRule(item, fakeipEnabled))
     .filter((item): item is UnknownRecord => Boolean(item));
+  if (Object.keys(customHostsEntries).length > 0) {
+    servers.push({
+      type: "hosts",
+      tag: dnsHostsOverrideServerTag,
+      predefined: customHostsEntries,
+    });
+    rules.unshift({
+      domain: Object.keys(customHostsEntries).sort(),
+      action: "route",
+      server: dnsHostsOverrideServerTag,
+    });
+  }
   const dns: UnknownRecord = {
     servers,
     rules,
@@ -760,6 +1729,40 @@ function buildDnsConfig(
     });
   }
   return dns;
+}
+
+function resolveMobileDnsCacheFilePath(resolverContext: MobileResolverContext): string {
+  const rawPath = resolverContext.dnsCacheFilePath?.trim();
+  if (rawPath) {
+    return rawPath;
+  }
+  return defaultMobileDnsCacheFilePath;
+}
+
+function buildExperimentalConfig(
+  snapshot: DaemonSnapshot,
+  resolverContext: MobileResolverContext,
+  options?: {
+    fakeipEnabled?: boolean;
+  },
+): UnknownRecord {
+  const dnsConfig = deepClone(snapshot.dns ?? defaultDnsConfig);
+  const experimental: UnknownRecord = {
+    clash_api: {
+      external_controller: defaultMobileClashAPIController,
+      default_mode: "Rule",
+    },
+  };
+  if (dnsConfig.cache?.fileEnabled === true) {
+    experimental.cache_file = {
+      enabled: true,
+      path: resolveMobileDnsCacheFilePath(resolverContext),
+      store_rdrc: dnsConfig.cache.storeRDRC === true,
+      store_fakeip: options?.fakeipEnabled === true,
+      rdrc_timeout: defaultMobileDnsCacheRDRCTimeout,
+    };
+  }
+  return experimental;
 }
 
 function normalizeSniffTimeoutMs(value: number | undefined): string {
@@ -800,8 +1803,23 @@ function buildFakeipRouteRule(snapshot: DaemonSnapshot, targetMode: ProxyMode): 
   };
 }
 
-function buildRuntimeRouteRules(snapshot: DaemonSnapshot, targetMode: ProxyMode): UnknownRecord[] {
-  const rules: UnknownRecord[] = [];
+function buildRuntimeRouteRules(
+  snapshot: DaemonSnapshot,
+  targetMode: ProxyMode,
+  userRouteRules: UnknownRecord[] = [],
+): UnknownRecord[] {
+  const rules: UnknownRecord[] = [
+    {
+      inbound: [dnsHealthProxyInboundTag],
+      action: "route",
+      outbound: proxySelectorTag,
+    },
+    {
+      inbound: [dnsHealthDirectInboundTag],
+      action: "route",
+      outbound: dnsDirectOutboundTag,
+    },
+  ];
   if (targetMode === "tun") {
     if (snapshot.sniffEnabled) {
       rules.push({
@@ -821,6 +1839,7 @@ function buildRuntimeRouteRules(snapshot: DaemonSnapshot, targetMode: ProxyMode)
     rules.push(fakeipRouteRule);
   }
   rules.push({ ip_is_private: true, action: "route", outbound: "direct" });
+  rules.push(...userRouteRules);
   return rules;
 }
 
@@ -831,16 +1850,21 @@ function buildProbeRouteRules(): UnknownRecord[] {
 }
 
 function buildTunInbound(snapshot: DaemonSnapshot): UnknownRecord {
-  return {
+  const inbound: UnknownRecord = {
     type: "tun",
     tag: "tun-in",
     interface_name: defaultTunInterfaceName,
     address: ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
     auto_route: true,
-    strict_route: true,
     mtu: normalizeTunMtu(snapshot.tunMtu),
     stack: normalizeTunStack(snapshot.tunStack),
   };
+  if (snapshot.sniffEnabled) {
+    inbound.sniff = true;
+    inbound.sniff_timeout = normalizeSniffTimeoutMs(snapshot.sniffTimeoutMs);
+    inbound.sniff_override_destination = snapshot.sniffOverrideDestination === true;
+  }
+  return inbound;
 }
 
 function normalizeLocalMixedListenPort(value: number | undefined): number {
@@ -855,11 +1879,26 @@ function resolveLocalMixedListenAddress(snapshot: DaemonSnapshot): string {
 }
 
 function buildMixedInbound(snapshot: DaemonSnapshot): UnknownRecord {
-  return {
+  const inbound: UnknownRecord = {
     type: "mixed",
     tag: "mixed-in",
     listen: resolveLocalMixedListenAddress(snapshot),
     listen_port: normalizeLocalMixedListenPort(snapshot.localProxyPort),
+  };
+  if (snapshot.sniffEnabled) {
+    inbound.sniff = true;
+    inbound.sniff_timeout = normalizeSniffTimeoutMs(snapshot.sniffTimeoutMs);
+    inbound.sniff_override_destination = snapshot.sniffOverrideDestination === true;
+  }
+  return inbound;
+}
+
+function buildSocksInbound(tag: string, port: number): UnknownRecord {
+  return {
+    type: "socks",
+    tag,
+    listen: defaultProbeSocksListenAddress,
+    listen_port: port,
   };
 }
 
@@ -891,56 +1930,46 @@ export function buildMobileRuntimeConfig(
   profileName: string;
   selectedNodeId: string;
 } {
-  const group = resolveActiveGroup(snapshot);
-  if (!group || group.nodes.length === 0) {
-    throw new Error("当前没有可用节点，无法启动移动端代理");
-  }
-  const selectedNode = resolveSelectedNode(snapshot, group);
-  if (!selectedNode) {
-    throw new Error("当前没有可用节点，无法启动移动端代理");
-  }
-
-  const nodeOutbounds: UnknownRecord[] = [];
-  const nodeTags: string[] = [];
-  for (const node of group.nodes) {
-    const tag = runtimeNodeTag(node.id);
-    try {
-      nodeOutbounds.push(buildNodeOutbound(node, tag));
-      nodeTags.push(tag);
-    } catch (error) {
-      if (node.id === selectedNode.id) {
-        throw error;
-      }
-    }
-  }
-  const selectedTag = runtimeNodeTag(selectedNode.id);
-  if (!nodeTags.includes(selectedTag)) {
-    throw new Error(`当前选中节点 ${selectedNode.name} 暂不支持移动端启动`);
-  }
+  const runtimeNodes = resolveMobileRuntimeNodes(snapshot);
+  const trafficRuntime = buildTrafficRuleRuntime(
+    snapshot.ruleConfigV2,
+    runtimeNodes.supportedNodes,
+    runtimeNodes.nodeTagsById,
+    runtimeNodes.nodeById,
+    resolverContext,
+  );
+  const mergedRuleSetDefinitions = mergeRouteRuleSetDefinitions(
+    buildRouteRuleSetDefinitions(snapshot.ruleConfigV2),
+    trafficRuntime.generatedRuleSetDefinitions,
+  );
+  const fakeipEnabled =
+    targetMode === "tun" &&
+    ((snapshot.dns?.fakeip?.enabled ?? defaultDnsConfig.fakeip.enabled) === true);
 
   const outbounds: UnknownRecord[] = [];
   outbounds.push({
     type: "selector",
     tag: proxySelectorTag,
-    outbounds: [proxyUrlTestTag, ...nodeTags, "direct"],
-    default: selectedTag,
+    outbounds: [proxyUrlTestTag, ...runtimeNodes.nodeTags, "direct"],
+    default: runtimeNodes.selectedTag,
     interrupt_exist_connections: true,
   });
-  outbounds.push(...nodeOutbounds);
-  outbounds.push({
-    type: "direct",
-    tag: dnsDirectOutboundTag,
-    connect_timeout: "5s",
-  });
+  outbounds.push(...runtimeNodes.nodeOutbounds);
   outbounds.push({
     type: "urltest",
     tag: proxyUrlTestTag,
-    outbounds: [...nodeTags],
+    outbounds: [...runtimeNodes.nodeTags],
     url: defaultUrlTestProbeUrl,
     interval: defaultUrlTestInterval,
     tolerance: defaultUrlTestToleranceMs,
     idle_timeout: defaultUrlTestIdleTimeout,
     interrupt_exist_connections: true,
+  });
+  outbounds.push(...trafficRuntime.policyOutbounds);
+  outbounds.push({
+    type: "direct",
+    tag: dnsDirectOutboundTag,
+    connect_timeout: "5s",
   });
   outbounds.push({ type: "direct", tag: "direct" }, { type: "block", tag: "block" });
 
@@ -949,28 +1978,37 @@ export function buildMobileRuntimeConfig(
       level: toSingboxLogLevel(snapshot.proxyLogLevel),
       timestamp: true,
     },
-    inbounds: targetMode === "system"
-      ? [buildMixedInbound(snapshot)]
-      : [buildTunInbound(snapshot), buildMixedInbound(snapshot)],
+    inbounds: [
+      ...(targetMode === "system" ? [] : [buildTunInbound(snapshot)]),
+      buildMixedInbound(snapshot),
+      buildSocksInbound(dnsHealthProxyInboundTag, defaultMobileDnsHealthProxySocksPort),
+      buildSocksInbound(dnsHealthDirectInboundTag, defaultMobileDnsHealthDirectSocksPort),
+    ],
     outbounds,
     dns: buildDnsConfig(snapshot, proxySelectorTag, resolverContext, {
-      fakeipEnabled:
-        targetMode === "tun" &&
-        ((snapshot.dns?.fakeip?.enabled ?? defaultDnsConfig.fakeip.enabled) === true),
+      fakeipEnabled,
+    }),
+    experimental: buildExperimentalConfig(snapshot, resolverContext, {
+      fakeipEnabled,
     }),
     route: {
-      rules: buildRuntimeRouteRules(snapshot, targetMode),
-      final: proxySelectorTag,
+      rules: buildRuntimeRouteRules(snapshot, targetMode, trafficRuntime.routeRules),
+      final: trafficRuntime.finalOutbound || proxySelectorTag,
       default_domain_resolver: bootstrapDnsServerTag,
       auto_detect_interface: targetMode === "tun",
       override_android_vpn: targetMode === "tun",
+      ...(mergedRuleSetDefinitions.length > 0
+        ? {
+            rule_set: mergedRuleSetDefinitions,
+          }
+        : {}),
     },
   };
 
   return {
     configJson: JSON.stringify(config),
-    profileName: `${group.name || "移动代理"} · ${selectedNode.name}${targetMode === "system" ? " · 本地代理" : ""}`,
-    selectedNodeId: selectedNode.id,
+    profileName: `${runtimeNodes.group.name || "移动代理"} · ${runtimeNodes.selectedNode.name}`,
+    selectedNodeId: runtimeNodes.selectedNode.id,
   };
 }
 

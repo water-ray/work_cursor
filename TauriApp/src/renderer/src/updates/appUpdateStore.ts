@@ -1,4 +1,5 @@
 import type { AppUpdateState } from "./types";
+import { getPlatformAdapter } from "../platform/runtimeStore";
 
 type Listener = () => void;
 
@@ -39,7 +40,7 @@ function applyState(next: AppUpdateState): AppUpdateState {
 }
 
 async function refreshState(): Promise<AppUpdateState> {
-  const next = await window.waterayDesktop.updates.getState();
+  const next = await getPlatformAdapter().updates.getState();
   return applyState(next);
 }
 
@@ -51,7 +52,7 @@ async function ensureStarted(): Promise<void> {
     return startPromise;
   }
   startPromise = (async () => {
-    stopListener = window.waterayDesktop.updates.onStateChanged((next) => {
+    stopListener = getPlatformAdapter().updates.onStateChanged((next) => {
       applyState(next);
     });
     await refreshState();
@@ -89,22 +90,22 @@ export const appUpdateStore = {
   },
   async check(): Promise<AppUpdateState> {
     await ensureStarted();
-    const next = await window.waterayDesktop.updates.check();
+    const next = await getPlatformAdapter().updates.check();
     return applyState(next);
   },
   async download(): Promise<AppUpdateState> {
     await ensureStarted();
-    const next = await window.waterayDesktop.updates.download();
+    const next = await getPlatformAdapter().updates.download();
     return applyState(next);
   },
   async install(): Promise<AppUpdateState> {
     await ensureStarted();
-    const next = await window.waterayDesktop.updates.install();
+    const next = await getPlatformAdapter().updates.install();
     return applyState(next);
   },
   async cancel(): Promise<AppUpdateState> {
     await ensureStarted();
-    const next = await window.waterayDesktop.updates.cancel();
+    const next = await getPlatformAdapter().updates.cancel();
     return applyState(next);
   },
 };

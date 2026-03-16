@@ -23,6 +23,7 @@ import {
   finishSharedServiceAction,
   useSharedServiceActionState,
 } from "../../services/sharedServiceAction";
+import { getPlatformAdapter } from "../../platform/runtimeStore";
 
 interface WindowTitleBarProps {
   title: string;
@@ -134,6 +135,7 @@ export function WindowTitleBar({
   taskCenterHasUnread,
   onTaskCenterToggle,
 }: WindowTitleBarProps) {
+  const platformAdapter = getPlatformAdapter();
   const notice = useAppNotice();
   const noticeHistory = useAppNoticeHistory();
   const sharedServiceAction = useSharedServiceActionState();
@@ -256,12 +258,12 @@ export function WindowTitleBar({
 
   useEffect(() => {
     let active = true;
-    void window.waterayDesktop.window.isMaximized().then((value) => {
+    void platformAdapter.window.isMaximized().then((value) => {
       if (active) {
         setMaximized(value);
       }
     });
-    const dispose = window.waterayDesktop.window.onMaximizedChanged((value) => {
+    const dispose = platformAdapter.window.onMaximizedChanged((value) => {
       setMaximized(value);
     });
     return () => {
@@ -272,7 +274,7 @@ export function WindowTitleBar({
 
   useEffect(() => {
     let active = true;
-    void window.waterayDesktop.window
+    void platformAdapter.window
       .getAppIconDataUrl()
       .then((value) => {
         if (active) {
@@ -304,16 +306,16 @@ export function WindowTitleBar({
     try {
       switch (behavior) {
         case "minimize_to_tray":
-          await window.waterayDesktop.window.minimizeToTray();
+          await platformAdapter.window.minimizeToTray();
           break;
         case "close_panel_keep_core":
-          await window.waterayDesktop.window.closePanelKeepCore();
+          await platformAdapter.window.closePanelKeepCore();
           break;
         case "exit_all":
-          await window.waterayDesktop.window.quitAll();
+          await platformAdapter.window.quitAll();
           break;
         default:
-          await window.waterayDesktop.window.closePanelKeepCore();
+          await platformAdapter.window.closePanelKeepCore();
           break;
       }
     } finally {
@@ -401,7 +403,7 @@ export function WindowTitleBar({
     }
     setQuittingAll(true);
     try {
-      await window.waterayDesktop.window.quitAll();
+      await platformAdapter.window.quitAll();
     } catch (error) {
       notice.error(error instanceof Error ? error.message : "完全退出失败");
     } finally {
@@ -445,13 +447,13 @@ export function WindowTitleBar({
   };
 
   const handleMinimizeClick = () => {
-    void window.waterayDesktop.window.minimize().catch((error) => {
+    void platformAdapter.window.minimize().catch((error) => {
       notice.error(formatWindowActionError(error, "窗口最小化失败"));
     });
   };
 
   const handleToggleMaximizeClick = () => {
-    void window.waterayDesktop.window
+    void platformAdapter.window
       .toggleMaximize()
       .then((value) => {
         setMaximized(value);

@@ -12,10 +12,13 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+ROOT_DIR = Path(__file__).resolve().parents[2]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 from scripts.build.common.build_manifest import DESKTOP_BUILD_MANIFEST_NAME
 
 
-ROOT_DIR = Path(__file__).resolve().parents[2]
 CORE_DIR = ROOT_DIR / "core"
 TAURI_DIR = ROOT_DIR / "TauriApp"
 VERSION_PATH = ROOT_DIR / "VERSION"

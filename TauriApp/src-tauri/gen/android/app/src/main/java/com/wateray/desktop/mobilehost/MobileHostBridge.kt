@@ -34,22 +34,45 @@ data class CheckConfigResult(
   val status: MobileHostStatus,
 )
 
+data class SwitchSelectorsResult(
+  val appliedCount: Int,
+  val status: MobileHostStatus,
+)
+
 object MobileHostBridge {
   private val lock = Any()
   private var status = MobileHostStatus()
-  private var emitter: ((MobileHostStatus) -> Unit)? = null
+  private var statusEmitter: ((MobileHostStatus) -> Unit)? = null
+  private var taskQueueEmitter: ((MobileTaskQueueResult) -> Unit)? = null
+  private var probeResultPatchEmitter: ((MobileProbeResultPatchPayload) -> Unit)? = null
 
-  fun attachEmitter(listener: (MobileHostStatus) -> Unit) {
+  fun attachStatusEmitter(listener: (MobileHostStatus) -> Unit) {
     val snapshot = synchronized(lock) {
-      emitter = listener
+      statusEmitter = listener
       status.copy()
     }
     listener(snapshot)
   }
 
-  fun clearEmitter() {
+  fun attachTaskQueueEmitter(listener: (MobileTaskQueueResult) -> Unit) {
     synchronized(lock) {
-      emitter = null
+      taskQueueEmitter = listener
+    }
+    val snapshot = MobileTaskCenter.queueSnapshot()
+    listener(snapshot)
+  }
+
+  fun attachProbeResultEmitter(listener: (MobileProbeResultPatchPayload) -> Unit) {
+    synchronized(lock) {
+      probeResultPatchEmitter = listener
+    }
+  }
+
+  fun clearEmitters() {
+    synchronized(lock) {
+      statusEmitter = null
+      taskQueueEmitter = null
+      probeResultPatchEmitter = null
     }
   }
 
@@ -162,10 +185,20 @@ object MobileHostBridge {
     synchronized(lock) {
       next = transform(status).copy(updatedAtMs = System.currentTimeMillis())
       status = next
-      listener = emitter
+      listener = statusEmitter
     }
     listener?.invoke(next)
     return next
+  }
+
+  fun emitTaskQueueChanged(snapshot: MobileTaskQueueResult) {
+    val listener = synchronized(lock) { taskQueueEmitter }
+    listener?.invoke(snapshot)
+  }
+
+  fun emitProbeResultPatch(payload: MobileProbeResultPatchPayload) {
+    val listener = synchronized(lock) { probeResultPatchEmitter }
+    listener?.invoke(payload)
   }
 
   private fun digestConfig(configJson: String): String {

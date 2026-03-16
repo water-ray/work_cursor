@@ -14,12 +14,13 @@ import type {
   DaemonResponsePayload,
   TransportStatus,
 } from "@shared/daemon";
+import type { PlatformUpdateState, WaterayPlatformAdapter } from "../platform/adapterTypes";
 
 import { abortPendingDaemonRequests } from "./daemonClient";
 import { daemonTransportManager } from "./daemonTransportManager";
 import { destroyTray, ensureTray, restoreMainWindow } from "./tray";
 
-type WaterayDesktopApi = Window["waterayDesktop"];
+type WaterayDesktopApi = WaterayPlatformAdapter;
 type MaximizedChangeListener = WaterayDesktopApi["window"]["onMaximizedChanged"] extends (
   listener: infer T,
 ) => () => void
@@ -32,6 +33,7 @@ type AppUpdateStateChangeListener = WaterayDesktopApi["updates"]["onStateChanged
   : never;
 
 type DesktopWindow = Window & {
+  __waterayDesktopAdapter?: WaterayPlatformAdapter;
   __waterayDesktopInstalled?: boolean;
   __waterayDesktopUnloadBound?: boolean;
 };
@@ -143,15 +145,12 @@ function createAppUpdateStateChangeListener(
   listener: AppUpdateStateChangeListener,
 ): () => void {
   let disposed = false;
-  const unlistenPromise = listen<Awaited<ReturnType<WaterayDesktopApi["updates"]["getState"]>>>(
-    appUpdateStateEventName,
-    (event) => {
-      if (disposed || !event.payload) {
-        return;
-      }
-      listener(event.payload);
-    },
-  );
+  const unlistenPromise = listen<PlatformUpdateState>(appUpdateStateEventName, (event) => {
+    if (disposed || !event.payload) {
+      return;
+    }
+    listener(event.payload);
+  });
   return () => {
     disposed = true;
     void unlistenPromise.then((unlisten) => {
@@ -274,15 +273,12 @@ function createDesktopApi(): WaterayDesktopApi {
   };
 }
 
-export async function installWaterayDesktop(): Promise<void> {
+export async function installWaterayDesktop(): Promise<WaterayPlatformAdapter> {
   const desktopWindow = window as DesktopWindow;
+  const desktopApi = desktopWindow.__waterayDesktopAdapter ?? createDesktopApi();
+  desktopWindow.__waterayDesktopAdapter = desktopApi;
 
   if (!desktopWindow.__waterayDesktopInstalled) {
-    const desktopApi = createDesktopApi();
-    Object.defineProperty(window, "waterayDesktop", {
-      configurable: true,
-      value: desktopApi,
-    });
     desktopWindow.__waterayDesktopInstalled = true;
   }
 
@@ -317,10 +313,13 @@ export async function installWaterayDesktop(): Promise<void> {
     import.meta.hot.dispose(() => {
       daemonTransportManager.stop();
       void destroyTray();
+      desktopWindow.__waterayDesktopAdapter = undefined;
       desktopWindow.__waterayDesktopInstalled = false;
       desktopWindow.__waterayDesktopUnloadBound = false;
     });
   }
+
+  return desktopApi;
 }
 
 export { restoreMainWindow };

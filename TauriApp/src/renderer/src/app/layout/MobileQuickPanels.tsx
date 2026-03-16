@@ -10,8 +10,8 @@ import { useAppNoticeHistory } from "../../components/notify/AppNoticeProvider";
 import { TaskCenterPanel } from "../../components/task/TaskCenterPanel";
 
 const mobileQuickPanelsPositionStorageKey = "wateray.mobile.quick.panels.position";
-const mobileQuickPanelsWidth = 98;
-const mobileQuickPanelsHeight = 44;
+const mobileQuickPanelsWidth = 44;
+const mobileQuickPanelsHeight = 76;
 const mobileQuickPanelsPadding = 8;
 const mobileQuickPanelsDragThresholdPx = 6;
 
@@ -35,19 +35,37 @@ interface FloatingPosition {
   y: number;
 }
 
+function defaultFloatingPosition(): FloatingPosition {
+  if (typeof window === "undefined") {
+    return { x: 12, y: 120 };
+  }
+  const maxX = Math.max(
+    mobileQuickPanelsPadding,
+    window.innerWidth - mobileQuickPanelsWidth - mobileQuickPanelsPadding,
+  );
+  const maxY = Math.max(
+    mobileQuickPanelsPadding,
+    window.innerHeight - mobileQuickPanelsHeight - mobileQuickPanelsPadding,
+  );
+  return {
+    x: maxX,
+    y: Math.max(mobileQuickPanelsPadding, maxY - 72),
+  };
+}
+
 function readFloatingPosition(): FloatingPosition {
   try {
     const raw = window.localStorage.getItem(mobileQuickPanelsPositionStorageKey);
     if (!raw) {
-      return { x: 12, y: 12 };
+      return defaultFloatingPosition();
     }
     const parsed = JSON.parse(raw) as Partial<FloatingPosition>;
     return {
-      x: Math.max(0, Number(parsed.x ?? 12) || 12),
-      y: Math.max(0, Number(parsed.y ?? 12) || 12),
+      x: Math.max(0, Number(parsed.x ?? defaultFloatingPosition().x) || defaultFloatingPosition().x),
+      y: Math.max(0, Number(parsed.y ?? defaultFloatingPosition().y) || defaultFloatingPosition().y),
     };
   } catch {
-    return { x: 12, y: 12 };
+    return defaultFloatingPosition();
   }
 }
 
@@ -63,6 +81,24 @@ function clampFloatingPosition(position: FloatingPosition): FloatingPosition {
   return {
     x: Math.min(maxX, Math.max(mobileQuickPanelsPadding, Math.round(position.x))),
     y: Math.min(maxY, Math.max(mobileQuickPanelsPadding, Math.round(position.y))),
+  };
+}
+
+function snapFloatingPosition(position: FloatingPosition): FloatingPosition {
+  if (typeof window === "undefined") {
+    return position;
+  }
+  const clamped = clampFloatingPosition(position);
+  const leftX = mobileQuickPanelsPadding;
+  const rightX = Math.max(
+    mobileQuickPanelsPadding,
+    window.innerWidth - mobileQuickPanelsWidth - mobileQuickPanelsPadding,
+  );
+  const centerX = clamped.x + mobileQuickPanelsWidth / 2;
+  const viewportCenterX = window.innerWidth / 2;
+  return {
+    x: centerX <= viewportCenterX ? leftX : rightX,
+    y: clamped.y,
   };
 }
 
@@ -83,7 +119,7 @@ export function MobileQuickPanels({
   const noticeHistory = useAppNoticeHistory();
   const [noticeOpen, setNoticeOpen] = useState(false);
   const [position, setPosition] = useState<FloatingPosition>(() =>
-    clampFloatingPosition(readFloatingPosition()),
+    snapFloatingPosition(readFloatingPosition()),
   );
   const dragRef = useRef({
     active: false,
@@ -105,7 +141,7 @@ export function MobileQuickPanels({
 
   useEffect(() => {
     const handleResize = () => {
-      setPosition((current) => clampFloatingPosition(current));
+      setPosition((current) => snapFloatingPosition(current));
     };
     window.addEventListener("resize", handleResize);
     return () => {
@@ -142,7 +178,12 @@ export function MobileQuickPanels({
       if (!dragRef.current.active) {
         return;
       }
+      const moved = dragRef.current.moved;
       dragRef.current.active = false;
+      dragRef.current.moved = false;
+      if (moved) {
+        setPosition((current) => snapFloatingPosition(current));
+      }
       window.setTimeout(() => {
         suppressClickRef.current = false;
       }, 0);
@@ -188,10 +229,15 @@ export function MobileQuickPanels({
     setNoticeOpen((value) => !value);
   };
 
+  const dockedLeft =
+    typeof window !== "undefined"
+      ? position.x + mobileQuickPanelsWidth / 2 <= window.innerWidth / 2
+      : false;
+
   return (
     <>
       <div
-        className="mobile-quick-panels"
+        className={`mobile-quick-panels${dockedLeft ? " is-docked-left" : " is-docked-right"}`}
         style={{
           left: `${position.x}px`,
           top: `${position.y}px`,

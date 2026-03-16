@@ -58,6 +58,12 @@ import {
   finishSharedServiceAction,
   useSharedServiceActionState,
 } from "../../services/sharedServiceAction";
+import {
+  getProxyPagePlatformAdapter,
+  getProxyPagePlatformConfig,
+  resolveProxyConfiguredMode,
+  resolveProxyTargetMode,
+} from "./proxyPagePlatform";
 
 const defaultSniffTimeoutMs = 1000;
 const defaultTunMtu = 1420;
@@ -354,6 +360,7 @@ function proxyModeLabel(mode: ProxyMode): string {
 }
 
 export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
+  const proxyPagePlatform = getProxyPagePlatformConfig();
   const notice = useAppNotice();
   const draftNotice = useDraftNotice();
   const sharedServiceAction = useSharedServiceActionState();
@@ -450,11 +457,7 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
       return;
     }
     setProxyMode(snapshot.proxyMode ?? "off");
-    setConfiguredProxyMode(
-      window.waterayPlatform?.isMobile
-        ? "tun"
-        : snapshot.configuredProxyMode === "tun" ? "tun" : "system",
-    );
+    setConfiguredProxyMode(resolveProxyConfiguredMode(snapshot.configuredProxyMode));
     if (proxyDraftDirty) {
       return;
     }
@@ -870,7 +873,7 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
     setForcingCloseStartup(false);
     setTogglingService(false);
     setStartupProgress(null);
-    void window.waterayDesktop.daemon.abortPendingRequests().catch(() => {
+    void getProxyPagePlatformAdapter().daemon.abortPendingRequests().catch(() => {
       // Best-effort abort for queued or hung startup requests.
     });
     void runAction(() => daemonApi.stopConnection()).catch(() => {
@@ -895,9 +898,7 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
         startupCancelRequestedRef.current = false;
         const startupSessionID = startupSessionRef.current + 1;
         startupSessionRef.current = startupSessionID;
-        const targetMode = window.waterayPlatform?.isMobile
-          ? "tun"
-          : configuredProxyMode === "tun" ? "tun" : "system";
+        const targetMode = resolveProxyTargetMode(configuredProxyMode);
         const startedAtMs = Date.now();
         setStartupProgress({
           startedAtMs,
@@ -1017,7 +1018,7 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
     }
     setExitingApp(true);
     try {
-      await window.waterayDesktop.window.quitAll();
+      await getProxyPagePlatformAdapter().window.quitAll();
     } catch (error) {
       notice.error(error instanceof Error ? error.message : "退出应用失败");
     } finally {
@@ -1157,24 +1158,24 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
     try {
       const result = await fetchExportContent();
       if (exportMode === "save_file") {
-        const path = await window.waterayDesktop.system.openExportSaveDialog(
+        const path = await getProxyPagePlatformAdapter().system.openExportSaveDialog(
           result.fileName || "waterayd_state.json",
         );
         if (!path) {
           notice.info("已取消导出");
           return;
         }
-        await window.waterayDesktop.system.writeTextFile(path, result.content);
+        await getProxyPagePlatformAdapter().system.writeTextFile(path, result.content);
         notice.success(`导出成功：${path}`);
         setExportModalOpen(false);
         return;
       }
       if (exportMode === "copy_file") {
-        const tempPath = await window.waterayDesktop.system.writeTempTextFile(
+        const tempPath = await getProxyPagePlatformAdapter().system.writeTempTextFile(
           result.fileName || "waterayd_state.json",
           result.content,
         );
-        const response = await window.waterayDesktop.system.writeClipboardFile(
+        const response = await getProxyPagePlatformAdapter().system.writeClipboardFile(
           tempPath,
         );
         if (response.mode === "windows_file_object") {
@@ -1185,7 +1186,7 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
         setExportModalOpen(false);
         return;
       }
-      await window.waterayDesktop.system.writeClipboardText(result.content);
+      await getProxyPagePlatformAdapter().system.writeClipboardText(result.content);
       notice.success("配置内容已复制到剪贴板");
       setExportModalOpen(false);
     } catch (error) {
@@ -1200,22 +1201,22 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
     try {
       let content = "";
       if (importMode === "select_file") {
-        const path = await window.waterayDesktop.system.openImportFileDialog();
+        const path = await getProxyPagePlatformAdapter().system.openImportFileDialog();
         if (!path) {
           notice.info("已取消导入");
           return;
         }
-        content = await window.waterayDesktop.system.readTextFile(path);
+        content = await getProxyPagePlatformAdapter().system.readTextFile(path);
       } else if (importMode === "clipboard_file") {
-        const filePaths = await window.waterayDesktop.system.readClipboardFilePaths();
+        const filePaths = await getProxyPagePlatformAdapter().system.readClipboardFilePaths();
         const selectedPath = filePaths.find((item) => item.trim() !== "");
         if (!selectedPath) {
           notice.warning("剪贴板中没有可导入的文件");
           return;
         }
-        content = await window.waterayDesktop.system.readTextFile(selectedPath);
+        content = await getProxyPagePlatformAdapter().system.readTextFile(selectedPath);
       } else {
-        content = await window.waterayDesktop.system.readClipboardText();
+        content = await getProxyPagePlatformAdapter().system.readClipboardText();
       }
 
       if (!content.trim()) {
@@ -1684,28 +1685,20 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
           <div className="proxy-startup-left-panel">
             <div className="proxy-startup-panel-stack">
               <SwitchWithLabel
-                checked={window.waterayPlatform?.isMobile ? true : configuredProxyMode === "tun"}
-                disabled={window.waterayPlatform?.isMobile || !snapshot || loading || serviceActionBusy}
+                checked={proxyPagePlatform.fixedTunMode ? true : configuredProxyMode === "tun"}
+                disabled={proxyPagePlatform.fixedTunMode || !snapshot || loading || serviceActionBusy}
                 onChange={(checked) => {
                   void updateConfiguredMode(checked);
                 }}
-                label={window.waterayPlatform?.isMobile ? "VPN 模式" : "网卡模式"}
-                helpContent={window.waterayPlatform?.isMobile
-                  ? {
-                    effect: "Android 当前固定使用虚拟网卡（VPN/TUN）模式运行。",
-                    recommendation: "启动后才会接管系统流量与 DNS；停止后系统网络与 DNS 将完全回归 Android 本身。",
-                  }
-                  : {
-                    effect: "控制默认启动模式：开启为虚拟网卡模式，关闭为系统代理模式。",
-                    recommendation: "需全局接管流量时优先开启；仅浏览器等显式代理场景可关闭。若当前代理正在运行，切换后会自动刷新服务。",
-                  }}
+                label={proxyPagePlatform.modeSwitchLabel}
+                helpContent={proxyPagePlatform.modeSwitchHelpContent}
               />
-              {window.waterayPlatform?.isMobile ? (
+              {proxyPagePlatform.modeSwitchAlertDescription ? (
                 <Alert
                   showIcon
                   type="info"
                   message="Android 模式说明"
-                  description="Android 当前仅支持虚拟网卡（VPN/TUN）模式。未启动代理时不会单独运行最小实例，也不支持节点测速/真连评分；点击启动后会先建立 VPN，再在运行中的代理环境里执行节点评分与优选切换，停止后系统 DNS 与网络完全回交给 Android。"
+                  description={proxyPagePlatform.modeSwitchAlertDescription}
                 />
               ) : null}
               <SwitchWithLabel
@@ -1724,23 +1717,7 @@ export function ProxyPage({ snapshot, loading, runAction }: DaemonPageProps) {
               <div className="proxy-startup-smart-optimize">
                 <HelpLabel
                   label="智能优选"
-                  helpContent={window.waterayPlatform?.isMobile
-                    ? {
-                      scene: "Android 端希望在 VPN 代理已经建立后，再为当前订阅分组执行评分并自动切到更优节点。",
-                      effect: "点击“启动”后先建立代理服务，再在运行中的代理环境里执行评分；若优选结果变更节点，会自动刷新服务使其生效。",
-                      caution: "未启动代理时不会单独拉起最小实例，因此也不支持离线测速/真连评分。",
-                      recommendation: "默认建议“关闭优选”；需要自动筛选更优节点时再开启。",
-                    }
-                    : {
-                      scene:
-                        "启动前希望自动挑选更稳或更符合地区偏好的节点，例如固定优先某个国家，或日常直接选当前激活订阅分组里的最佳节点。",
-                      effect:
-                        "仅在点击“启动”时会先执行评分；选择“订阅激活分组最佳”时会评分当前激活订阅分组全部节点，选择国家时只评分该国家候选节点，以减少检测耗时。",
-                      caution:
-                        "“重启服务”不会重新执行智能优选。智能优选仅对当前激活订阅分组生效；国家优选还要求节点具备国家字段。若没有可用候选，系统会回退当前激活节点继续启动并提示警告。",
-                      recommendation:
-                        "默认建议“关闭优选”；想始终优先当前订阅分组最佳线路可选“订阅激活分组最佳”；有明确地区偏好时再切换到对应国家。",
-                    }}
+                  helpContent={proxyPagePlatform.smartOptimizeHelpContent}
                 />
                 <Select<ProxyStartupSmartOptimizePreference>
                   className="proxy-startup-smart-optimize-select"

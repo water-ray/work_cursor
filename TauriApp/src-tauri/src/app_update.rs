@@ -1,9 +1,10 @@
 use std::cmp::Ordering;
 use std::fs;
 use std::io::Write;
-#[cfg(target_family = "unix")]
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Mutex;
@@ -17,7 +18,8 @@ use tauri_plugin_http::reqwest;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 
-use crate::backend;
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+use crate::desktop_host::runtime;
 
 const UPDATE_STATE_EVENT_NAME: &str = "wateray:app-update-state";
 const DEFAULT_UPDATE_FEED_URL: &str =
@@ -154,6 +156,7 @@ struct UpdateRuntimeContext {
     install_kind: String,
     supported: bool,
     unsupported_reason: String,
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     install_dir: PathBuf,
 }
 
@@ -355,6 +358,7 @@ fn build_runtime_context(app: &AppHandle) -> Result<UpdateRuntimeContext, String
             install_kind: "unknown".to_string(),
             supported: false,
             unsupported_reason: "开发模式暂不支持应用自动更新。".to_string(),
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
             install_dir,
         });
     }
@@ -366,6 +370,7 @@ fn build_runtime_context(app: &AppHandle) -> Result<UpdateRuntimeContext, String
             install_kind: "portable-zip".to_string(),
             supported: true,
             unsupported_reason: String::new(),
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
             install_dir,
         }),
         "linux" => {
@@ -379,6 +384,7 @@ fn build_runtime_context(app: &AppHandle) -> Result<UpdateRuntimeContext, String
                     install_kind,
                     supported,
                     unsupported_reason,
+                    #[cfg(any(target_os = "windows", target_os = "linux"))]
                     install_dir,
                 })
             }
@@ -390,6 +396,7 @@ fn build_runtime_context(app: &AppHandle) -> Result<UpdateRuntimeContext, String
                     install_kind: "unknown".to_string(),
                     supported: false,
                     unsupported_reason: "当前平台更新功能未完成。".to_string(),
+                    #[cfg(any(target_os = "windows", target_os = "linux"))]
                     install_dir,
                 })
             }
@@ -400,6 +407,7 @@ fn build_runtime_context(app: &AppHandle) -> Result<UpdateRuntimeContext, String
             install_kind: "unknown".to_string(),
             supported: false,
             unsupported_reason: "当前平台更新功能未完成。".to_string(),
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
             install_dir,
         }),
         _ => Ok(UpdateRuntimeContext {
@@ -408,6 +416,7 @@ fn build_runtime_context(app: &AppHandle) -> Result<UpdateRuntimeContext, String
             install_kind: "unknown".to_string(),
             supported: false,
             unsupported_reason: "当前平台更新功能未完成。".to_string(),
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
             install_dir,
         }),
     }
@@ -474,6 +483,7 @@ fn compare_semver_versions(left: &str, right: &str) -> Ordering {
     }
 }
 
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn resolve_env_dir(name: &str) -> Option<PathBuf> {
     let value = std::env::var(name).ok()?;
     let trimmed = value.trim();
@@ -536,6 +546,7 @@ fn ensure_directory(path: &Path) -> Result<(), String> {
     fs::create_dir_all(path).map_err(|error| format!("创建目录失败：{} ({error})", path.display()))
 }
 
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn write_script_file(prefix: &str, extension: &str, content: &str) -> Result<PathBuf, String> {
     let scripts_dir = resolve_update_cache_root().join("scripts");
     ensure_directory(&scripts_dir)?;
@@ -682,7 +693,7 @@ fn spawn_detached_command(program: &str, args: &[String]) -> Result<(), String> 
     Ok(())
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
 fn spawn_detached_command(program: &str, args: &[String]) -> Result<(), String> {
     let mut command = Command::new(program);
     command
@@ -1025,7 +1036,7 @@ impl AppUpdateManager {
         };
         let selected_release =
             selected_release.ok_or_else(|| "缺少待安装的更新资产信息。".to_string())?;
-        let downloaded_file_path =
+        let _downloaded_file_path =
             downloaded_file_path.ok_or_else(|| "缺少已下载的更新文件。".to_string())?;
 
         let _ = self.mutate_state(app, |session, _| {
@@ -1044,7 +1055,7 @@ impl AppUpdateManager {
                     let plan = WindowsUpdaterPlan {
                         current_pid: std::process::id(),
                         install_dir: context.install_dir.to_string_lossy().to_string(),
-                        zip_path: downloaded_file_path.to_string_lossy().to_string(),
+                        zip_path: _downloaded_file_path.to_string_lossy().to_string(),
                         staging_dir: update_root.join("staging").to_string_lossy().to_string(),
                         backup_dir: update_root.join("backup").to_string_lossy().to_string(),
                         tmp_install_dir: update_root
@@ -1075,7 +1086,7 @@ impl AppUpdateManager {
                             "更新已准备完成，客户端即将退出并自动替换到新版本。".to_string();
                         session.public_state.last_error.clear();
                     })?;
-                    backend::window_quit_all(app.clone())?;
+                    runtime::window_quit_all(app.clone())?;
                     Ok(state)
                 }
                 #[cfg(not(target_os = "windows"))]
@@ -1101,7 +1112,7 @@ impl AppUpdateManager {
                             )?;
                             run_pkexec_script(
                                 &installer_script,
-                                &[downloaded_file_path.to_string_lossy().to_string()],
+                                &[_downloaded_file_path.to_string_lossy().to_string()],
                                 "安装 Linux .deb 更新",
                             )?;
                             let relaunch_script = write_script_file(
@@ -1128,7 +1139,7 @@ impl AppUpdateManager {
                                     "Linux .deb 更新已安装完成，客户端即将自动重启。".to_string();
                                 session.public_state.last_error.clear();
                             })?;
-                            backend::window_close_panel_keep_core(app.clone())?;
+                            runtime::window_close_panel_keep_core(app.clone())?;
                             Ok(state)
                         }
                         "appimage" => {
@@ -1138,10 +1149,10 @@ impl AppUpdateManager {
                             let release_path = releases_dir.join(safe_asset_file_name(
                                 &selected_release.asset.name,
                             )?);
-                            fs::copy(&downloaded_file_path, &release_path).map_err(|error| {
+                            fs::copy(&_downloaded_file_path, &release_path).map_err(|error| {
                                 format!(
                                     "写入 AppImage 发布文件失败：{} -> {} ({error})",
-                                    downloaded_file_path.display(),
+                                    _downloaded_file_path.display(),
                                     release_path.display()
                                 )
                             })?;
@@ -1191,7 +1202,7 @@ impl AppUpdateManager {
                                     "AppImage 更新已切换完成，客户端即将自动重启。".to_string();
                                 session.public_state.last_error.clear();
                             })?;
-                            backend::window_close_panel_keep_core(app.clone())?;
+                            runtime::window_close_panel_keep_core(app.clone())?;
                             Ok(state)
                         }
                         _ => {
@@ -1507,6 +1518,7 @@ mod tests {
             install_kind: "portable-zip".to_string(),
             supported: true,
             unsupported_reason: String::new(),
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
             install_dir: PathBuf::from("C:/Wateray"),
         };
         let linux_context = UpdateRuntimeContext {
@@ -1515,6 +1527,7 @@ mod tests {
             install_kind: "deb".to_string(),
             supported: true,
             unsupported_reason: String::new(),
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
             install_dir: PathBuf::from("/opt/wateray"),
         };
 
