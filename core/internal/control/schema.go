@@ -341,6 +341,7 @@ const (
 	OperationTypeSelectNode        OperationType = "select_node"
 	OperationTypeApplySettings     OperationType = "apply_settings"
 	OperationTypeClearDNSCache     OperationType = "clear_dns_cache"
+	OperationTypeRequestMonitor    OperationType = "request_monitor"
 )
 
 type OperationStatusType string
@@ -808,6 +809,72 @@ type ResetTrafficStatsRequest struct {
 
 type UpdateNodeCountriesRequest struct {
 	NodeIDs []string `json:"nodeIds"`
+}
+
+type RequestMonitorScope string
+
+const (
+	RequestMonitorScopeAll      RequestMonitorScope = "all"
+	RequestMonitorScopeMissOnly RequestMonitorScope = "miss_only"
+)
+
+type RequestMonitorProcess struct {
+	PID  int    `json:"pid"`
+	Name string `json:"name,omitempty"`
+	Path string `json:"path,omitempty"`
+}
+
+type RequestMonitorRequest struct {
+	Domain          string `json:"domain,omitempty"`
+	DestinationIP   string `json:"destinationIp,omitempty"`
+	DestinationPort int    `json:"destinationPort,omitempty"`
+	Network         string `json:"network,omitempty"`
+	Protocol        string `json:"protocol,omitempty"`
+	InboundTag      string `json:"inboundTag,omitempty"`
+	Country         string `json:"country,omitempty"`
+}
+
+type RequestMonitorDecision struct {
+	RecordScope   RequestMonitorScope `json:"recordScope"`
+	RuleMissed    bool                `json:"ruleMissed"`
+	MatchedRule   string              `json:"matchedRule,omitempty"`
+	OutboundTag   string               `json:"outboundTag,omitempty"`
+	SuggestedRule string               `json:"suggestedRule,omitempty"`
+	UploadBytes   int64                `json:"uploadBytes,omitempty"`
+	DownloadBytes int64                `json:"downloadBytes,omitempty"`
+}
+
+type RequestMonitorRecord struct {
+	ID          string                 `json:"id"`
+	TimestampMS int64                  `json:"timestampMs"`
+	Process     RequestMonitorProcess  `json:"process"`
+	Request     RequestMonitorRequest  `json:"request"`
+	Monitor     RequestMonitorDecision `json:"monitor"`
+	Tags        []string               `json:"tags,omitempty"`
+}
+
+type RequestMonitorSessionSummary struct {
+	ID            string              `json:"id"`
+	FileName      string              `json:"fileName"`
+	FileBaseName  string              `json:"fileBaseName"`
+	DurationSec   int                 `json:"durationSec,omitempty"`
+	RecordScope   RequestMonitorScope `json:"recordScope,omitempty"`
+	CreatedAtMS   int64               `json:"createdAtMs,omitempty"`
+	CompletedAtMS int64               `json:"completedAtMs,omitempty"`
+	RequestCount  int                 `json:"requestCount"`
+	Running       bool                `json:"running,omitempty"`
+	LastError     string              `json:"lastError,omitempty"`
+}
+
+type RequestMonitorSessionContent struct {
+	Session RequestMonitorSessionSummary `json:"session"`
+	Records []RequestMonitorRecord       `json:"records"`
+}
+
+type CreateRequestMonitorSessionRequest struct {
+	DurationSec  int                 `json:"durationSec"`
+	FileBaseName string              `json:"fileBaseName"`
+	RecordScope  RequestMonitorScope `json:"recordScope"`
 }
 
 type SetRuleConfigV2Request struct {

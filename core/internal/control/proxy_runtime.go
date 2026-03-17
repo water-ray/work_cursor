@@ -98,6 +98,44 @@ type clashConnectionsSnapshot struct {
 	Connections        []clashConnectionRecord `json:"connections"`
 }
 
+func (s *clashConnectionsSnapshot) UnmarshalJSON(data []byte) error {
+	type rawSnapshot struct {
+		UploadTotal        json.RawMessage        `json:"uploadTotal"`
+		DownloadTotal      json.RawMessage        `json:"downloadTotal"`
+		UploadTotalSnake   json.RawMessage        `json:"upload_total"`
+		DownloadTotalSnake json.RawMessage        `json:"download_total"`
+		Connections        []clashConnectionRecord `json:"connections"`
+	}
+	var raw rawSnapshot
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	uploadTotal, err := decodeFlexibleJSONInt64(raw.UploadTotal)
+	if err != nil {
+		return fmt.Errorf("uploadTotal: %w", err)
+	}
+	downloadTotal, err := decodeFlexibleJSONInt64(raw.DownloadTotal)
+	if err != nil {
+		return fmt.Errorf("downloadTotal: %w", err)
+	}
+	uploadTotalSnake, err := decodeFlexibleJSONInt64(raw.UploadTotalSnake)
+	if err != nil {
+		return fmt.Errorf("upload_total: %w", err)
+	}
+	downloadTotalSnake, err := decodeFlexibleJSONInt64(raw.DownloadTotalSnake)
+	if err != nil {
+		return fmt.Errorf("download_total: %w", err)
+	}
+	*s = clashConnectionsSnapshot{
+		UploadTotal:        uploadTotal,
+		DownloadTotal:      downloadTotal,
+		UploadTotalSnake:   uploadTotalSnake,
+		DownloadTotalSnake: downloadTotalSnake,
+		Connections:        raw.Connections,
+	}
+	return nil
+}
+
 type clashConnectionRecord struct {
 	ID            string                  `json:"id"`
 	Upload        int64                   `json:"upload"`
@@ -108,8 +146,169 @@ type clashConnectionRecord struct {
 	Chains        []string                `json:"chains"`
 }
 
+func (r *clashConnectionRecord) UnmarshalJSON(data []byte) error {
+	type rawRecord struct {
+		ID            string                `json:"id"`
+		Upload        json.RawMessage       `json:"upload"`
+		Download      json.RawMessage       `json:"download"`
+		UploadSnake   json.RawMessage       `json:"upload_bytes"`
+		DownloadSnake json.RawMessage       `json:"download_bytes"`
+		Metadata      clashConnectionMetadata `json:"metadata"`
+		Chains        []string              `json:"chains"`
+	}
+	var raw rawRecord
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	upload, err := decodeFlexibleJSONInt64(raw.Upload)
+	if err != nil {
+		return fmt.Errorf("upload: %w", err)
+	}
+	download, err := decodeFlexibleJSONInt64(raw.Download)
+	if err != nil {
+		return fmt.Errorf("download: %w", err)
+	}
+	uploadSnake, err := decodeFlexibleJSONInt64(raw.UploadSnake)
+	if err != nil {
+		return fmt.Errorf("upload_bytes: %w", err)
+	}
+	downloadSnake, err := decodeFlexibleJSONInt64(raw.DownloadSnake)
+	if err != nil {
+		return fmt.Errorf("download_bytes: %w", err)
+	}
+	*r = clashConnectionRecord{
+		ID:            strings.TrimSpace(raw.ID),
+		Upload:        upload,
+		Download:      download,
+		UploadSnake:   uploadSnake,
+		DownloadSnake: downloadSnake,
+		Metadata:      raw.Metadata,
+		Chains:        append([]string{}, raw.Chains...),
+	}
+	return nil
+}
+
 type clashConnectionMetadata struct {
-	Network string `json:"network"`
+	Network              string `json:"network"`
+	Type                 string `json:"type"`
+	Host                 string `json:"host"`
+	DestinationIP        string `json:"destinationIP"`
+	DestinationIPSnake   string `json:"destination_ip"`
+	DestinationPort      int    `json:"destinationPort"`
+	DestinationPortSnake int    `json:"destination_port"`
+	Inbound              string `json:"inbound"`
+	InboundName          string `json:"inboundName"`
+	InboundTag           string `json:"inboundTag"`
+	Process              string `json:"process"`
+	ProcessName          string `json:"processName"`
+	ProcessPath          string `json:"processPath"`
+	ProcessPathSnake     string `json:"process_path"`
+	ProcessID            int64  `json:"processId"`
+	ProcessIDSnake       int64  `json:"process_id"`
+	Rule                 string `json:"rule"`
+	RulePayload          string `json:"rulePayload"`
+	RulePayloadSnake     string `json:"rule_payload"`
+	Country              string `json:"country"`
+}
+
+func (m *clashConnectionMetadata) UnmarshalJSON(data []byte) error {
+	type rawMetadata struct {
+		Network              string          `json:"network"`
+		Type                 string          `json:"type"`
+		Host                 string          `json:"host"`
+		DestinationIP        string          `json:"destinationIP"`
+		DestinationIPSnake   string          `json:"destination_ip"`
+		DestinationPort      json.RawMessage `json:"destinationPort"`
+		DestinationPortSnake json.RawMessage `json:"destination_port"`
+		Inbound              string          `json:"inbound"`
+		InboundName          string          `json:"inboundName"`
+		InboundTag           string          `json:"inboundTag"`
+		Process              string          `json:"process"`
+		ProcessName          string          `json:"processName"`
+		ProcessPath          string          `json:"processPath"`
+		ProcessPathSnake     string          `json:"process_path"`
+		ProcessID            json.RawMessage `json:"processId"`
+		ProcessIDSnake       json.RawMessage `json:"process_id"`
+		Rule                 string          `json:"rule"`
+		RulePayload          string          `json:"rulePayload"`
+		RulePayloadSnake     string          `json:"rule_payload"`
+		Country              string          `json:"country"`
+	}
+	var raw rawMetadata
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	destinationPort, err := decodeFlexibleJSONInt(raw.DestinationPort)
+	if err != nil {
+		return fmt.Errorf("destinationPort: %w", err)
+	}
+	destinationPortSnake, err := decodeFlexibleJSONInt(raw.DestinationPortSnake)
+	if err != nil {
+		return fmt.Errorf("destination_port: %w", err)
+	}
+	processID, err := decodeFlexibleJSONInt64(raw.ProcessID)
+	if err != nil {
+		return fmt.Errorf("processId: %w", err)
+	}
+	processIDSnake, err := decodeFlexibleJSONInt64(raw.ProcessIDSnake)
+	if err != nil {
+		return fmt.Errorf("process_id: %w", err)
+	}
+	*m = clashConnectionMetadata{
+		Network:              strings.TrimSpace(raw.Network),
+		Type:                 strings.TrimSpace(raw.Type),
+		Host:                 strings.TrimSpace(raw.Host),
+		DestinationIP:        strings.TrimSpace(raw.DestinationIP),
+		DestinationIPSnake:   strings.TrimSpace(raw.DestinationIPSnake),
+		DestinationPort:      destinationPort,
+		DestinationPortSnake: destinationPortSnake,
+		Inbound:              strings.TrimSpace(raw.Inbound),
+		InboundName:          strings.TrimSpace(raw.InboundName),
+		InboundTag:           strings.TrimSpace(raw.InboundTag),
+		Process:              strings.TrimSpace(raw.Process),
+		ProcessName:          strings.TrimSpace(raw.ProcessName),
+		ProcessPath:          strings.TrimSpace(raw.ProcessPath),
+		ProcessPathSnake:     strings.TrimSpace(raw.ProcessPathSnake),
+		ProcessID:            processID,
+		ProcessIDSnake:       processIDSnake,
+		Rule:                 strings.TrimSpace(raw.Rule),
+		RulePayload:          strings.TrimSpace(raw.RulePayload),
+		RulePayloadSnake:     strings.TrimSpace(raw.RulePayloadSnake),
+		Country:              strings.TrimSpace(raw.Country),
+	}
+	return nil
+}
+
+func decodeFlexibleJSONInt(data json.RawMessage) (int, error) {
+	value, err := decodeFlexibleJSONInt64(data)
+	if err != nil {
+		return 0, err
+	}
+	return int(value), nil
+}
+
+func decodeFlexibleJSONInt64(data json.RawMessage) (int64, error) {
+	trimmed := strings.TrimSpace(string(data))
+	if trimmed == "" || trimmed == "null" {
+		return 0, nil
+	}
+	var intValue int64
+	if err := json.Unmarshal(data, &intValue); err == nil {
+		return intValue, nil
+	}
+	var text string
+	if err := json.Unmarshal(data, &text); err == nil {
+		text = strings.TrimSpace(text)
+		if text == "" {
+			return 0, nil
+		}
+		value, parseErr := strconv.ParseInt(text, 10, 64)
+		if parseErr != nil {
+			return 0, fmt.Errorf("invalid integer string %q", text)
+		}
+		return value, nil
+	}
+	return 0, fmt.Errorf("invalid integer value %s", trimmed)
 }
 
 func newProxyRuntime(onLog func(level LogLevel, message string)) *proxyRuntime {
@@ -653,6 +852,14 @@ func (r *proxyRuntime) CloseAllConnections() error {
 }
 
 func (r *proxyRuntime) QueryConnectionsStats() (TrafficTickPayload, error) {
+	payload, err := r.QueryConnectionsSnapshot()
+	if err != nil {
+		return TrafficTickPayload{}, err
+	}
+	return buildTrafficTickFromConnectionsSnapshot(payload), nil
+}
+
+func (r *proxyRuntime) QueryConnectionsSnapshot() (clashConnectionsSnapshot, error) {
 	controller := r.clashAPIControllerOrDefault()
 	request, err := http.NewRequest(
 		http.MethodGet,
@@ -660,19 +867,19 @@ func (r *proxyRuntime) QueryConnectionsStats() (TrafficTickPayload, error) {
 		nil,
 	)
 	if err != nil {
-		return TrafficTickPayload{}, fmt.Errorf("create query connections request failed: %w", err)
+		return clashConnectionsSnapshot{}, fmt.Errorf("create query connections request failed: %w", err)
 	}
 	client := &http.Client{
 		Timeout: 3 * time.Second,
 	}
 	response, err := client.Do(request)
 	if err != nil {
-		return TrafficTickPayload{}, fmt.Errorf("query connections failed: %w", err)
+		return clashConnectionsSnapshot{}, fmt.Errorf("query connections failed: %w", err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(response.Body, 1024))
-		return TrafficTickPayload{}, fmt.Errorf(
+		return clashConnectionsSnapshot{}, fmt.Errorf(
 			"query connections failed: status=%d body=%s",
 			response.StatusCode,
 			strings.TrimSpace(string(body)),
@@ -680,9 +887,9 @@ func (r *proxyRuntime) QueryConnectionsStats() (TrafficTickPayload, error) {
 	}
 	var payload clashConnectionsSnapshot
 	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
-		return TrafficTickPayload{}, fmt.Errorf("decode query connections response failed: %w", err)
+		return clashConnectionsSnapshot{}, fmt.Errorf("decode query connections response failed: %w", err)
 	}
-	return buildTrafficTickFromConnectionsSnapshot(payload), nil
+	return payload, nil
 }
 
 func buildTrafficTickFromConnectionsSnapshot(payload clashConnectionsSnapshot) TrafficTickPayload {

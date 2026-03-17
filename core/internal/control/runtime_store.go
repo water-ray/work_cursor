@@ -4644,6 +4644,23 @@ func (s *RuntimeStore) refreshRulePoolAvailableNodeIDsBeforeStart(ctx context.Co
 	)
 }
 
+type suppressReferencedNodePoolRefreshKey struct{}
+
+func withSuppressedReferencedNodePoolRefresh(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, suppressReferencedNodePoolRefreshKey{}, true)
+}
+
+func shouldSuppressReferencedNodePoolRefresh(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	value, _ := ctx.Value(suppressReferencedNodePoolRefreshKey{}).(bool)
+	return value
+}
+
 func (s *RuntimeStore) startNow(ctx context.Context) (StateSnapshot, error) {
 	s.mu.Lock()
 	s.ensureValidLocked()
@@ -4794,7 +4811,7 @@ func (s *RuntimeStore) startNow(ctx context.Context) (StateSnapshot, error) {
 	result := cloneSnapshot(s.state)
 	shouldEnqueue := s.state.ProxyMode != ProxyModeOff && hasReferencedNodePoolRule(s.state)
 	s.mu.Unlock()
-	if shouldEnqueue {
+	if shouldEnqueue && !shouldSuppressReferencedNodePoolRefresh(ctx) {
 		s.enqueueReferencedNodePoolRefresh("start_connection")
 	}
 	return result, nil
@@ -5094,7 +5111,7 @@ func (s *RuntimeStore) restartNow(ctx context.Context) (StateSnapshot, error) {
 	result := cloneSnapshot(s.state)
 	shouldEnqueue := s.state.ProxyMode != ProxyModeOff && hasReferencedNodePoolRule(s.state)
 	s.mu.Unlock()
-	if shouldEnqueue {
+	if shouldEnqueue && !shouldSuppressReferencedNodePoolRefresh(ctx) {
 		s.enqueueReferencedNodePoolRefresh("restart_connection")
 	}
 	return result, nil
@@ -7241,9 +7258,7 @@ func collectReferencedPolicyIDs(config RuleConfigV2) map[string]struct{} {
 	if resolveActiveRuleGroupOnMissMode(config) == RuleMissModeProxy {
 		onMissPolicy = "proxy"
 	}
-	if onMissPolicy != "" {
-		referenced[onMissPolicy] = struct{}{}
-	}
+	referenced[onMissPolicy] = struct{}{}
 	for _, rule := range config.Rules {
 		if !rule.Enabled || normalizeRuleActionType(rule.Action.Type) != RuleActionTypeRoute {
 			continue

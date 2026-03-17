@@ -568,35 +568,34 @@ function normalizeProbeResult(payload: unknown): WaterayMobileProbeResult {
     return { results: [] };
   }
   const source = payload as Partial<WaterayMobileProbeResult>;
-  const results = Array.isArray(source.results)
-    ? source.results
-        .map((item) => {
-          if (!item || typeof item !== "object") {
-            return null;
-          }
-          const record = item as Record<string, unknown>;
-          const nodeId = typeof record.nodeId === "string" ? record.nodeId.trim() : "";
-          if (nodeId === "") {
-            return null;
-          }
-          return {
-            nodeId,
-            latencyMs:
-              typeof record.latencyMs === "number" && Number.isFinite(record.latencyMs)
-                ? record.latencyMs
-                : undefined,
-            realConnectMs:
-              typeof record.realConnectMs === "number" && Number.isFinite(record.realConnectMs)
-                ? record.realConnectMs
-                : undefined,
-            error:
-              typeof record.error === "string" && record.error.trim() !== ""
-                ? record.error.trim()
-                : undefined,
-          } satisfies WaterayMobileProbeResultItem;
-        })
-        .filter((item): item is WaterayMobileProbeResultItem => item != null)
-    : [];
+  const results: WaterayMobileProbeResultItem[] = [];
+  if (Array.isArray(source.results)) {
+    for (const item of source.results as unknown[]) {
+      if (!item || typeof item !== "object") {
+        continue;
+      }
+      const record = item as Partial<WaterayMobileProbeResultItem>;
+      const nodeId = typeof record.nodeId === "string" ? record.nodeId.trim() : "";
+      if (nodeId === "") {
+        continue;
+      }
+      results.push({
+        nodeId,
+        latencyMs:
+          typeof record.latencyMs === "number" && Number.isFinite(record.latencyMs)
+            ? record.latencyMs
+            : undefined,
+        realConnectMs:
+          typeof record.realConnectMs === "number" && Number.isFinite(record.realConnectMs)
+            ? record.realConnectMs
+            : undefined,
+        error:
+          typeof record.error === "string" && record.error.trim() !== ""
+            ? record.error.trim()
+            : undefined,
+      });
+    }
+  }
   return { results };
 }
 

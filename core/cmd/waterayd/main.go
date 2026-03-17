@@ -361,6 +361,55 @@ func registerHandlers(
 		writeProbeNodesResult(w, snapshot, summary, err)
 	})
 
+	mux.HandleFunc("/v1/monitor/records", func(w http.ResponseWriter, r *http.Request) {
+		if !allowMethod(w, r, http.MethodGet, http.MethodDelete) {
+			return
+		}
+		if r.Method == http.MethodGet {
+			sessions, err := store.ListRequestMonitorSessions(r.Context())
+			logCoreAction(store, "list request monitor sessions", err)
+			writeRequestMonitorSessionsResult(w, sessions, err)
+			return
+		}
+		recordID := strings.TrimSpace(r.URL.Query().Get("id"))
+		snapshot, err := store.DeleteRequestMonitorSession(r.Context(), recordID)
+		logCoreAction(store, fmt.Sprintf("delete request monitor session id=%s", recordID), err)
+		writeResult(w, snapshot, err)
+	})
+
+	mux.HandleFunc("/v1/monitor/records/content", func(w http.ResponseWriter, r *http.Request) {
+		if !allowMethod(w, r, http.MethodGet) {
+			return
+		}
+		recordID := strings.TrimSpace(r.URL.Query().Get("id"))
+		content, err := store.GetRequestMonitorSessionContent(r.Context(), recordID)
+		logCoreAction(store, fmt.Sprintf("load request monitor session content id=%s", recordID), err)
+		writeRequestMonitorContentResult(w, content, err)
+	})
+
+	mux.HandleFunc("/v1/monitor/sessions", func(w http.ResponseWriter, r *http.Request) {
+		if !allowMethod(w, r, http.MethodPost) {
+			return
+		}
+		var req control.CreateRequestMonitorSessionRequest
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		snapshot, err := store.CreateRequestMonitorSession(r.Context(), req)
+		logCoreAction(
+			store,
+			fmt.Sprintf(
+				"create request monitor session file=%s scope=%s duration=%d",
+				req.FileBaseName,
+				req.RecordScope,
+				req.DurationSec,
+			),
+			err,
+		)
+		writeResult(w, snapshot, err)
+	})
+
 	mux.HandleFunc("/v1/tasks/background", func(w http.ResponseWriter, r *http.Request) {
 		if !allowMethod(w, r, http.MethodDelete) {
 			return
@@ -1248,6 +1297,42 @@ func writeConfigImportResult(
 		"importSummary": summary,
 		"task":          resolveResponseTask(snapshot),
 		"operation":     resolveResponseOperation(snapshot),
+	}
+	if err != nil {
+		status = http.StatusBadRequest
+		payload["ok"] = false
+		payload["error"] = err.Error()
+	}
+	writeJSON(w, status, payload)
+}
+
+func writeRequestMonitorSessionsResult(
+	w http.ResponseWriter,
+	sessions []control.RequestMonitorSessionSummary,
+	err error,
+) {
+	status := http.StatusOK
+	payload := map[string]any{
+		"ok":              true,
+		"monitorSessions": sessions,
+	}
+	if err != nil {
+		status = http.StatusBadRequest
+		payload["ok"] = false
+		payload["error"] = err.Error()
+	}
+	writeJSON(w, status, payload)
+}
+
+func writeRequestMonitorContentResult(
+	w http.ResponseWriter,
+	content control.RequestMonitorSessionContent,
+	err error,
+) {
+	status := http.StatusOK
+	payload := map[string]any{
+		"ok":             true,
+		"monitorContent": content,
 	}
 	if err != nil {
 		status = http.StatusBadRequest

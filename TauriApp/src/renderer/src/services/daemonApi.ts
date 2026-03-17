@@ -9,11 +9,14 @@ import type {
   DNSHealthReport,
   DaemonRequestPayload,
   DaemonSnapshot,
+  CreateRequestMonitorSessionRequestPayload,
   ExportConfigContentRequestPayload,
   ExportConfigContentResult,
   ImportConfigSummary,
   LogLevel,
   LoopbackExemptResult,
+  RequestMonitorSessionContent,
+  RequestMonitorSessionSummary,
   ImportManualNodesTextRequestPayload,
   ProbeNodesRequestPayload,
   ProbeNodesSummary,
@@ -45,6 +48,8 @@ type ProbeNodesRequestInput = ProbeNodesRequestPayload & {
 function shouldSkipUILog(path: string): boolean {
   return (
     path.startsWith("/v1/state") ||
+    path.startsWith("/v1/monitor/records") ||
+    path.startsWith("/v1/monitor/records/content") ||
     path === "/v1/session/heartbeat" ||
     path === "/v1/logs/ui" ||
     path === "/v1/logs/save" ||
@@ -269,6 +274,63 @@ export const daemonApi = {
   async probeNodes(input: ProbeNodesRequestInput): Promise<DaemonSnapshot> {
     const result = await daemonApi.probeNodesWithSummary(input);
     return result.snapshot;
+  },
+  async listRequestMonitorSessions(): Promise<RequestMonitorSessionSummary[]> {
+    const payload: DaemonRequestPayload = {
+      method: "GET",
+      path: "/v1/monitor/records",
+    };
+    const trackUILog = !shouldSkipUILog(payload.path);
+    const response = await window.waterayDesktop.daemon.request(payload);
+    daemonTransportStore.mergeResponse(response);
+    if (!response.ok || !Array.isArray(response.monitorSessions)) {
+      if (trackUILog) {
+        void appendUILog(
+          "error",
+          `UI请求失败 ${payload.method} ${payload.path}: ${response.error ?? "daemon request failed"}`,
+        );
+      }
+      throw new Error(response.error ?? "daemon request failed");
+    }
+    if (trackUILog) {
+      void appendUILog("info", `UI请求成功 ${payload.method} ${payload.path}`);
+    }
+    return response.monitorSessions;
+  },
+  async getRequestMonitorSessionContent(recordId: string): Promise<RequestMonitorSessionContent> {
+    const payload: DaemonRequestPayload = {
+      method: "GET",
+      path: `/v1/monitor/records/content?id=${encodeURIComponent(recordId.trim())}`,
+    };
+    const trackUILog = !shouldSkipUILog(payload.path);
+    const response = await window.waterayDesktop.daemon.request(payload);
+    daemonTransportStore.mergeResponse(response);
+    if (!response.ok || !response.monitorContent) {
+      if (trackUILog) {
+        void appendUILog(
+          "error",
+          `UI请求失败 ${payload.method} ${payload.path}: ${response.error ?? "daemon request failed"}`,
+        );
+      }
+      throw new Error(response.error ?? "daemon request failed");
+    }
+    if (trackUILog) {
+      void appendUILog("info", `UI请求成功 ${payload.method} ${payload.path}`);
+    }
+    return response.monitorContent;
+  },
+  createRequestMonitorSession(input: CreateRequestMonitorSessionRequestPayload): Promise<DaemonSnapshot> {
+    return requestSnapshot({
+      method: "POST",
+      path: "/v1/monitor/sessions",
+      body: input,
+    });
+  },
+  deleteRequestMonitorSession(recordId: string): Promise<DaemonSnapshot> {
+    return requestSnapshot({
+      method: "DELETE",
+      path: `/v1/monitor/records?id=${encodeURIComponent(recordId.trim())}`,
+    });
   },
   removeBackgroundTask(taskId: string): Promise<DaemonSnapshot> {
     return requestSnapshot({

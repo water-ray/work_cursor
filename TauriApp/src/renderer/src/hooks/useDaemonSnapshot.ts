@@ -236,7 +236,7 @@ export function useDaemonSnapshot(options: UseDaemonSnapshotOptions = {}) {
         if (!current) {
           return current;
         }
-        let nextSnapshot = {
+        let nextSnapshot: DaemonSnapshot = {
           ...current,
           backgroundTasks: tasks,
           probeRuntimeTasks: Array.isArray(probeTasks) ? probeTasks : current.probeRuntimeTasks,

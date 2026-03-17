@@ -35,6 +35,14 @@ export const desktopNavRoutes: NavRoute[] = [
     icon: <BiIcon name="diagram-3" />,
   },
   {
+    key: "monitor",
+    path: "/monitor",
+    title: "监控",
+    tip: "临时监控入站请求并提炼分流规则线索",
+    label: "监控",
+    icon: <BiIcon name="activity" />,
+  },
+  {
     key: "logs",
     path: "/logs",
     title: "日志",

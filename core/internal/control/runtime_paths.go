@@ -34,3 +34,7 @@ func resolveDNSCacheFilePath() string {
 func resolveRuleSetStorageDir() string {
 	return filepath.Join(resolveWaterayDataRoot(), "rule-set")
 }
+
+func resolveRequestLogDir() string {
+	return filepath.Join(resolveWaterayDataRoot(), "requestlogs")
+}

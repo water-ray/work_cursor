@@ -24,4 +24,7 @@ func TestResolveWaterayPathsUseDataRootEnv(t *testing.T) {
 	if got := resolveRuleSetStorageDir(); got != filepath.Join(filepath.Clean(dataRoot), "rule-set") {
 		t.Fatalf("unexpected rule-set storage dir: %q", got)
 	}
+	if got := resolveRequestLogDir(); got != filepath.Join(filepath.Clean(dataRoot), "requestlogs") {
+		t.Fatalf("unexpected requestlogs dir: %q", got)
+	}
 }

@@ -115,7 +115,8 @@ export type OperationType =
   | "select_group"
   | "select_node"
   | "apply_settings"
-  | "clear_dns_cache";
+  | "clear_dns_cache"
+  | "request_monitor";
 export type OperationStatusType = "queued" | "running" | "success" | "failed" | "cancelled";
 export type DNSStrategy =
   | "prefer_ipv4"
@@ -515,6 +516,67 @@ export interface UpdateNodeCountriesRequestPayload extends Record<string, unknow
   nodeIds: string[];
 }
 
+export type RequestMonitorScope = "all" | "miss_only";
+
+export interface RequestMonitorProcess {
+  pid: number;
+  name?: string;
+  path?: string;
+}
+
+export interface RequestMonitorRequestTarget {
+  domain?: string;
+  destinationIp?: string;
+  destinationPort?: number;
+  network?: string;
+  protocol?: string;
+  inboundTag?: string;
+  country?: string;
+}
+
+export interface RequestMonitorDecision {
+  recordScope: RequestMonitorScope;
+  ruleMissed: boolean;
+  matchedRule?: string;
+  outboundTag?: string;
+  suggestedRule?: string;
+  uploadBytes?: number;
+  downloadBytes?: number;
+}
+
+export interface RequestMonitorRecord {
+  id: string;
+  timestampMs: number;
+  process: RequestMonitorProcess;
+  request: RequestMonitorRequestTarget;
+  monitor: RequestMonitorDecision;
+  tags?: string[];
+}
+
+export interface RequestMonitorSessionSummary {
+  id: string;
+  fileName: string;
+  fileBaseName: string;
+  durationSec?: number;
+  recordScope?: RequestMonitorScope;
+  createdAtMs?: number;
+  completedAtMs?: number;
+  requestCount: number;
+  running?: boolean;
+  lastError?: string;
+}
+
+export interface RequestMonitorSessionContent {
+  session: RequestMonitorSessionSummary;
+  records: RequestMonitorRecord[];
+}
+
+export interface CreateRequestMonitorSessionRequestPayload extends Record<string, unknown> {
+  durationSec: number;
+  fileBaseName: string;
+  recordScope: RequestMonitorScope;
+}
+
 export interface RemoveNodeRequestItem extends Record<string, unknown> {
   groupId: string;
   nodeId: string;
@@ -849,4 +911,6 @@ export interface DaemonResponsePayload {
   task?: BackgroundTask;
   operation?: OperationStatus;
   transport?: TransportStatus;
+  monitorSessions?: RequestMonitorSessionSummary[];
+  monitorContent?: RequestMonitorSessionContent;
 }

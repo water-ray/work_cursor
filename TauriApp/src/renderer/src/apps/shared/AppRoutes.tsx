@@ -16,6 +16,9 @@ const DnsPage = lazy(async () => ({
 const RulesPage = lazy(async () => ({
   default: (await import("../../pages/rules/RulesPage")).RulesPage,
 }));
+const MonitorPage = lazy(async () => ({
+  default: (await import("../../pages/monitor/MonitorPage")).MonitorPage,
+}));
 const LogsPage = lazy(async () => ({
   default: (await import("../../pages/logs/LogsPage")).LogsPage,
 }));
@@ -172,6 +175,10 @@ export function AppRoutes({
         />
         <Route path="/dns" element={<DnsPage {...daemonState} />} />
         <Route path="/rules" element={<RulesPage {...daemonState} />} />
+        <Route
+          path="/monitor"
+          element={isMobile ? <Navigate to={defaultRoutePath} replace /> : <MonitorPage {...daemonState} />}
+        />
         <Route path="/logs" element={<LogsPage {...daemonState} />} />
         <Route path="/airport" element={<AirportPage command={null} />} />
         <Route path="/settings" element={<SettingsPage {...daemonState} />} />

@@ -1,6 +1,9 @@
 package control
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func TestBuildTrafficTickFromConnectionsSnapshot(t *testing.T) {
 	stats := buildTrafficTickFromConnectionsSnapshot(clashConnectionsSnapshot{
@@ -80,5 +83,59 @@ func TestParseRuntimeNodeIDFromTag(t *testing.T) {
 	}
 	if _, ok := parseRuntimeNodeIDFromTag("node-"); ok {
 		t.Fatalf("expected empty node id to be rejected")
+	}
+}
+
+func TestUnmarshalClashConnectionsSnapshotAcceptsStringNumbers(t *testing.T) {
+	raw := []byte(`{
+		"uploadTotal": "120",
+		"downloadTotal": 360,
+		"upload_total": "180",
+		"download_total": 240,
+		"connections": [
+			{
+				"id": "conn-1",
+				"upload": "100",
+				"download": 200,
+				"upload_bytes": "150",
+				"download_bytes": 250,
+				"metadata": {
+					"network": "tcp",
+					"host": "example.com",
+					"destinationPort": "443",
+					"destination_port": 8443,
+					"processId": "1234",
+					"process_id": 5678
+				},
+				"chains": ["proxy", "node-alpha"]
+			}
+		]
+	}`)
+
+	var payload clashConnectionsSnapshot
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("unmarshal clash connections snapshot failed: %v", err)
+	}
+	if payload.UploadTotal != 120 || payload.UploadTotalSnake != 180 {
+		t.Fatalf("unexpected upload totals: %+v", payload)
+	}
+	if payload.DownloadTotal != 360 || payload.DownloadTotalSnake != 240 {
+		t.Fatalf("unexpected download totals: %+v", payload)
+	}
+	if len(payload.Connections) != 1 {
+		t.Fatalf("expected 1 connection, got %d", len(payload.Connections))
+	}
+	connection := payload.Connections[0]
+	if connection.Upload != 100 || connection.UploadSnake != 150 {
+		t.Fatalf("unexpected upload fields: %+v", connection)
+	}
+	if connection.Download != 200 || connection.DownloadSnake != 250 {
+		t.Fatalf("unexpected download fields: %+v", connection)
+	}
+	if connection.Metadata.DestinationPort != 443 || connection.Metadata.DestinationPortSnake != 8443 {
+		t.Fatalf("unexpected destination ports: %+v", connection.Metadata)
+	}
+	if connection.Metadata.ProcessID != 1234 || connection.Metadata.ProcessIDSnake != 5678 {
+		t.Fatalf("unexpected process ids: %+v", connection.Metadata)
 	}
 }
