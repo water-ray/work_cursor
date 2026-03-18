@@ -21,6 +21,8 @@ if str(ROOT_DIR) not in sys.path:
 from scripts.build.targets.desktop import resolve_current_platform_id
 from scripts.release.release_framework import (
     DEFAULT_PUBLIC_REPO,
+    PLATFORM_DISPLAY_NAMES,
+    PLATFORM_ORDER,
     ReleaseFrameworkError,
     read_version,
     resolve_release_assets_in_dir,
@@ -32,16 +34,22 @@ DEFAULT_RELEASE_ROOT_DIR = ROOT_DIR / "Bin" / "github-staging-release"
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="上传当前平台客户端产物到 GitHub staging release")
+    parser = argparse.ArgumentParser(description="上传单个平台客户端产物到 GitHub staging release")
     parser.add_argument(
         "--repo",
         default=DEFAULT_PUBLIC_REPO,
         help="公开发布仓库 owner/name，例如 water-ray/wateray-release",
     )
     parser.add_argument(
+        "--platform",
+        choices=("current", "windows", "linux", "android"),
+        default="current",
+        help="要上传的平台：current / windows / linux / android，默认 current",
+    )
+    parser.add_argument(
         "--release-root-dir",
         default="",
-        help="当前平台发布素材根目录，默认 Bin/github-staging-release",
+        help="单平台发布素材根目录，默认 Bin/github-staging-release",
     )
     parser.add_argument(
         "--dry-run",
@@ -82,6 +90,12 @@ def resolve_staging_root_dir(raw_value: str) -> Path:
     return resolve_release_root_dir(raw_value)
 
 
+def resolve_target_platform(platform_arg: str) -> str:
+    if platform_arg == "current":
+        return resolve_current_platform_id()
+    return platform_arg
+
+
 def collect_uploaded_platforms(repo: str, tag: str) -> list[str]:
     result = run_command(
         [
@@ -108,16 +122,19 @@ def collect_uploaded_platforms(repo: str, tag: str) -> list[str]:
 
 
 def build_staging_notes(version: str, uploaded_platforms: list[str]) -> str:
-    expected = {"windows", "linux"}
+    expected = set(PLATFORM_ORDER)
     uploaded = set(uploaded_platforms)
     missing = sorted(expected - uploaded)
+    uploaded_labels = [PLATFORM_DISPLAY_NAMES.get(item, item) for item in sorted(uploaded)]
+    missing_labels = [PLATFORM_DISPLAY_NAMES.get(item, item) for item in missing]
+    expected_labels = " / ".join(PLATFORM_DISPLAY_NAMES.get(item, item) for item in PLATFORM_ORDER)
     lines = [
         f"# Wateray staging v{version}",
         "",
-        "当前 release 仅用于汇总 Windows + Linux 构建产物，正式发布将由 GitHub Actions 统一执行。",
+        f"当前 release 仅用于汇总 {expected_labels} 构建产物，正式发布将由 GitHub Actions 统一执行。",
         "",
-        f"- 已上传平台：{', '.join(sorted(uploaded)) if uploaded else '无'}",
-        f"- 缺少平台：{', '.join(missing) if missing else '无'}",
+        f"- 已上传平台：{', '.join(uploaded_labels) if uploaded_labels else '无'}",
+        f"- 缺少平台：{', '.join(missing_labels) if missing_labels else '无'}",
     ]
     return "\n".join(lines)
 
@@ -148,7 +165,7 @@ def ensure_staging_release(repo: str, tag: str, title: str, *, dry_run: bool) ->
             "--title",
             title,
             "--notes",
-            "等待 Windows 与 Linux 客户端产物上传完成后，由 GitHub Actions 统一汇总正式发布。",
+            "等待 Windows / Linux / Android 客户端产物上传完成后，由 GitHub Actions 统一汇总正式发布。",
             "--draft",
             "--prerelease",
         ]
@@ -205,7 +222,7 @@ def main() -> int:
         args = parse_args()
         version = read_version()
         repo = args.repo.strip() or DEFAULT_PUBLIC_REPO
-        platform_id = resolve_current_platform_id()
+        platform_id = resolve_target_platform(args.platform)
         release_root_dir = resolve_staging_root_dir(args.release_root_dir)
         release_dir = release_root_dir / f"v{version}"
         assets = resolve_release_assets_in_dir(version, release_dir, {platform_id})
@@ -216,13 +233,13 @@ def main() -> int:
         upload_platform_assets(repo, staging_tag, [*([item.path for item in assets]), manifest_path], dry_run=args.dry_run)
         update_staging_release_notes(repo, staging_tag, version, dry_run=args.dry_run)
         if not args.dry_run:
-            print(f"已上传当前平台产物：{platform_id} -> {repo} {staging_tag}")
+            print(f"已上传平台产物：{platform_id} -> {repo} {staging_tag}")
         return 0
     except ReleaseFrameworkError as err:
-        print(f"上传当前平台产物失败：{err}", file=sys.stderr)
+        print(f"上传平台产物失败：{err}", file=sys.stderr)
         return 1
     except Exception as err:  # pragma: no cover
-        print(f"上传当前平台产物失败：[unexpected] {err}", file=sys.stderr)
+        print(f"上传平台产物失败：[unexpected] {err}", file=sys.stderr)
         return 99
 
 

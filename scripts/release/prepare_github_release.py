@@ -42,9 +42,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--platform",
-        choices=("all", "current", "windows", "linux"),
+        choices=("all", "current", "windows", "linux", "android"),
         default="all",
-        help="要收集的平台：all / current / windows / linux，默认 all",
+        help="要收集的平台：all / current / windows / linux / android，默认 all",
     )
     parser.add_argument(
         "--source-archives-dir",

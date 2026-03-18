@@ -1,6 +1,6 @@
 [package]
 name = "wateray_tauri"
-version = "1.5.0"
+version = "1.5.1"
 description = "Wateray desktop frontend powered by Tauri v2"
 authors = ["Wateray Contributors"]
 license = ""

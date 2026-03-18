@@ -438,7 +438,28 @@
       }
     },
     {
-      "label": "公开发布：触发 GitHub 汇总发布",
+      "label": "公开发布：上传安卓产物到 GitHub",
+      "type": "shell",
+      "command": "python scripts/release/build_and_upload_android_release.py --repo \"${input:githubPublicRepo}\" --release-root-dir \"Bin/github-staging-release\"",
+      "linux": {
+        "command": "/bin/bash",
+        "args": [
+          "-lc",
+          "source \"$HOME/.cargo/env\" && exec python3 scripts/release/build_and_upload_android_release.py --repo \"${input:githubPublicRepo}\" --release-root-dir \"Bin/github-staging-release\""
+        ]
+      },
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": true
+      }
+    },
+    {
+      "label": "公开发布：触发 GitHub 汇总发布（Windows/Linux/Android）",
       "type": "shell",
       "command": "python scripts/release/dispatch_github_release_workflow.py --public-repo \"${input:githubPublicRepo}\"",
       "linux": {

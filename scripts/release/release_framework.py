@@ -20,20 +20,23 @@ CHANGELOG_LATEST_PATH = ROOT_DIR / "docs" / "build" / "CHANGELOG_LATEST.md"
 BIN_DIR = ROOT_DIR / "Bin"
 RELEASE_ROOT_DIR = BIN_DIR / "github-release"
 DEFAULT_PUBLIC_REPO = "water-ray/wateray-release"
-PLATFORM_ORDER = ("windows", "linux")
+PLATFORM_ORDER = ("windows", "linux", "android")
 PLATFORM_DISPLAY_NAMES = {
     "windows": "Windows",
     "linux": "Linux",
+    "android": "Android",
 }
 PLATFORM_DIRECTORY_NAMES = {
     "windows": "Wateray-windows",
     "linux": "Wateray-linux",
+    "android": "Wateray-Android",
 }
 LINUX_PACKAGE_OUTPUT_DIR = BIN_DIR / "Wateray-linux-packages"
 ASSET_KIND_ORDER = {
     "portable-zip": 0,
     "deb": 1,
     "appimage": 2,
+    "apk": 3,
 }
 
 
@@ -321,6 +324,8 @@ def build_compatibility_summary(assets: list[ReleaseAsset]) -> str:
     normalized = [item.lower() for item in distinct_platforms(assets)]
     if normalized == ["windows"]:
         return "当前公开发布包仅包含 Windows 客户端；Linux 客户端将在后续补齐后一起发布。"
+    if normalized == ["android"]:
+        return "当前公开发布包仅包含 Android 客户端；桌面客户端将在后续补齐后一起发布。"
     return f"当前公开发布包包含：{', '.join(platforms)}。请按对应平台下载使用。"
 
 
@@ -350,6 +355,11 @@ def resolve_expected_release_assets(version: str, platform_id: str) -> tuple[Exp
             ExpectedReleaseAsset("linux", "Linux Debian/Ubuntu 安装包", f"wateray_{version}_amd64.deb", "deb"),
             ExpectedReleaseAsset("linux", "Linux AppImage 便携包", f"Wateray-linux-v{version}-x86_64.AppImage", "appimage"),
         )
+    if platform_id == "android":
+        return (
+            ExpectedReleaseAsset("android", "Android arm64 release APK", f"Wateray-Android-v{version}-arm64-release.apk", "apk", True),
+            ExpectedReleaseAsset("android", "Android x86_64 release APK", f"Wateray-Android-v{version}-x86_64-release.apk", "apk"),
+        )
     raise ReleaseFrameworkError(f"不支持的平台：{platform_id}")
 
 
@@ -358,6 +368,8 @@ def resolve_local_asset_source(expected: ExpectedReleaseAsset) -> tuple[str, Pat
         return ("directory", BIN_DIR / PLATFORM_DIRECTORY_NAMES[expected.platform_id])
     if expected.platform_id == "linux":
         return ("file", LINUX_PACKAGE_OUTPUT_DIR / expected.asset_name)
+    if expected.platform_id == "android":
+        return ("file", BIN_DIR / PLATFORM_DIRECTORY_NAMES["android"] / expected.asset_name)
     raise ReleaseFrameworkError(f"无法解析本地发布资产来源：{expected.asset_name}")
 
 

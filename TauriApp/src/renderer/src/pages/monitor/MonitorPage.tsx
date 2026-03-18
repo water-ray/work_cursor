@@ -10,7 +10,6 @@ import {
   Select,
   Space,
   Table,
-  Tag,
   Tooltip,
   Typography,
 } from "antd";
@@ -81,6 +80,7 @@ interface RequestMonitorSession {
 
 const monitorDurationOptions = [10, 30, 60, 120];
 const monitorPageSize = 12;
+const monitorTableMaxHeightPx = 470;
 const filterKeyPresets = [
   "process:",
   "pid:",
@@ -135,16 +135,8 @@ function formatRecordScopeLabel(scope: RequestMonitorScope): string {
   return scope === "miss_only" ? "仅漏网之鱼" : "全部请求";
 }
 
-function formatRecordScopeColor(scope: RequestMonitorScope): string {
-  return scope === "miss_only" ? "purple" : "default";
-}
-
 function formatMonitorResultLabel(ruleMissed: boolean): string {
   return ruleMissed ? "漏网之鱼" : "规则命中";
-}
-
-function formatMonitorResultColor(ruleMissed: boolean): string {
-  return ruleMissed ? "magenta" : "blue";
 }
 
 function formatCompactTimestamp(timestampMs: number): string {
@@ -258,15 +250,6 @@ function buildDuplicateRecordKey(record: RequestMonitorRecord): string {
   ].join("|");
 }
 
-function buildCompactRequestTarget(record: RequestMonitorRecord): string {
-  const host = record.domain.trim() || record.destinationIp.trim();
-  if (host === "") {
-    return "-";
-  }
-  const port = record.destinationPort > 0 ? `:${record.destinationPort}` : "";
-  return `${host}${port}`;
-}
-
 function buildRequestMonitorRecordJSON(record: RequestMonitorRecord): string {
   return JSON.stringify(
     {
@@ -320,7 +303,7 @@ function keepLatestDuplicateRecords(records: RequestMonitorRecord[]): RequestMon
   return deduped;
 }
 
-function matchesFilterToken(record: RequestMonitorRecord, token: string): boolean {
+function matchesPositiveFilterToken(record: RequestMonitorRecord, token: string): boolean {
   const normalizedToken = token.trim().toLowerCase();
   if (normalizedToken === "") {
     return true;
@@ -367,6 +350,20 @@ function matchesFilterToken(record: RequestMonitorRecord, token: string): boolea
     default:
       return buildRecordSearchText(record).includes(value);
   }
+}
+
+function matchesFilterToken(record: RequestMonitorRecord, token: string): boolean {
+  const normalizedToken = token.trim();
+  if (normalizedToken === "") {
+    return true;
+  }
+  const negated = normalizedToken.startsWith("!");
+  const positiveToken = negated ? normalizedToken.slice(1).trim() : normalizedToken;
+  if (positiveToken === "" || positiveToken.endsWith(":")) {
+    return true;
+  }
+  const matched = matchesPositiveFilterToken(record, positiveToken);
+  return negated ? !matched : matched;
 }
 
 function appendFilterTokenOption(
@@ -933,37 +930,30 @@ export function MonitorPage({ loading, runAction, snapshot }: DaemonPageProps) {
         ),
       },
       {
-        title: "请求目标",
-        key: "target",
+        title: "域名",
+        key: "domain",
         width: 260,
         ellipsis: true,
-        render: (_unused, record) => {
-          const target = buildCompactRequestTarget(record);
-          const tooltip = [target, record.destinationIp, record.network, record.protocol, record.country]
-            .filter((item) => String(item ?? "").trim() !== "" && String(item) !== "-")
-            .join(" · ");
-          return <Typography.Text ellipsis={{ tooltip: tooltip || target }}>{target}</Typography.Text>;
-        },
+        render: (_unused, record) =>
+          record.domain.trim() === "" ? (
+            ""
+          ) : (
+            <Typography.Text ellipsis={{ tooltip: record.domain }}>{record.domain}</Typography.Text>
+          ),
       },
       {
-        title: "结果",
-        key: "result",
-        width: 190,
-        render: (_unused, record) => {
-          const tooltip = [formatMonitorResultLabel(record.ruleMissed), record.outboundTag, record.matchedRule]
-            .filter((item) => String(item ?? "").trim() !== "")
-            .join(" · ");
-          return (
-            <Tooltip title={tooltip}>
-              <Space size={6} wrap={false}>
-                <Tag color={formatMonitorResultColor(record.ruleMissed)}>
-                  {formatMonitorResultLabel(record.ruleMissed)}
-                </Tag>
-                {record.outboundTag ? <Tag>{record.outboundTag}</Tag> : null}
-              </Space>
-            </Tooltip>
-          );
-        },
+        title: "IP",
+        key: "destinationIp",
+        width: 180,
+        ellipsis: true,
+        render: (_unused, record) =>
+          record.destinationIp.trim() === "" ? (
+            ""
+          ) : (
+            <Typography.Text ellipsis={{ tooltip: record.destinationIp }}>
+              {record.destinationIp}
+            </Typography.Text>
+          ),
       },
       {
         title: "规则建议",
@@ -1060,28 +1050,16 @@ export function MonitorPage({ loading, runAction, snapshot }: DaemonPageProps) {
       bodyStyle={{ padding: 16 }}
     >
       <Space direction="vertical" size={14} style={{ width: "100%" }}>
-        {selectedSession ? (
-          <Space wrap size={[8, 8]}>
-            <Tag color="blue">记录 {selectedSession.fileName}</Tag>
-            <Tag color={formatRecordScopeColor(selectedSession.recordScope)}>
-              {formatRecordScopeLabel(selectedSession.recordScope)}
-            </Tag>
-            <Tag color={selectedSession.running ? "processing" : "default"}>
-              {selectedSession.running ? "运行中" : "已完成"}
-            </Tag>
-            <Tag>请求数 {selectedSession.requestCount}</Tag>
-            {selectedSession.lastError ? <Tag color="error">错误: {selectedSession.lastError}</Tag> : null}
-          </Space>
-        ) : (
+        {selectedSession == null ? (
           <Typography.Text type="secondary">先创建一条监控记录，再查看请求明细。</Typography.Text>
-        )}
+        ) : null}
 
         <Space wrap align="start" size={10} style={{ width: "100%" }}>
           <Select
             mode="tags"
             value={filterTokens}
             options={filterTokenOptions}
-            placeholder="过滤：支持 key:value，示例 process:chrome domain:github.com"
+            placeholder="过滤：支持 key:value / !key:value，示例 process:chrome !process:chrome domain:github.com"
             onChange={(values) =>
               setFilterTokens(
                 Array.from(
@@ -1146,7 +1124,7 @@ export function MonitorPage({ loading, runAction, snapshot }: DaemonPageProps) {
               pagination={false}
               loading={tableLoading}
               locale={{ emptyText: "当前筛选条件下没有记录" }}
-              scroll={{ x: 980 }}
+              scroll={{ x: 980, y: monitorTableMaxHeightPx }}
             />
 
             <Space

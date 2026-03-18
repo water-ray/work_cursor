@@ -18,6 +18,7 @@ if str(ROOT_DIR) not in sys.path:
 
 from scripts.release.release_framework import (
     DEFAULT_PUBLIC_REPO,
+    PLATFORM_DISPLAY_NAMES,
     PLATFORM_ORDER,
     ReleaseAsset,
     ReleaseFrameworkError,
@@ -134,7 +135,7 @@ def validate_staging_assets(
         available_platforms.add(platform)
     commits = {str(item.get("sourceCommit", "")).strip() for item in manifests.values() if str(item.get("sourceCommit", "")).strip()}
     if len(commits) > 1:
-        raise ReleaseFrameworkError("Windows 与 Linux 构建来源提交不一致，请确认两台机器使用同一源码版本")
+        raise ReleaseFrameworkError("各平台构建来源提交不一致，请确认上传的 staging 产物来自同一源码版本")
     return available_platforms, manifests, platform_assets
 
 
@@ -146,13 +147,15 @@ def write_status_file(
 ) -> None:
     expected = set(PLATFORM_ORDER)
     missing = sorted(expected - available_platforms)
+    uploaded_labels = [PLATFORM_DISPLAY_NAMES.get(item, item) for item in sorted(available_platforms)]
+    missing_labels = [PLATFORM_DISPLAY_NAMES.get(item, item) for item in missing]
     lines = [
         f"# Wateray v{version} 汇总状态",
         "",
         "正式 Release 尚未发布，当前仍在等待 staging 产物齐备。",
         "",
-        f"- 已收到平台：{', '.join(sorted(available_platforms)) if available_platforms else '无'}",
-        f"- 缺少平台：{', '.join(missing) if missing else '无'}",
+        f"- 已收到平台：{', '.join(uploaded_labels) if uploaded_labels else '无'}",
+        f"- 缺少平台：{', '.join(missing_labels) if missing_labels else '无'}",
     ]
     commits = sorted({str(item.get('sourceCommit', '')).strip() for item in manifests.values() if str(item.get('sourceCommit', '')).strip()})
     if commits:

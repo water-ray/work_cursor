@@ -1,4 +1,4 @@
-name: Desktop Release
+name: Client Release
 
 on:
   workflow_dispatch:
@@ -18,7 +18,7 @@ permissions:
 
 jobs:
   aggregate_release:
-    name: Aggregate Desktop Release
+    name: Aggregate Client Release
     runs-on: ubuntu-latest
     env:
       RELEASE_VERSION: ${{ inputs.version }}
