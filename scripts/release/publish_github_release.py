@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -21,6 +23,9 @@ from scripts.release.release_framework import (
     DEFAULT_PUBLIC_REPO,
     RELEASE_ROOT_DIR,
     ReleaseFrameworkError,
+    ReleaseAsset,
+    build_public_release_readme,
+    load_release_asset_records_from_latest_json,
     load_release_assets_from_latest_json,
     read_version,
     resolve_release_root_dir,
@@ -49,6 +54,11 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="发布素材根目录，默认 Bin/github-release",
     )
+    parser.add_argument(
+        "--skip-readme-sync",
+        action="store_true",
+        help="跳过公开发布仓库 README.md 自动同步",
+    )
     return parser.parse_args()
 
 
@@ -76,7 +86,7 @@ def ensure_gh_ready() -> None:
     run_command(["gh", "auth", "status"], check=True)
 
 
-def resolve_release_files(version: str, release_root_dir: Path) -> tuple[Path, Path, list[Path]]:
+def resolve_release_files(version: str, release_root_dir: Path) -> tuple[Path, Path, list[Path], list[ReleaseAsset]]:
     release_dir = release_root_dir / f"v{version}"
     notes_path = release_dir / f"release-notes-v{version}.md"
     latest_path = release_dir / "latest.json"
@@ -92,11 +102,12 @@ def resolve_release_files(version: str, release_root_dir: Path) -> tuple[Path, P
     asset_names = load_release_assets_from_latest_json(latest_path)
     if not asset_names:
         raise ReleaseFrameworkError("latest.json 中没有正式发布资产")
+    release_assets = load_release_asset_records_from_latest_json(latest_path)
     asset_paths = [release_dir / name for name in asset_names]
     missing_assets = [str(path) for path in asset_paths if not path.exists()]
     if missing_assets:
         raise ReleaseFrameworkError(f"发布素材不完整：{', '.join(missing_assets)}")
-    return release_dir, notes_path, [*asset_paths, sha_path, latest_path, latest_github_path]
+    return release_dir, notes_path, [*asset_paths, sha_path, latest_path, latest_github_path], release_assets
 
 
 def release_exists(repo: str, tag: str) -> bool:
@@ -178,6 +189,62 @@ def publish_release(repo: str, tag: str, title: str, notes_path: Path, assets: l
     print(f"已创建 GitHub Release：{repo} {tag}")
 
 
+def resolve_repo_file_state(repo: str, path: str) -> tuple[str, str]:
+    result = run_command(
+        ["gh", "api", f"repos/{repo}/contents/{path}"],
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode == 0:
+        try:
+            payload = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError as err:
+            raise ReleaseFrameworkError(f"解析 {repo}/{path} 元数据失败") from err
+        sha = str(payload.get("sha", "")).strip()
+        if not sha:
+            raise ReleaseFrameworkError(f"{repo}/{path} 缺少 sha，无法更新 README")
+        content = ""
+        if str(payload.get("encoding", "")).strip().lower() == "base64":
+            raw_content = str(payload.get("content", "")).replace("\n", "")
+            if raw_content:
+                try:
+                    content = base64.b64decode(raw_content.encode("ascii")).decode("utf-8")
+                except Exception as err:  # pragma: no cover
+                    raise ReleaseFrameworkError(f"解码 {repo}/{path} 内容失败") from err
+        return sha, content
+    detail = (result.stderr or result.stdout or "").strip()
+    if "404" in detail or "Not Found" in detail:
+        return "", ""
+    raise ReleaseFrameworkError(detail or f"读取 {repo}/{path} 失败")
+
+
+def sync_public_release_readme(repo: str, version: str, assets: list[ReleaseAsset], *, dry_run: bool) -> None:
+    readme_content = build_public_release_readme(version, repo, assets)
+    if dry_run:
+        print(f"[dry-run] 将同步 {repo} 的 README.md")
+        return
+    readme_sha, existing_content = resolve_repo_file_state(repo, "README.md")
+    if existing_content == readme_content:
+        print(f"公开发布 README 已是最新：{repo}/README.md")
+        return
+    encoded_content = base64.b64encode(readme_content.encode("utf-8")).decode("ascii")
+    command = [
+        "gh",
+        "api",
+        f"repos/{repo}/contents/README.md",
+        "--method",
+        "PUT",
+        "-f",
+        f"message=docs: update public release README for v{version}",
+        "-f",
+        f"content={encoded_content}",
+    ]
+    if readme_sha:
+        command.extend(["-f", f"sha={readme_sha}"])
+    run_command(command, check=True)
+    print(f"已同步公开发布 README：{repo}/README.md")
+
+
 def main() -> int:
     try:
         args = parse_args()
@@ -186,9 +253,11 @@ def main() -> int:
         release_root_dir = resolve_release_root_dir(args.release_root_dir) if args.release_root_dir.strip() else RELEASE_ROOT_DIR
         tag = f"v{version}"
         title = f"Wateray {tag}"
-        _release_dir, notes_path, assets = resolve_release_files(version, release_root_dir)
+        _release_dir, notes_path, assets, release_assets = resolve_release_files(version, release_root_dir)
         ensure_gh_ready()
         publish_release(repo, tag, title, notes_path, assets, dry_run=args.dry_run)
+        if not args.skip_readme_sync:
+            sync_public_release_readme(repo, version, release_assets, dry_run=args.dry_run)
         return 0
     except ReleaseFrameworkError as err:
         print(f"GitHub Release 发布失败：{err}", file=sys.stderr)

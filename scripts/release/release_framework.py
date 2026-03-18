@@ -20,6 +20,7 @@ CHANGELOG_LATEST_PATH = ROOT_DIR / "docs" / "build" / "CHANGELOG_LATEST.md"
 BIN_DIR = ROOT_DIR / "Bin"
 RELEASE_ROOT_DIR = BIN_DIR / "github-release"
 DEFAULT_PUBLIC_REPO = "water-ray/wateray-release"
+OFFICIAL_SITE_URL = "https://wateray.net/"
 PLATFORM_ORDER = ("windows", "linux", "android")
 PLATFORM_DISPLAY_NAMES = {
     "windows": "Windows",
@@ -525,6 +526,11 @@ def write_latest_json(version: str, release_dir: Path, assets: list[ReleaseAsset
     return output
 
 
+def build_release_asset_download_url(public_repo: str, release_tag: str, asset_name: str) -> str:
+    repo = public_repo.strip() or DEFAULT_PUBLIC_REPO
+    return f"https://github.com/{repo}/releases/download/{release_tag}/{asset_name}"
+
+
 def write_latest_json_for_github(version: str, public_repo: str, release_dir: Path, assets: list[ReleaseAsset]) -> Path:
     release_tag = f"v{version}"
     repo = public_repo.strip() or DEFAULT_PUBLIC_REPO
@@ -539,7 +545,7 @@ def write_latest_json_for_github(version: str, public_repo: str, release_dir: Pa
         "assets": [
             {
                 **build_asset_payload(asset),
-                "downloadUrl": f"https://github.com/{repo}/releases/download/{release_tag}/{asset.asset_name}",
+                "downloadUrl": build_release_asset_download_url(repo, release_tag, asset.asset_name),
             }
             for asset in sort_release_assets(assets)
         ],
@@ -587,6 +593,69 @@ def write_release_notes(version: str, public_repo: str, release_dir: Path, asset
     output = release_dir / f"release-notes-{release_tag}.md"
     output.write_text("\n".join(lines), encoding="utf-8")
     return output
+
+
+def build_public_release_readme(version: str, public_repo: str, assets: list[ReleaseAsset]) -> str:
+    release_tag = f"v{version}"
+    repo = public_repo.strip() or DEFAULT_PUBLIC_REPO
+    ordered_assets = sort_release_assets(assets)
+    summary = build_release_summary(version, ordered_assets)
+    platform_ids = distinct_platforms(ordered_assets)
+    platform_labels = [PLATFORM_DISPLAY_NAMES.get(item, item) for item in platform_ids]
+    lines = [
+        "# Wateray Release",
+        "",
+        f"官网：[{OFFICIAL_SITE_URL}]({OFFICIAL_SITE_URL})",
+        "",
+        "Wateray 的公开发布仓库，用于分发客户端安装包、版本说明与升级索引文件。",
+        "此 README 由发布流程自动更新。",
+        "",
+        "## 当前稳定版本",
+        "",
+        f"- 版本：`{version}`",
+        "- 发布渠道：稳定版",
+        f"- 当前平台：{', '.join(platform_labels) if platform_labels else '暂无公开发布平台'}",
+        f"- Release 页面：[Wateray {release_tag}](https://github.com/{repo}/releases/tag/{release_tag})",
+        f"- 全部版本：[查看 Releases](https://github.com/{repo}/releases)",
+        "",
+        "## 更新摘要",
+        f"- 新功能：{summary['features']}",
+        f"- 修复：{summary['fixes']}",
+        f"- 优化：{summary['refactors']}",
+        f"- 兼容性说明：{summary['compatibility']}",
+        "",
+        "## 下载文件",
+        "",
+    ]
+    for platform_id in platform_ids:
+        lines.append(f"### {PLATFORM_DISPLAY_NAMES.get(platform_id, platform_id)}")
+        lines.append("")
+        for asset in ordered_assets:
+            if asset.platform_id != platform_id:
+                continue
+            asset_url = build_release_asset_download_url(repo, release_tag, asset.asset_name)
+            recommendation = "，推荐下载" if asset.primary else ""
+            lines.append(
+                f"- [{asset.asset_name}]({asset_url})：{asset.label}（{format_size(asset.path.stat().st_size)}{recommendation}）"
+            )
+        lines.append("")
+    lines.extend(
+        [
+            "## 附加文件",
+            "",
+            f"- [SHA256SUMS.txt]({build_release_asset_download_url(repo, release_tag, 'SHA256SUMS.txt')})：发布文件校验值。",
+            f"- [latest.json]({build_release_asset_download_url(repo, release_tag, 'latest.json')})：机器可读版本摘要。",
+            f"- [latest-github.json]({build_release_asset_download_url(repo, release_tag, 'latest-github.json')})：带 GitHub 下载地址的版本摘要。",
+            f"- [本次版本说明](https://github.com/{repo}/releases/tag/{release_tag})：查看完整 Release Notes。",
+            "",
+            "## 说明",
+            "",
+            "- 该仓库默认只保留公开发布所需文件，不包含源码开发文档。",
+            "- 当前公开发布平台以本 README 与对应 Release 附件为准。",
+            "",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def write_platform_build_manifest(
@@ -664,3 +733,38 @@ def load_release_assets_from_latest_json(latest_json_path: Path) -> list[str]:
         if name:
             names.append(name)
     return names
+
+
+def load_release_asset_records_from_latest_json(latest_json_path: Path) -> list[ReleaseAsset]:
+    try:
+        payload = json.loads(latest_json_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as err:
+        raise ReleaseFrameworkError(f"latest.json 解析失败：{latest_json_path}") from err
+    assets_payload = payload.get("assets", [])
+    if not isinstance(assets_payload, list):
+        raise ReleaseFrameworkError("latest.json 缺少 assets 列表")
+    release_dir = latest_json_path.parent
+    assets: list[ReleaseAsset] = []
+    for item in assets_payload:
+        if not isinstance(item, dict):
+            raise ReleaseFrameworkError("latest.json 资产条目非法")
+        asset_name = str(item.get("name", "")).strip()
+        label = str(item.get("label", "")).strip()
+        platform_id = str(item.get("platform", "")).strip()
+        kind = str(item.get("kind", "")).strip()
+        primary = bool(item.get("primary", False))
+        if not asset_name or not label or not platform_id or not kind:
+            raise ReleaseFrameworkError("latest.json 缺少必要资产字段")
+        asset_path = release_dir / asset_name
+        if not asset_path.exists():
+            raise ReleaseFrameworkError(f"发布素材不完整：{asset_path}")
+        assets.append(
+            ReleaseAsset(
+                platform_id=platform_id,
+                label=label,
+                path=asset_path,
+                kind=kind,
+                primary=primary,
+            )
+        )
+    return sort_release_assets(assets)
