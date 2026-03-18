@@ -185,6 +185,10 @@ func TestUnmarshalClashConnectionsSnapshotAcceptsStringNumbers(t *testing.T) {
 				"metadata": {
 					"network": "tcp",
 					"host": "example.com",
+					"sourceIP": "127.0.0.1",
+					"sourcePort": "52345",
+					"source_ip": "127.0.0.2",
+					"source_port": 52346,
 					"destinationPort": "443",
 					"destination_port": 8443,
 					"processId": "1234",
@@ -214,6 +218,12 @@ func TestUnmarshalClashConnectionsSnapshotAcceptsStringNumbers(t *testing.T) {
 	}
 	if connection.Download != 200 || connection.DownloadSnake != 250 {
 		t.Fatalf("unexpected download fields: %+v", connection)
+	}
+	if connection.Metadata.SourceIP != "127.0.0.1" || connection.Metadata.SourceIPSnake != "127.0.0.2" {
+		t.Fatalf("unexpected source ips: %+v", connection.Metadata)
+	}
+	if connection.Metadata.SourcePort != 52345 || connection.Metadata.SourcePortSnake != 52346 {
+		t.Fatalf("unexpected source ports: %+v", connection.Metadata)
 	}
 	if connection.Metadata.DestinationPort != 443 || connection.Metadata.DestinationPortSnake != 8443 {
 		t.Fatalf("unexpected destination ports: %+v", connection.Metadata)

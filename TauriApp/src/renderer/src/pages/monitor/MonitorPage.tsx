@@ -15,7 +15,7 @@ import {
 } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import type { TableRowSelection } from "antd/es/table/interface";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type { DaemonPageProps } from "../../app/types";
 import { HelpLabel } from "../../components/form/HelpLabel";
@@ -143,6 +143,26 @@ function formatCompactTimestamp(timestampMs: number): string {
   const date = new Date(timestampMs);
   const pad = (value: number) => String(value).padStart(2, "0");
   return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+function formatCountdownDuration(remainingMs: number): string {
+  const totalSeconds = Math.max(0, Math.ceil(remainingMs / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  const pad = (value: number) => String(value).padStart(2, "0");
+  if (hours > 0) {
+    return `${pad(hours)}:${pad(minutes)}:${pad(seconds)}`;
+  }
+  return `${pad(minutes)}:${pad(seconds)}`;
+}
+
+function resolveMonitorSessionRemainingMs(session: RequestMonitorSession | null, nowMs: number): number | null {
+  if (session == null || !session.running || session.createdAtMs <= 0 || session.durationSec <= 0) {
+    return null;
+  }
+  const deadlineMs = session.createdAtMs + session.durationSec * 1000;
+  return Math.max(0, deadlineMs - nowMs);
 }
 
 function formatBytes(value: number): string {
@@ -516,9 +536,12 @@ function buildRulePreviewHelpContent(kind: RulePreviewKind) {
 
 export function MonitorPage({ loading, runAction, snapshot }: DaemonPageProps) {
   const notice = useAppNotice();
+  const previousRunningSessionIdsRef = useRef<string[]>([]);
+  const countdownSyncSessionIdRef = useRef("");
 
   const [sessions, setSessions] = useState<RequestMonitorSession[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState<string>("");
+  const [countdownNowMs, setCountdownNowMs] = useState(() => Date.now());
 
   const [sessionListLoading, setSessionListLoading] = useState(false);
   const [sessionContentLoading, setSessionContentLoading] = useState(false);
@@ -616,6 +639,23 @@ export function MonitorPage({ loading, runAction, snapshot }: DaemonPageProps) {
     [notice],
   );
 
+  const selectedSession = useMemo(
+    () => sessions.find((session) => session.id === selectedSessionId) ?? null,
+    [selectedSessionId, sessions],
+  );
+  const runningSession = useMemo(
+    () => sessions.find((session) => session.running) ?? null,
+    [sessions],
+  );
+  const runningSessionRemainingMs = useMemo(
+    () => resolveMonitorSessionRemainingMs(runningSession, countdownNowMs),
+    [countdownNowMs, runningSession],
+  );
+  const runningSessionCountdownText = useMemo(
+    () => (runningSessionRemainingMs == null ? "" : formatCountdownDuration(runningSessionRemainingMs)),
+    [runningSessionRemainingMs],
+  );
+
   useEffect(() => {
     void syncSessions();
   }, [syncSessions]);
@@ -650,6 +690,20 @@ export function MonitorPage({ loading, runAction, snapshot }: DaemonPageProps) {
   }, [loadSessionContent, selectedSessionId]);
 
   useEffect(() => {
+    if (!runningSession) {
+      countdownSyncSessionIdRef.current = "";
+      return;
+    }
+    setCountdownNowMs(Date.now());
+    const timer = window.setInterval(() => {
+      setCountdownNowMs(Date.now());
+    }, 1000);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [runningSession]);
+
+  useEffect(() => {
     const hasRunningSession = sessions.some((item) => item.running);
     if (!hasRunningSession) {
       return;
@@ -664,6 +718,32 @@ export function MonitorPage({ loading, runAction, snapshot }: DaemonPageProps) {
       window.clearInterval(timer);
     };
   }, [loadSessionContent, selectedSessionId, sessions, syncSessions]);
+
+  useEffect(() => {
+    if (!runningSession || runningSessionRemainingMs == null || runningSessionRemainingMs > 0) {
+      return;
+    }
+    if (countdownSyncSessionIdRef.current === runningSession.id) {
+      return;
+    }
+    countdownSyncSessionIdRef.current = runningSession.id;
+    void syncSessions({ silent: true, suppressError: true });
+    void loadSessionContent(runningSession.id, { silent: true, suppressError: true });
+  }, [loadSessionContent, runningSession, runningSessionRemainingMs, syncSessions]);
+
+  useEffect(() => {
+    const currentRunningIds = sessions.filter((item) => item.running).map((item) => item.id);
+    const currentById = new Map(sessions.map((item) => [item.id, item]));
+    const endedSession = previousRunningSessionIdsRef.current
+      .map((id) => currentById.get(id) ?? null)
+      .find((item) => item != null && !item.running && item.completedAtMs > 0);
+    previousRunningSessionIdsRef.current = currentRunningIds;
+    if (!endedSession) {
+      return;
+    }
+    void loadSessionContent(endedSession.id, { silent: true, suppressError: true });
+    notice.success("监控结束");
+  }, [loadSessionContent, notice, sessions]);
 
   useEffect(() => {
     const pendingSessionID = pendingMonitorSessionId.trim();
@@ -707,11 +787,6 @@ export function MonitorPage({ loading, runAction, snapshot }: DaemonPageProps) {
     setSelectedRecordKeys([]);
     setExpandedRecordKeys([]);
   }, [duplicateFilterMode, filterJoinMode, filterTokens, selectedSessionId]);
-
-  const selectedSession = useMemo(
-    () => sessions.find((session) => session.id === selectedSessionId) ?? null,
-    [selectedSessionId, sessions],
-  );
 
   const filteredRecords = useMemo(() => {
     if (!selectedSession) {
@@ -1011,45 +1086,74 @@ export function MonitorPage({ loading, runAction, snapshot }: DaemonPageProps) {
 
   return (
     <Card
-      title="请求监控"
-      extra={
-        <Space wrap size={8}>
-          <Select
-            value={selectedSessionId || undefined}
-            placeholder={sessions.length === 0 ? "暂无监控记录" : "选择监控记录"}
-            options={sessionOptions}
-            onChange={(value) => setSelectedSessionId(String(value))}
-            style={{ width: 320 }}
-            showSearch
-            optionFilterProp="label"
-            allowClear={sessions.length > 0}
-            onClear={() => setSelectedSessionId("")}
-            loading={sessionListLoading}
-          />
-          <Button
-            icon={<BiIcon name="arrow-clockwise" />}
-            onClick={() => void handleRefresh()}
-            loading={tableLoading}
-          >
-            刷新
-          </Button>
-          <Button icon={<BiIcon name="plus-lg" />} type="primary" onClick={() => setCreateModalOpen(true)}>
-            新增监控
-          </Button>
-          <Button
-            danger
-            icon={<BiIcon name="trash3" />}
-            onClick={() => void handleDeleteCurrentSession()}
-            disabled={selectedSession == null}
-            loading={sessionActionLoading}
-          >
-            删除当前
-          </Button>
-        </Space>
-      }
       bodyStyle={{ padding: 16 }}
     >
       <Space direction="vertical" size={14} style={{ width: "100%" }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 12,
+            width: "100%",
+          }}
+        >
+          <div style={{ flex: "0 1 70%", minWidth: 0 }}>
+            <Space wrap size={8}>
+              <Select
+                value={selectedSessionId || undefined}
+                placeholder={sessions.length === 0 ? "暂无监控记录" : "选择监控记录"}
+                options={sessionOptions}
+                onChange={(value) => setSelectedSessionId(String(value))}
+                style={{ width: 320 }}
+                showSearch
+                optionFilterProp="label"
+                allowClear={sessions.length > 0}
+                onClear={() => setSelectedSessionId("")}
+                loading={sessionListLoading}
+              />
+              <Button
+                icon={<BiIcon name="arrow-clockwise" />}
+                onClick={() => void handleRefresh()}
+                loading={tableLoading}
+              >
+                刷新
+              </Button>
+              <Button icon={<BiIcon name="plus-lg" />} type="primary" onClick={() => setCreateModalOpen(true)}>
+                新增监控
+              </Button>
+              <Button
+                danger
+                icon={<BiIcon name="trash3" />}
+                onClick={() => void handleDeleteCurrentSession()}
+                disabled={selectedSession == null}
+                loading={sessionActionLoading}
+              >
+                删除当前
+              </Button>
+            </Space>
+          </div>
+          <div
+            style={{
+              flex: "0 0 30%",
+              minWidth: 0,
+              display: "flex",
+              justifyContent: "flex-end",
+            }}
+          >
+            {runningSession && runningSessionCountdownText !== "" ? (
+              <Typography.Text
+                type="secondary"
+                style={{
+                  fontVariantNumeric: "tabular-nums",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                监控中 · 剩余 {runningSessionCountdownText}
+              </Typography.Text>
+            ) : null}
+          </div>
+        </div>
+
         {selectedSession == null ? (
           <Typography.Text type="secondary">先创建一条监控记录，再查看请求明细。</Typography.Text>
         ) : null}

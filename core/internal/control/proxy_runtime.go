@@ -243,6 +243,10 @@ type clashConnectionMetadata struct {
 	Network              string `json:"network"`
 	Type                 string `json:"type"`
 	Host                 string `json:"host"`
+	SourceIP             string `json:"sourceIP"`
+	SourceIPSnake        string `json:"source_ip"`
+	SourcePort           int    `json:"sourcePort"`
+	SourcePortSnake      int    `json:"source_port"`
 	DestinationIP        string `json:"destinationIP"`
 	DestinationIPSnake   string `json:"destination_ip"`
 	DestinationPort      int    `json:"destinationPort"`
@@ -267,6 +271,10 @@ func (m *clashConnectionMetadata) UnmarshalJSON(data []byte) error {
 		Network              string          `json:"network"`
 		Type                 string          `json:"type"`
 		Host                 string          `json:"host"`
+		SourceIP             string          `json:"sourceIP"`
+		SourceIPSnake        string          `json:"source_ip"`
+		SourcePort           json.RawMessage `json:"sourcePort"`
+		SourcePortSnake      json.RawMessage `json:"source_port"`
 		DestinationIP        string          `json:"destinationIP"`
 		DestinationIPSnake   string          `json:"destination_ip"`
 		DestinationPort      json.RawMessage `json:"destinationPort"`
@@ -289,6 +297,14 @@ func (m *clashConnectionMetadata) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
+	sourcePort, err := decodeFlexibleJSONInt(raw.SourcePort)
+	if err != nil {
+		return fmt.Errorf("sourcePort: %w", err)
+	}
+	sourcePortSnake, err := decodeFlexibleJSONInt(raw.SourcePortSnake)
+	if err != nil {
+		return fmt.Errorf("source_port: %w", err)
+	}
 	destinationPort, err := decodeFlexibleJSONInt(raw.DestinationPort)
 	if err != nil {
 		return fmt.Errorf("destinationPort: %w", err)
@@ -309,6 +325,10 @@ func (m *clashConnectionMetadata) UnmarshalJSON(data []byte) error {
 		Network:              strings.TrimSpace(raw.Network),
 		Type:                 strings.TrimSpace(raw.Type),
 		Host:                 strings.TrimSpace(raw.Host),
+		SourceIP:             strings.TrimSpace(raw.SourceIP),
+		SourceIPSnake:        strings.TrimSpace(raw.SourceIPSnake),
+		SourcePort:           sourcePort,
+		SourcePortSnake:      sourcePortSnake,
 		DestinationIP:        strings.TrimSpace(raw.DestinationIP),
 		DestinationIPSnake:   strings.TrimSpace(raw.DestinationIPSnake),
 		DestinationPort:      destinationPort,

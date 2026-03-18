@@ -791,6 +791,7 @@ func (s *RuntimeStore) queryConnectionsSnapshotForMonitor() (clashConnectionsSna
 			if queryErr != nil {
 				return queryErr
 			}
+			enrichMonitorConnectionsProcessInfo(&result)
 			snapshot = result
 			return nil
 		},
@@ -891,11 +892,11 @@ type requestMonitorDiskMonitorCompat struct {
 }
 
 type requestMonitorDiskRecordCompat struct {
-	TimestampMS int64                        `json:"timestamp_ms"`
-	Process     requestMonitorDiskProcess    `json:"process"`
-	Request     requestMonitorDiskRequest    `json:"request"`
+	TimestampMS int64                           `json:"timestamp_ms"`
+	Process     requestMonitorDiskProcess       `json:"process"`
+	Request     requestMonitorDiskRequest       `json:"request"`
 	Monitor     requestMonitorDiskMonitorCompat `json:"monitor"`
-	Tags        []string                     `json:"tags,omitempty"`
+	Tags        []string                        `json:"tags,omitempty"`
 }
 
 func loadRequestMonitorSessionSummary(sessionPath string) (RequestMonitorSessionSummary, error) {
@@ -1158,10 +1159,10 @@ func buildRequestMonitorDiskRecord(
 			Country: strings.TrimSpace(metadata.Country),
 		},
 		Monitor: requestMonitorDiskMonitor{
-			RecordScope:   recordScope,
-			RuleMissed:    ruleMissed,
-			MatchedRule:   matchedRule,
-			OutboundTag:   outboundTag,
+			RecordScope: recordScope,
+			RuleMissed:  ruleMissed,
+			MatchedRule: matchedRule,
+			OutboundTag: outboundTag,
 			SuggestedRule: buildRequestMonitorSuggestedRule(
 				processName,
 				domain,

@@ -287,13 +287,21 @@ def wait_linux_dev_ready(timeout_sec: float = LINUX_DEV_READY_TIMEOUT_SEC) -> bo
     return False
 
 
+def print_linux_dev_task_status(message: str) -> None:
+    print(message, flush=True)
+    print(
+        "linux dev task is one-shot: waterayd-dev is managed by systemd, so this task exits normally after readiness check",
+        flush=True,
+    )
+
+
 def ensure_linux_dev_service() -> int:
     if not LINUX_HELPER_PATH.is_file():
         print(f"missing Linux helper: {LINUX_HELPER_PATH}", file=sys.stderr)
         return 1
     expected_manifest = build_linux_dev_manifest()
     if linux_dev_service_is_ready(expected_manifest):
-        print("waterayd-dev service is already up-to-date")
+        print_linux_dev_task_status("waterayd-dev service is already up-to-date")
         return 0
 
     install_dir = LINUX_DEV_INSTALL_DIR
@@ -324,6 +332,7 @@ def ensure_linux_dev_service() -> int:
     if not wait_linux_dev_ready():
         print("waterayd-dev service start timeout", file=sys.stderr)
         return 1
+    print_linux_dev_task_status("waterayd-dev service is ready")
     return 0
 
 
