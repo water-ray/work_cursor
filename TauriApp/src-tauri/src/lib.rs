@@ -57,6 +57,8 @@ pub fn run() {
             mobile_host::mobile_host_get_status,
             mobile_host::mobile_host_bootstrap,
             mobile_host::mobile_host_get_versions,
+            mobile_host::mobile_host_list_installed_apps,
+            mobile_host::mobile_host_get_installed_app_icon,
             mobile_host::mobile_host_prepare,
             mobile_host::mobile_host_check_config,
             mobile_host::mobile_host_start,

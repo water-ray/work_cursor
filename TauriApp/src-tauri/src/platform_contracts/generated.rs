@@ -64,7 +64,7 @@ pub fn resolve_runtime_platform_contract(kind: &str) -> RuntimePlatformContract 
 }
 
 pub const MOBILE_HOST_PLUGIN_NAME: &str = "mobile-host";
-pub const MOBILE_HOST_ANDROID_PLUGIN_IDENTIFIER: &str = "com.wateray.desktop.mobilehost";
+pub const MOBILE_HOST_ANDROID_PLUGIN_IDENTIFIER: &str = "com.singbox.wateray.mobilehost";
 pub const MOBILE_HOST_ANDROID_PLUGIN_CLASS: &str = "MobileHostPlugin";
 
 pub const MOBILE_HOST_BOOTSTRAP_INVOKE_COMMAND: &str = "mobile_host_bootstrap";
@@ -78,6 +78,14 @@ pub const MOBILE_HOST_GET_STATUS_PERMISSION: &str = "mobile-host:allow-getStatus
 pub const MOBILE_HOST_GET_VERSIONS_INVOKE_COMMAND: &str = "mobile_host_get_versions";
 pub const MOBILE_HOST_GET_VERSIONS_PLUGIN_COMMAND: &str = "getVersions";
 pub const MOBILE_HOST_GET_VERSIONS_PERMISSION: &str = "mobile-host:allow-getVersions";
+
+pub const MOBILE_HOST_LIST_INSTALLED_APPS_INVOKE_COMMAND: &str = "mobile_host_list_installed_apps";
+pub const MOBILE_HOST_LIST_INSTALLED_APPS_PLUGIN_COMMAND: &str = "listInstalledApps";
+pub const MOBILE_HOST_LIST_INSTALLED_APPS_PERMISSION: &str = "mobile-host:allow-listInstalledApps";
+
+pub const MOBILE_HOST_GET_INSTALLED_APP_ICON_INVOKE_COMMAND: &str = "mobile_host_get_installed_app_icon";
+pub const MOBILE_HOST_GET_INSTALLED_APP_ICON_PLUGIN_COMMAND: &str = "getInstalledAppIcon";
+pub const MOBILE_HOST_GET_INSTALLED_APP_ICON_PERMISSION: &str = "mobile-host:allow-getInstalledAppIcon";
 
 pub const MOBILE_HOST_PREPARE_INVOKE_COMMAND: &str = "mobile_host_prepare";
 pub const MOBILE_HOST_PREPARE_PLUGIN_COMMAND: &str = "prepare";
@@ -123,5 +131,5 @@ pub const MOBILE_HOST_SWITCH_SELECTORS_INVOKE_COMMAND: &str = "mobile_host_switc
 pub const MOBILE_HOST_SWITCH_SELECTORS_PLUGIN_COMMAND: &str = "switchSelectors";
 pub const MOBILE_HOST_SWITCH_SELECTORS_PERMISSION: &str = "mobile-host:allow-switchSelectors";
 
-pub const MOBILE_HOST_PLUGIN_COMMANDS: &[&str] = &["bootstrap", "getStatus", "getVersions", "prepare", "checkConfig", "start", "stop", "clearDnsCache", "probe", "probeStart", "probeCancel", "getTaskQueue", "dnsHealth", "switchSelectors"];
-pub const MOBILE_HOST_PERMISSIONS: &[&str] = &["mobile-host:allow-bootstrap", "mobile-host:allow-getStatus", "mobile-host:allow-getVersions", "mobile-host:allow-prepare", "mobile-host:allow-checkConfig", "mobile-host:allow-start", "mobile-host:allow-stop", "mobile-host:allow-clearDnsCache", "mobile-host:allow-probe", "mobile-host:allow-probeStart", "mobile-host:allow-probeCancel", "mobile-host:allow-getTaskQueue", "mobile-host:allow-dnsHealth", "mobile-host:allow-switchSelectors"];
+pub const MOBILE_HOST_PLUGIN_COMMANDS: &[&str] = &["bootstrap", "getStatus", "getVersions", "listInstalledApps", "getInstalledAppIcon", "prepare", "checkConfig", "start", "stop", "clearDnsCache", "probe", "probeStart", "probeCancel", "getTaskQueue", "dnsHealth", "switchSelectors"];
+pub const MOBILE_HOST_PERMISSIONS: &[&str] = &["mobile-host:allow-bootstrap", "mobile-host:allow-getStatus", "mobile-host:allow-getVersions", "mobile-host:allow-listInstalledApps", "mobile-host:allow-getInstalledAppIcon", "mobile-host:allow-prepare", "mobile-host:allow-checkConfig", "mobile-host:allow-start", "mobile-host:allow-stop", "mobile-host:allow-clearDnsCache", "mobile-host:allow-probe", "mobile-host:allow-probeStart", "mobile-host:allow-probeCancel", "mobile-host:allow-getTaskQueue", "mobile-host:allow-dnsHealth", "mobile-host:allow-switchSelectors"];

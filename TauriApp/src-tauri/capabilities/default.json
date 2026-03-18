@@ -24,6 +24,8 @@
     "mobile-host:allow-bootstrap",
     "mobile-host:allow-getStatus",
     "mobile-host:allow-getVersions",
+    "mobile-host:allow-listInstalledApps",
+    "mobile-host:allow-getInstalledAppIcon",
     "mobile-host:allow-prepare",
     "mobile-host:allow-checkConfig",
     "mobile-host:allow-start",

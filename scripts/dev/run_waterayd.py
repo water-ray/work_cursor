@@ -11,6 +11,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import TextIO
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
@@ -32,11 +33,92 @@ LINUX_DEV_MANIFEST_PATH = LINUX_DEV_INSTALL_DIR / DESKTOP_BUILD_MANIFEST_NAME
 LINUX_DEV_SERVICE_NAME = "waterayd-dev"
 LINUX_DEV_READY_URL = "http://127.0.0.1:39080/v1/state?withLogs=0"
 LINUX_DEV_READY_TIMEOUT_SEC = 20.0
+DEV_CRASH_LOG_DIR = ROOT_DIR / "temp" / "crash" / "waterayd"
 
 
 def run_command(command: list[str], cwd: Path, env: dict[str, str] | None = None) -> int:
     completed = subprocess.run(command, cwd=str(cwd), env=env)
     return int(completed.returncode)
+
+
+def write_stream_targets(targets: list[TextIO], text: str) -> None:
+    for target in targets:
+        target.write(text)
+        target.flush()
+
+
+def build_foreground_core_log_paths() -> tuple[Path, Path]:
+    DEV_CRASH_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    return (
+        DEV_CRASH_LOG_DIR / f"waterayd-{timestamp}.log",
+        DEV_CRASH_LOG_DIR / "latest.log",
+    )
+
+
+def stream_command_with_combined_logging(
+    command: list[str],
+    cwd: Path,
+    env: dict[str, str] | None = None,
+) -> int:
+    log_path, latest_path = build_foreground_core_log_paths()
+    command_text = " ".join(command)
+    started_at = time.strftime("%Y-%m-%d %H:%M:%S")
+    with (
+        log_path.open("w", encoding="utf-8", newline="") as log_file,
+        latest_path.open("w", encoding="utf-8", newline="") as latest_file,
+    ):
+        log_targets = [log_file, latest_file]
+        write_stream_targets(
+            log_targets,
+            (
+                f"[waterayd-dev]\n"
+                f"started_at={started_at}\n"
+                f"cwd={cwd}\n"
+                f"command={command_text}\n\n"
+            ),
+        )
+        print(f"[waterayd-dev] logging to {log_path}", flush=True)
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=str(cwd),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+            )
+        except OSError as error:
+            message = f"[waterayd-dev] launch failed: {error}\n"
+            sys.stderr.write(message)
+            sys.stderr.flush()
+            write_stream_targets(log_targets, message)
+            return 1
+
+        stdout = process.stdout
+        if stdout is not None:
+            for line in stdout:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                write_stream_targets(log_targets, line)
+
+        return_code = process.wait()
+        finished_at = time.strftime("%Y-%m-%d %H:%M:%S")
+        write_stream_targets(
+            log_targets,
+            f"\n[waterayd-dev] finished_at={finished_at}\n[waterayd-dev] exit_code={return_code}\n",
+        )
+
+    if return_code != 0:
+        print(
+            f"[waterayd-dev] process exited with code {return_code}, full log: {log_path}",
+            file=sys.stderr,
+            flush=True,
+        )
+    return return_code
 
 
 def safe_slug(value: str) -> str:
@@ -246,7 +328,7 @@ def ensure_linux_dev_service() -> int:
 
 
 def run_foreground_core() -> int:
-    return run_command(
+    return stream_command_with_combined_logging(
         ["go", "run", "-tags", "with_clash_api,with_gvisor,with_quic", "./cmd/waterayd"],
         cwd=CORE_DIR,
     )

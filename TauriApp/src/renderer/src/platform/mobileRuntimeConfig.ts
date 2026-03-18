@@ -29,11 +29,26 @@ export interface MobileSelectorSwitchSelection {
   outboundTag: string;
 }
 
+export interface MobileInstalledAppSummary {
+  packageName: string;
+  label?: string;
+  uid?: number;
+}
+
+export interface MobileRuleCompileWarning {
+  ruleId: string;
+  ruleName: string;
+  unresolvedLabels: string[];
+  unresolvedUIDs: number[];
+  skipped: boolean;
+}
+
 export interface MobileResolverContext {
   systemDnsServers?: string[];
   builtInRuleSetPaths?: Record<string, string>;
   dnsCacheFilePath?: string;
   internalPorts?: LoopbackInternalPortBundle;
+  installedApps?: MobileInstalledAppSummary[];
 }
 
 const defaultTunInterfaceName = "wateray-tun";
@@ -333,6 +348,120 @@ function uniqueNonEmptyStrings(values: string[] | undefined): string[] {
     result.push(value);
   }
   return result;
+}
+
+function uniquePositiveIntegers(values: number[] | undefined): number[] {
+  const result: number[] = [];
+  const seen = new Set<number>();
+  for (const rawValue of values ?? []) {
+    const value = Math.trunc(Number(rawValue));
+    if (!Number.isFinite(value) || value <= 0 || seen.has(value)) {
+      continue;
+    }
+    seen.add(value);
+    result.push(value);
+  }
+  return result;
+}
+
+function normalizeMobileInstalledApps(
+  values: MobileInstalledAppSummary[] | undefined,
+): MobileInstalledAppSummary[] {
+  const result: MobileInstalledAppSummary[] = [];
+  const seen = new Set<string>();
+  for (const item of values ?? []) {
+    const packageName = String(item.packageName ?? "").trim();
+    if (packageName === "") {
+      continue;
+    }
+    const normalized: MobileInstalledAppSummary = { packageName };
+    const label = String(item.label ?? "").trim();
+    if (label !== "") {
+      normalized.label = label;
+    }
+    const uid = Math.trunc(Number(item.uid));
+    if (Number.isFinite(uid) && uid > 0) {
+      normalized.uid = uid;
+    }
+    const key = `${packageName.toLowerCase()}#${normalized.uid ?? 0}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    result.push(normalized);
+  }
+  return result;
+}
+
+function resolveMobileAndroidRulePackageNames(
+  match: RuleMatchV2,
+  resolverContext: MobileResolverContext,
+): {
+  packageNames: string[];
+  unresolvedLabels: string[];
+  unresolvedUIDs: number[];
+  hasAppMatchers: boolean;
+} {
+  const processMatch = match.process ?? {};
+  const directPackages = uniqueNonEmptyStrings([
+    ...(processMatch.app?.packageName ?? []),
+    // Backward compatibility: 历史未加前缀的移动“进程规则”按包名处理。
+    ...(processMatch.nameContains ?? []),
+  ]);
+  const appLabels = uniqueNonEmptyStrings(processMatch.app?.label);
+  const appUIDs = uniquePositiveIntegers(processMatch.app?.uid);
+  const hasAppMatchers = directPackages.length > 0 || appLabels.length > 0 || appUIDs.length > 0;
+  if (appLabels.length === 0 && appUIDs.length === 0) {
+    return {
+      packageNames: directPackages,
+      unresolvedLabels: [],
+      unresolvedUIDs: [],
+      hasAppMatchers,
+    };
+  }
+
+  const installedApps = normalizeMobileInstalledApps(resolverContext.installedApps);
+  const resolvedPackages: string[] = [...directPackages];
+  const unresolvedLabels: string[] = [];
+  if (installedApps.length === 0) {
+    unresolvedLabels.push(...appLabels);
+    return {
+      packageNames: uniqueNonEmptyStrings(resolvedPackages),
+      unresolvedLabels,
+      unresolvedUIDs: appUIDs,
+      hasAppMatchers,
+    };
+  }
+  for (const rawLabel of appLabels) {
+    const normalizedLabel = rawLabel.trim().toLowerCase();
+    const matchedPackages = installedApps
+      .filter((item) => String(item.label ?? "").trim().toLowerCase() === normalizedLabel)
+      .map((item) => item.packageName);
+    if (matchedPackages.length === 0) {
+      unresolvedLabels.push(rawLabel);
+      continue;
+    }
+    resolvedPackages.push(...matchedPackages);
+  }
+
+  const unresolvedUIDs: number[] = [];
+  for (const uid of appUIDs) {
+    const matchedPackages = installedApps
+      .filter((item) => item.uid === uid)
+      .map((item) => item.packageName);
+    if (matchedPackages.length === 0) {
+      unresolvedUIDs.push(uid);
+      continue;
+    }
+    resolvedPackages.push(...matchedPackages);
+  }
+
+  return {
+    packageNames: uniqueNonEmptyStrings(resolvedPackages),
+    unresolvedLabels,
+    unresolvedUIDs,
+    hasAppMatchers,
+  };
 }
 
 function normalizeDnsHostsText(raw: string | undefined): string {
@@ -856,14 +985,42 @@ function convertRuleSetDefinitionMapToList(
     .filter((item): item is UnknownRecord => Boolean(item));
 }
 
+function buildMobileRuleCompileWarning(
+  ruleMeta: Pick<RuleConfigV2["rules"][number], "id" | "name"> | undefined,
+  resolution: {
+    unresolvedLabels: string[];
+    unresolvedUIDs: number[];
+    hasAppMatchers: boolean;
+    packageNames: string[];
+  },
+): MobileRuleCompileWarning | null {
+  if (
+    !resolution.hasAppMatchers ||
+    (resolution.unresolvedLabels.length === 0 && resolution.unresolvedUIDs.length === 0)
+  ) {
+    return null;
+  }
+  return {
+    ruleId: String(ruleMeta?.id ?? "").trim(),
+    ruleName: String(ruleMeta?.name ?? "").trim(),
+    unresolvedLabels: [...resolution.unresolvedLabels],
+    unresolvedUIDs: [...resolution.unresolvedUIDs],
+    skipped: resolution.packageNames.length === 0,
+  };
+}
+
 function compileRuleMatchV2(
   match: RuleMatchV2,
   outboundTag: string,
   generatedRuleSets: Record<string, UnknownRecord>,
   resolverContext: MobileResolverContext = {},
-): UnknownRecord | null {
+  ruleMeta?: Pick<RuleConfigV2["rules"][number], "id" | "name">,
+): {
+  rule: UnknownRecord | null;
+  warning: MobileRuleCompileWarning | null;
+} {
   if (outboundTag.trim() === "") {
-    return null;
+    return { rule: null, warning: null };
   }
   const rule: UnknownRecord = {
     action: "route",
@@ -900,11 +1057,29 @@ function compileRuleMatchV2(
   if (ruleSetRefs.length > 0) {
     rule.rule_set = ruleSetRefs;
   }
-  // Android 端不沿用桌面进程路径匹配，避免平台能力差异导致规则编译失真。
-  if (Object.keys(rule).length <= 2) {
-    return null;
+  const packageResolution = resolveMobileAndroidRulePackageNames(match, resolverContext);
+  const packageNames = packageResolution.packageNames;
+  if (packageNames.length > 0) {
+    rule.package_name = packageNames;
   }
-  return rule;
+  const warning = buildMobileRuleCompileWarning(ruleMeta, packageResolution);
+  if (packageResolution.hasAppMatchers && packageNames.length === 0) {
+    return {
+      rule: null,
+      warning,
+    };
+  }
+  // Android 端仅编译应用包名，桌面进程路径/正则不下发到移动端 sing-box。
+  if (Object.keys(rule).length <= 2) {
+    return {
+      rule: null,
+      warning,
+    };
+  }
+  return {
+    rule,
+    warning,
+  };
 }
 
 function buildTrafficRuleRuntime(
@@ -964,9 +1139,10 @@ function buildTrafficRuleRuntime(
       outboundTag,
       generatedRuleSets,
       resolverContext,
+      item,
     );
-    if (compiledRule) {
-      routeRules.push(compiledRule);
+    if (compiledRule.rule) {
+      routeRules.push(compiledRule.rule);
     }
   }
   return {
@@ -1002,6 +1178,66 @@ export function buildMobileSelectorSelections(
   return selections.filter(
     (item) => item.selectorTag.trim() !== "" && item.outboundTag.trim() !== "",
   );
+}
+
+function summarizeMobileRuleCompileWarningItem(item: MobileRuleCompileWarning): string {
+  const ruleName = item.ruleName || item.ruleId || "未命名规则";
+  const details: string[] = [];
+  if (item.unresolvedLabels.length > 0) {
+    details.push(`label ${item.unresolvedLabels.join(" / ")}`);
+  }
+  if (item.unresolvedUIDs.length > 0) {
+    details.push(`uid ${item.unresolvedUIDs.join(" / ")}`);
+  }
+  return `${item.skipped ? "已跳过规则" : "已跳过无效项"}「${ruleName}」${
+    details.length > 0 ? `（${details.join("；")}）` : ""
+  }`;
+}
+
+export function collectMobileRuleCompileWarnings(
+  config: RuleConfigV2,
+  resolverContext: MobileResolverContext = {},
+): MobileRuleCompileWarning[] {
+  const generatedRuleSets: Record<string, UnknownRecord> = {};
+  const warnings: MobileRuleCompileWarning[] = [];
+  for (const item of config.rules ?? []) {
+    if (!item.enabled) {
+      continue;
+    }
+    const compiledRule = compileRuleMatchV2(
+      item.match,
+      proxySelectorTag,
+      generatedRuleSets,
+      resolverContext,
+      item,
+    );
+    if (compiledRule.warning) {
+      warnings.push(compiledRule.warning);
+    }
+  }
+  return warnings;
+}
+
+export function summarizeMobileRuleCompileWarnings(
+  warnings: MobileRuleCompileWarning[],
+): string | undefined {
+  if (warnings.length === 0) {
+    return undefined;
+  }
+  const skippedRules = warnings.filter((item) => item.skipped).length;
+  const skippedEntries = warnings.length - skippedRules;
+  const summaryParts: string[] = [];
+  if (skippedRules > 0) {
+    summaryParts.push(`跳过 ${skippedRules} 条应用规则`);
+  }
+  if (skippedEntries > 0) {
+    summaryParts.push(`剔除 ${skippedEntries} 条规则中的无效应用项`);
+  }
+  const preview = warnings.slice(0, 2).map(summarizeMobileRuleCompileWarningItem).join("；");
+  const remaining = warnings.length - 2;
+  return `安卓应用规则已容错处理：${summaryParts.join("，")}。${preview}${
+    remaining > 0 ? `；另有 ${remaining} 条` : ""
+  }`;
 }
 
 export function materializeMobileDnsEndpoint(

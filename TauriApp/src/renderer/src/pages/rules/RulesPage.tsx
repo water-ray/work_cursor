@@ -34,17 +34,22 @@ interface PendingRuleConfigCache {
 
 function notifyRuleConfigResult(notice: ReturnType<typeof useAppNotice>, snapshot: DaemonSnapshot): void {
   const result = snapshot.lastRuntimeApply?.result;
+  const warning = String(snapshot.lastRuntimeApply?.warning ?? "").trim();
   if (result === "hot_applied") {
     notifyConfigApplied(notice, "规则配置");
-    return;
-  }
-  if (result === "restart_required") {
+  } else if (result === "restart_required") {
     notifyConfigSaved(notice, "规则配置", {
       restartRequired: true,
     });
-    return;
+  } else {
+    notifyConfigSaved(notice, "规则配置");
   }
-  notifyConfigSaved(notice, "规则配置");
+  if (warning !== "") {
+    notice.warning(warning, {
+      title: "安卓应用规则已容错处理",
+      durationMs: 5000,
+    });
+  }
 }
 
 function readPendingRuleConfig(): PendingRuleConfigCache | null {

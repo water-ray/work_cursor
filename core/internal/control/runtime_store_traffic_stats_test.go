@@ -195,3 +195,42 @@ func TestResetTrafficStatsClearsTargetGroup(t *testing.T) {
 		t.Fatalf("expected non-target group totals unchanged, got %+v", snapshot.Groups[1].Nodes[0])
 	}
 }
+
+func TestNewTrafficTickPushEventLimitsAndCopiesNodes(t *testing.T) {
+	nodes := make([]ActiveNodeConnection, maxTrafficTickPushNodes+5)
+	for index := range nodes {
+		nodes[index] = ActiveNodeConnection{
+			NodeID:        "node-" + string(rune('a'+(index%26))),
+			Connections:   int64(index + 1),
+			UploadBytes:   int64(index * 10),
+			DownloadBytes: int64(index * 20),
+		}
+	}
+
+	event := newTrafficTickPushEvent(7, TrafficTickPayload{
+		TotalConnections: int64(len(nodes)),
+		ActiveNodeCount:  int64(len(nodes)),
+		Nodes:            nodes,
+	})
+	if event.Kind != DaemonPushEventTrafficTick {
+		t.Fatalf("unexpected event kind: %s", event.Kind)
+	}
+	if event.Payload.Traffic == nil {
+		t.Fatalf("expected traffic payload")
+	}
+	if len(event.Payload.Traffic.Nodes) != maxTrafficTickPushNodes {
+		t.Fatalf("expected %d nodes after push clamp, got %d", maxTrafficTickPushNodes, len(event.Payload.Traffic.Nodes))
+	}
+	if event.Payload.Traffic.TotalConnections != int64(len(nodes)) {
+		t.Fatalf("expected total connections preserved, got %d", event.Payload.Traffic.TotalConnections)
+	}
+	if event.Payload.Traffic.ActiveNodeCount != int64(len(nodes)) {
+		t.Fatalf("expected active node count preserved, got %d", event.Payload.Traffic.ActiveNodeCount)
+	}
+
+	originalFirst := event.Payload.Traffic.Nodes[0].Connections
+	nodes[0].Connections = 9999
+	if event.Payload.Traffic.Nodes[0].Connections != originalFirst {
+		t.Fatalf("expected push nodes copied independently, got %+v", event.Payload.Traffic.Nodes[0])
+	}
+}

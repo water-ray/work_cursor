@@ -71,7 +71,7 @@ export function resolveRuntimePlatformContract(kind: string): RuntimePlatformCon
 
 export const mobileHostContract = {
   pluginName: "mobile-host",
-  androidPluginIdentifier: "com.wateray.desktop.mobilehost",
+  androidPluginIdentifier: "com.singbox.wateray.mobilehost",
   androidPluginClass: "MobileHostPlugin",
   commands: {
     bootstrap: {
@@ -88,6 +88,16 @@ export const mobileHostContract = {
       invokeCommand: "mobile_host_get_versions",
       pluginCommand: "getVersions",
       permission: "mobile-host:allow-getVersions",
+    },
+    listInstalledApps: {
+      invokeCommand: "mobile_host_list_installed_apps",
+      pluginCommand: "listInstalledApps",
+      permission: "mobile-host:allow-listInstalledApps",
+    },
+    getInstalledAppIcon: {
+      invokeCommand: "mobile_host_get_installed_app_icon",
+      pluginCommand: "getInstalledAppIcon",
+      permission: "mobile-host:allow-getInstalledAppIcon",
     },
     prepare: {
       invokeCommand: "mobile_host_prepare",

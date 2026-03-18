@@ -15,11 +15,11 @@ val tauriProperties = Properties().apply {
 
 android {
     compileSdk = 36
-    namespace = "com.wateray.desktop"
+    namespace = "com.singbox.wateray"
     defaultConfig {
         // Mobile host talks to the local Clash controller over HTTP loopback.
         manifestPlaceholders["usesCleartextTraffic"] = "true"
-        applicationId = "com.wateray.desktop"
+        applicationId = "com.singbox.wateray"
         minSdk = 24
         targetSdk = 36
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()

@@ -43,7 +43,7 @@
   },
   "mobileHost": {
     "pluginName": "mobile-host",
-    "androidPluginIdentifier": "com.wateray.desktop.mobilehost",
+    "androidPluginIdentifier": "com.singbox.wateray.mobilehost",
     "androidPluginClass": "MobileHostPlugin",
     "commands": [
       {
@@ -63,6 +63,18 @@
         "invokeCommand": "mobile_host_get_versions",
         "pluginCommand": "getVersions",
         "permission": "mobile-host:allow-getVersions"
+      },
+      {
+        "key": "listInstalledApps",
+        "invokeCommand": "mobile_host_list_installed_apps",
+        "pluginCommand": "listInstalledApps",
+        "permission": "mobile-host:allow-listInstalledApps"
+      },
+      {
+        "key": "getInstalledAppIcon",
+        "invokeCommand": "mobile_host_get_installed_app_icon",
+        "pluginCommand": "getInstalledAppIcon",
+        "permission": "mobile-host:allow-getInstalledAppIcon"
       },
       {
         "key": "prepare",

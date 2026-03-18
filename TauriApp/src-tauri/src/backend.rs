@@ -69,7 +69,7 @@ const LINUX_PACKAGED_SERVICE_NAME: &str = "waterayd";
 #[cfg(target_os = "linux")]
 const LINUX_DEV_DESKTOP_OVERRIDE_MARKER: &str = "X-Wateray-DevDesktop=true";
 #[cfg(target_os = "linux")]
-const LINUX_DEV_DESKTOP_FILE_NAME: &str = "com.wateray.desktop.desktop";
+const LINUX_DEV_DESKTOP_FILE_NAME: &str = "com.singbox.wateray.desktop";
 #[cfg(target_os = "linux")]
 const LINUX_ELECTRON_DEV_DESKTOP_FILE_NAME: &str = "wateray-dev-local.desktop";
 #[cfg(target_os = "linux")]

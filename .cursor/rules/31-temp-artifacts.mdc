@@ -1,0 +1,19 @@
+---
+description: Store temporary, downloaded, and test artifacts under temp/
+alwaysApply: true
+---
+
+# Temp Artifact Location
+
+- Save temporary files, generated downloads, screenshots, UI dumps, ad-hoc logs, and manual test outputs under `temp/`.
+- Do not place these artifacts in the repo root or source directories unless the file is intentionally meant to be versioned.
+- Treat `temp/` as local-only workspace output and keep it out of git.
+- If a generated file becomes long-term documentation, fixture, or script input, move it to the proper tracked location such as `docs/`, `scripts/`, or a dedicated fixture directory in the same change.
+- When a task needs scratch output, prefer a named subdirectory such as `temp/android/`, `temp/screenshots/`, or `temp/debug/`.
+
+## Example
+
+```text
+BAD: Save `wateray-window.xml`, screenshots, test zips, or ad-hoc downloads in the project root.
+GOOD: Save them under `temp/` and only promote files into tracked directories when they are intentionally part of the repo.
+```

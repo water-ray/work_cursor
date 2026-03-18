@@ -2,7 +2,7 @@
   "name": "wateray-tauri-app",
   "version": "1.5.0",
   "private": true,
-  "desktopName": "com.wateray.desktop.desktop",
+  "desktopName": "com.singbox.wateray.desktop",
   "description": "Wateray desktop frontend powered by Tauri v2 + React + Ant Design",
   "scripts": {
     "dev": "node scripts/run-tauri-dev.mjs dev",

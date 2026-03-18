@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,6 +26,7 @@ import (
 const maxRuntimeLogEntries = 4000
 const maxRuntimeLogMemoryBytes = 1 * 1024 * 1024
 const maxPushSubscriberQueue = 256
+const maxTrafficTickPushNodes = 128
 const currentSnapshotSchemaVersion = 21
 const defaultUnifiedSemVerVersion = "0.1.0"
 
@@ -6285,6 +6287,22 @@ func uniqueNonEmptyStrings(values []string) []string {
 	return result
 }
 
+func uniquePositiveInts(values []int) []int {
+	seen := map[int]struct{}{}
+	result := make([]int, 0, len(values))
+	for _, value := range values {
+		if value <= 0 {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
+}
+
 func normalizeRuleNodeRefs(values []RuleNodeRef) []RuleNodeRef {
 	seen := map[string]struct{}{}
 	result := make([]RuleNodeRef, 0, len(values))
@@ -6721,6 +6739,11 @@ func normalizeRuleItems(
 					NameContains: uniqueNonEmptyStrings(item.Match.Process.NameContains),
 					PathContains: uniqueNonEmptyStrings(item.Match.Process.PathContains),
 					PathRegex:    uniqueNonEmptyStrings(item.Match.Process.PathRegex),
+					App: RuleAppMatch{
+						PackageName: uniqueNonEmptyStrings(item.Match.Process.App.PackageName),
+						Label:       uniqueNonEmptyStrings(item.Match.Process.App.Label),
+						UID:         uniquePositiveInts(item.Match.Process.App.UID),
+					},
 				},
 			},
 			Action: RuleAction{
@@ -6773,7 +6796,10 @@ func hasAnyRuleMatcher(match RuleMatch) bool {
 		len(match.RuleSetRefs) > 0 ||
 		len(match.Process.NameContains) > 0 ||
 		len(match.Process.PathContains) > 0 ||
-		len(match.Process.PathRegex) > 0
+		len(match.Process.PathRegex) > 0 ||
+		len(match.Process.App.PackageName) > 0 ||
+		len(match.Process.App.Label) > 0 ||
+		len(match.Process.App.UID) > 0
 }
 
 func hasReferencedNodePoolRule(snapshot StateSnapshot) bool {
@@ -7758,30 +7784,45 @@ func (s *RuntimeStore) runConnectionsStatsLoop() {
 				s.mu.Unlock()
 				continue
 			}
-			nowMS := time.Now().UnixMilli()
-			if !s.shouldSampleConnectionsStats(nowMS) {
-				continue
-			}
-			trafficStats, err := s.runtime.QueryConnectionsStats()
-			if err != nil {
-				continue
-			}
-			s.mu.Lock()
-			s.refreshSessionObservabilityLocked(nowMS)
-			if s.state.ConnectionStage != ConnectionConnected ||
-				normalizeTrafficMonitorIntervalSec(s.state.TrafficMonitorIntervalSec) <= 0 {
-				s.mu.Unlock()
-				continue
-			}
-			s.enrichTrafficTickLocked(&trafficStats, nowMS, intervalSec)
-			s.persistTrafficStatsIfNeededLocked(nowMS, false)
-			s.publishPushEventLocked(newTrafficTickPushEvent(s.state.StateRevision, trafficStats))
-			s.mu.Unlock()
+			s.sampleConnectionsStatsSafely(intervalSec)
 		case <-s.connectionStatsStop:
 			timer.Stop()
 			return
 		}
 	}
+}
+
+func (s *RuntimeStore) sampleConnectionsStatsSafely(intervalSec int) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			s.LogCore(
+				LogLevelError,
+				fmt.Sprintf(
+					"traffic monitor sampling panic recovered: %v\n%s",
+					recovered,
+					strings.TrimSpace(string(debug.Stack())),
+				),
+			)
+		}
+	}()
+	nowMS := time.Now().UnixMilli()
+	if !s.shouldSampleConnectionsStats(nowMS) {
+		return
+	}
+	trafficStats, err := s.runtime.QueryConnectionsStats()
+	if err != nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.refreshSessionObservabilityLocked(nowMS)
+	if s.state.ConnectionStage != ConnectionConnected ||
+		normalizeTrafficMonitorIntervalSec(s.state.TrafficMonitorIntervalSec) <= 0 {
+		return
+	}
+	s.enrichTrafficTickLocked(&trafficStats, nowMS, intervalSec)
+	s.persistTrafficStatsIfNeededLocked(nowMS, false)
+	s.publishPushEventLocked(newTrafficTickPushEvent(s.state.StateRevision, trafficStats))
 }
 
 func (s *RuntimeStore) currentTrafficMonitorIntervalSec() int {
@@ -8278,6 +8319,7 @@ func newLogPushEvent(kind DaemonPushEventKind, revision int64, entry RuntimeLogE
 
 func newTrafficTickPushEvent(revision int64, traffic TrafficTickPayload) DaemonPushEvent {
 	trafficCopy := traffic
+	trafficCopy.Nodes = cloneTrafficTickPushNodes(traffic.Nodes)
 	return DaemonPushEvent{
 		Kind:        DaemonPushEventTrafficTick,
 		TimestampMS: time.Now().UnixMilli(),
@@ -8286,6 +8328,19 @@ func newTrafficTickPushEvent(revision int64, traffic TrafficTickPayload) DaemonP
 			Traffic: &trafficCopy,
 		},
 	}
+}
+
+func cloneTrafficTickPushNodes(nodes []ActiveNodeConnection) []ActiveNodeConnection {
+	if len(nodes) == 0 || maxTrafficTickPushNodes <= 0 {
+		return nil
+	}
+	limit := len(nodes)
+	if limit > maxTrafficTickPushNodes {
+		limit = maxTrafficTickPushNodes
+	}
+	cloned := make([]ActiveNodeConnection, limit)
+	copy(cloned, nodes[:limit])
+	return cloned
 }
 
 func newRuntimeApplyPushEvent(revision int64, status RuntimeApplyStatus) DaemonPushEvent {

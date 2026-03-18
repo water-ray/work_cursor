@@ -38,3 +38,6 @@ core/cache.db
 docs/build/*
 !docs/build/CHANGELOG_LATEST.md
 scripts/build/__pycache__/
+
+# Local temp artifacts
+temp/

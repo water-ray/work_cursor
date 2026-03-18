@@ -16,7 +16,7 @@ Android 端 VPN 客户端启动后无法联网。经过对 sing-box 编译构建
 
 ### C-1. VPN Socket 未保护，出站流量路由回环
 
-**文件**：`TauriApp/src-tauri/gen/android/app/src/main/java/com/wateray/desktop/mobilehost/WaterayVpnService.kt`
+**文件**：`TauriApp/src-tauri/gen/android/app/src/main/java/com/singbox/wateray/mobilehost/WaterayVpnService.kt`
 
 **现象**：VPN 启动后，所有出站流量被 TUN 接口捕获并送回 sing-box 处理，形成死循环，无法到达远程代理服务器。
 

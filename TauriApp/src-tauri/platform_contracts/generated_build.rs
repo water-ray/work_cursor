@@ -2,4 +2,4 @@
 // Do not edit manually.
 
 pub const MOBILE_HOST_PLUGIN_NAME: &str = "mobile-host";
-pub const MOBILE_HOST_PLUGIN_COMMANDS: &[&str] = &["bootstrap", "getStatus", "getVersions", "prepare", "checkConfig", "start", "stop", "clearDnsCache", "probe", "probeStart", "probeCancel", "getTaskQueue", "dnsHealth", "switchSelectors"];
+pub const MOBILE_HOST_PLUGIN_COMMANDS: &[&str] = &["bootstrap", "getStatus", "getVersions", "listInstalledApps", "getInstalledAppIcon", "prepare", "checkConfig", "start", "stop", "clearDnsCache", "probe", "probeStart", "probeCancel", "getTaskQueue", "dnsHealth", "switchSelectors"];

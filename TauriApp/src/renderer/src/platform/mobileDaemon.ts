@@ -47,7 +47,9 @@ import {
 import {
   buildMobileRuntimeConfig,
   buildMobileSelectorSelections,
+  collectMobileRuleCompileWarnings,
   resolveNodePoolRefsToNodeIds,
+  summarizeMobileRuleCompileWarnings,
   type MobileResolverContext,
 } from "./mobileRuntimeConfig";
 import { checkMobileDnsHealth } from "./mobileDnsHealth";
@@ -304,8 +306,17 @@ async function ensureMobileDnsCacheFilePath(): Promise<string | undefined> {
 
 async function createMobileResolverContext(
   status: WaterayMobileHostStatus | null | undefined,
+  mobileHost: WaterayMobileHostApi | null | undefined = null,
 ): Promise<MobileResolverContext> {
   const bootstrap = getLatestMobileHostBootstrap();
+  let installedApps: MobileResolverContext["installedApps"] = [];
+  if (mobileHost) {
+    try {
+      installedApps = await mobileHost.listInstalledApps();
+    } catch {
+      installedApps = [];
+    }
+  }
   return {
     systemDnsServers: Array.isArray(status?.systemDnsServers)
       ? status.systemDnsServers
@@ -313,6 +324,7 @@ async function createMobileResolverContext(
     builtInRuleSetPaths: Object.fromEntries(mobileBuiltInRuleSetLocalPathByTag.entries()),
     dnsCacheFilePath: await ensureMobileDnsCacheFilePath(),
     internalPorts: bootstrap?.internalPorts,
+    installedApps,
   };
 }
 
@@ -1841,7 +1853,7 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
     const runtimeConfig = buildMobileRuntimeConfig(
       nextSnapshot,
       targetMode,
-      await createMobileResolverContext(currentStatus),
+      await createMobileResolverContext(currentStatus, mobileHost),
     );
     await host.checkConfig(runtimeConfig.configJson);
     await host.start({
@@ -1913,7 +1925,7 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
       return commitSnapshot(nextSnapshot);
     }
     await ensureBuiltInRuleSetCache(nextSnapshot.ruleConfigV2);
-    const resolverContext = await createMobileResolverContext(status);
+    const resolverContext = await createMobileResolverContext(status, mobileHost);
     let currentConfigJson = "";
     try {
       const currentMode = normalizeModeForMobile(snapshot.configuredProxyMode);
@@ -2069,6 +2081,7 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
     rollbackApplied?: boolean;
     restartRequired?: boolean;
     error?: string;
+    warning?: string;
   }): DaemonSnapshot["lastRuntimeApply"] => ({
     operation: input.operation,
     strategy: input.strategy,
@@ -2078,6 +2091,7 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
     rollbackApplied: input.rollbackApplied === true,
     restartRequired: input.restartRequired,
     error: input.error,
+    warning: input.warning,
     timestampMs: nowMs(),
   });
 
@@ -2278,7 +2292,7 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
       return reloadRunningSnapshot(nextSnapshot, currentStatus);
     }
     await ensureBuiltInRuleSetCache(nextSnapshot.ruleConfigV2);
-    const resolverContext = await createMobileResolverContext(currentStatus);
+    const resolverContext = await createMobileResolverContext(currentStatus, mobileHost);
     let currentConfigJson = "";
     try {
       const currentMode = normalizeModeForMobile(snapshot.configuredProxyMode);
@@ -2925,6 +2939,10 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
     if (currentRuntimeStatus) {
       syncHostStatus(currentRuntimeStatus);
     }
+    const resolverContext = await createMobileResolverContext(currentRuntimeStatus, mobileHost);
+    const compileWarning = summarizeMobileRuleCompileWarnings(
+      collectMobileRuleCompileWarnings(nextSnapshot.ruleConfigV2, resolverContext),
+    );
     const shouldApplyRuntime = currentRuntimeStatus?.serviceRunning === true;
     if (!shouldApplyRuntime) {
       nextSnapshot.lastRuntimeApply = buildRuntimeApplyStatus({
@@ -2933,6 +2951,7 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
         result: "saved_only",
         changeSetSummary: "mobile_rule_config",
         success: true,
+        warning: compileWarning,
       });
       return commitSnapshot(nextSnapshot);
     }
@@ -2945,6 +2964,12 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
           changeSetSummary: "mobile_rule_config",
         },
       });
+      if (appliedSnapshot.lastRuntimeApply && compileWarning) {
+        appliedSnapshot.lastRuntimeApply = {
+          ...appliedSnapshot.lastRuntimeApply,
+          warning: compileWarning,
+        };
+      }
       const committedSnapshot = commitSnapshot(appliedSnapshot);
       return await refreshReferencedNodePoolsInBackground({
         status: currentRuntimeStatus,
@@ -3015,7 +3040,7 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
     const runtimeConfig = buildMobileRuntimeConfig(
       snapshot,
       targetMode,
-      await createMobileResolverContext(currentStatus),
+      await createMobileResolverContext(currentStatus, mobileHost),
     );
     await host.checkConfig(runtimeConfig.configJson);
     await host.start({
@@ -3112,7 +3137,7 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
     const runtimeConfig = buildMobileRuntimeConfig(
       snapshot,
       targetMode,
-      await createMobileResolverContext(currentStatus),
+      await createMobileResolverContext(currentStatus, mobileHost),
     );
     await host.checkConfig(runtimeConfig.configJson);
     await host.start({
@@ -3210,7 +3235,7 @@ export function createMobileDaemonBridge(mobileHost: WaterayMobileHostApi | null
               domain: typeof payload.body?.domain === "string" ? payload.body.domain : "",
               timeoutMs:
                 typeof payload.body?.timeoutMs === "number" ? payload.body.timeoutMs : undefined,
-            }, await createMobileResolverContext(currentStatus), mobileHost ?? undefined, currentStatus ?? undefined);
+            }, await createMobileResolverContext(currentStatus, mobileHost), mobileHost ?? undefined, currentStatus ?? undefined);
             return {
               ok: result.error === undefined,
               snapshot,

@@ -21,4 +21,4 @@
 #-renamesourcefileattribute SourceFile
 
 # Keep mobile host bridge/plugin models stable for Tauri JSON serialization.
--keep class com.wateray.desktop.mobilehost.** { *; }
+-keep class com.singbox.wateray.mobilehost.** { *; }

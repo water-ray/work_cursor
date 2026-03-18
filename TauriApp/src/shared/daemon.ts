@@ -281,6 +281,13 @@ export interface RuleProcessMatch {
   nameContains?: string[];
   pathContains?: string[];
   pathRegex?: string[];
+  app?: RuleAppMatch;
+}
+
+export interface RuleAppMatch {
+  packageName?: string[];
+  label?: string[];
+  uid?: number[];
 }
 
 export interface RuleMatchV2 {
@@ -726,6 +733,7 @@ export interface RuntimeApplyStatus {
   rollbackApplied: boolean;
   restartRequired?: boolean;
   error?: string;
+  warning?: string;
   timestampMs: number;
 }
 

@@ -277,6 +277,7 @@ type RuntimeApplyStatus struct {
 	RollbackApplied  bool                  `json:"rollbackApplied"`
 	RestartRequired  bool                  `json:"restartRequired,omitempty"`
 	Error            string                `json:"error,omitempty"`
+	Warning          string                `json:"warning,omitempty"`
 	TimestampMS      int64                 `json:"timestampMs"`
 }
 
@@ -637,6 +638,13 @@ type RuleProcessMatch struct {
 	NameContains []string `json:"nameContains,omitempty"`
 	PathContains []string `json:"pathContains,omitempty"`
 	PathRegex    []string `json:"pathRegex,omitempty"`
+	App          RuleAppMatch `json:"app,omitempty"`
+}
+
+type RuleAppMatch struct {
+	PackageName []string `json:"packageName,omitempty"`
+	Label       []string `json:"label,omitempty"`
+	UID         []int    `json:"uid,omitempty"`
 }
 
 type RuleMatch struct {

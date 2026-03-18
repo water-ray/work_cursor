@@ -100,10 +100,10 @@ type clashConnectionsSnapshot struct {
 
 func (s *clashConnectionsSnapshot) UnmarshalJSON(data []byte) error {
 	type rawSnapshot struct {
-		UploadTotal        json.RawMessage        `json:"uploadTotal"`
-		DownloadTotal      json.RawMessage        `json:"downloadTotal"`
-		UploadTotalSnake   json.RawMessage        `json:"upload_total"`
-		DownloadTotalSnake json.RawMessage        `json:"download_total"`
+		UploadTotal        json.RawMessage         `json:"uploadTotal"`
+		DownloadTotal      json.RawMessage         `json:"downloadTotal"`
+		UploadTotalSnake   json.RawMessage         `json:"upload_total"`
+		DownloadTotalSnake json.RawMessage         `json:"download_total"`
 		Connections        []clashConnectionRecord `json:"connections"`
 	}
 	var raw rawSnapshot
@@ -148,13 +148,13 @@ type clashConnectionRecord struct {
 
 func (r *clashConnectionRecord) UnmarshalJSON(data []byte) error {
 	type rawRecord struct {
-		ID            string                `json:"id"`
-		Upload        json.RawMessage       `json:"upload"`
-		Download      json.RawMessage       `json:"download"`
-		UploadSnake   json.RawMessage       `json:"upload_bytes"`
-		DownloadSnake json.RawMessage       `json:"download_bytes"`
+		ID            string                  `json:"id"`
+		Upload        json.RawMessage         `json:"upload"`
+		Download      json.RawMessage         `json:"download"`
+		UploadSnake   json.RawMessage         `json:"upload_bytes"`
+		DownloadSnake json.RawMessage         `json:"download_bytes"`
 		Metadata      clashConnectionMetadata `json:"metadata"`
-		Chains        []string              `json:"chains"`
+		Chains        []string                `json:"chains"`
 	}
 	var raw rawRecord
 	if err := json.Unmarshal(data, &raw); err != nil {
@@ -183,6 +183,57 @@ func (r *clashConnectionRecord) UnmarshalJSON(data []byte) error {
 		UploadSnake:   uploadSnake,
 		DownloadSnake: downloadSnake,
 		Metadata:      raw.Metadata,
+		Chains:        append([]string{}, raw.Chains...),
+	}
+	return nil
+}
+
+type clashConnectionStatsRecord struct {
+	Upload        int64    `json:"upload"`
+	Download      int64    `json:"download"`
+	UploadSnake   int64    `json:"upload_bytes"`
+	DownloadSnake int64    `json:"download_bytes"`
+	Network       string   `json:"network"`
+	Chains        []string `json:"chains"`
+}
+
+func (r *clashConnectionStatsRecord) UnmarshalJSON(data []byte) error {
+	type rawRecord struct {
+		Upload        json.RawMessage `json:"upload"`
+		Download      json.RawMessage `json:"download"`
+		UploadSnake   json.RawMessage `json:"upload_bytes"`
+		DownloadSnake json.RawMessage `json:"download_bytes"`
+		Metadata      struct {
+			Network string `json:"network"`
+		} `json:"metadata"`
+		Chains []string `json:"chains"`
+	}
+	var raw rawRecord
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	upload, err := decodeFlexibleJSONInt64(raw.Upload)
+	if err != nil {
+		return fmt.Errorf("upload: %w", err)
+	}
+	download, err := decodeFlexibleJSONInt64(raw.Download)
+	if err != nil {
+		return fmt.Errorf("download: %w", err)
+	}
+	uploadSnake, err := decodeFlexibleJSONInt64(raw.UploadSnake)
+	if err != nil {
+		return fmt.Errorf("upload_bytes: %w", err)
+	}
+	downloadSnake, err := decodeFlexibleJSONInt64(raw.DownloadSnake)
+	if err != nil {
+		return fmt.Errorf("download_bytes: %w", err)
+	}
+	*r = clashConnectionStatsRecord{
+		Upload:        upload,
+		Download:      download,
+		UploadSnake:   uploadSnake,
+		DownloadSnake: downloadSnake,
+		Network:       strings.TrimSpace(raw.Metadata.Network),
 		Chains:        append([]string{}, raw.Chains...),
 	}
 	return nil
@@ -309,6 +360,188 @@ func decodeFlexibleJSONInt64(data json.RawMessage) (int64, error) {
 		return value, nil
 	}
 	return 0, fmt.Errorf("invalid integer value %s", trimmed)
+}
+
+type trafficTickConnectionsBuilder struct {
+	stats             TrafficTickPayload
+	nodeUsage         map[string]int64
+	nodeUploadBytes   map[string]int64
+	nodeDownloadBytes map[string]int64
+}
+
+func newTrafficTickConnectionsBuilder(uploadBytes int64, downloadBytes int64) trafficTickConnectionsBuilder {
+	return trafficTickConnectionsBuilder{
+		stats: TrafficTickPayload{
+			UploadBytes:   uploadBytes,
+			DownloadBytes: downloadBytes,
+		},
+		nodeUsage:         map[string]int64{},
+		nodeUploadBytes:   map[string]int64{},
+		nodeDownloadBytes: map[string]int64{},
+	}
+}
+
+func (b *trafficTickConnectionsBuilder) setUploadBytes(value int64) {
+	b.stats.UploadBytes = maxInt64(b.stats.UploadBytes, value)
+}
+
+func (b *trafficTickConnectionsBuilder) setDownloadBytes(value int64) {
+	b.stats.DownloadBytes = maxInt64(b.stats.DownloadBytes, value)
+}
+
+func (b *trafficTickConnectionsBuilder) addConnection(network string, uploadBytes int64, downloadBytes int64, chains []string) {
+	b.stats.TotalConnections++
+	switch {
+	case strings.HasPrefix(network, "tcp"):
+		b.stats.TCPConnections++
+	case strings.HasPrefix(network, "udp"):
+		b.stats.UDPConnections++
+	}
+
+	var connectionNodeIDs map[string]struct{}
+	for _, chainTag := range chains {
+		nodeID, ok := parseRuntimeNodeIDFromTag(chainTag)
+		if !ok {
+			continue
+		}
+		if connectionNodeIDs == nil {
+			connectionNodeIDs = make(map[string]struct{}, len(chains))
+		}
+		connectionNodeIDs[nodeID] = struct{}{}
+	}
+	for nodeID := range connectionNodeIDs {
+		b.nodeUsage[nodeID]++
+		b.nodeUploadBytes[nodeID] += uploadBytes
+		b.nodeDownloadBytes[nodeID] += downloadBytes
+	}
+}
+
+func (b *trafficTickConnectionsBuilder) build() TrafficTickPayload {
+	stats := b.stats
+	if len(b.nodeUsage) == 0 {
+		return stats
+	}
+	stats.ActiveNodeCount = int64(len(b.nodeUsage))
+	nodeIDs := make([]string, 0, len(b.nodeUsage))
+	for nodeID := range b.nodeUsage {
+		nodeIDs = append(nodeIDs, nodeID)
+	}
+	sort.Slice(nodeIDs, func(i, j int) bool {
+		left := b.nodeUsage[nodeIDs[i]]
+		right := b.nodeUsage[nodeIDs[j]]
+		if left == right {
+			return nodeIDs[i] < nodeIDs[j]
+		}
+		return left > right
+	})
+	stats.Nodes = make([]ActiveNodeConnection, 0, len(nodeIDs))
+	for _, nodeID := range nodeIDs {
+		stats.Nodes = append(stats.Nodes, ActiveNodeConnection{
+			NodeID:        nodeID,
+			Connections:   b.nodeUsage[nodeID],
+			UploadBytes:   b.nodeUploadBytes[nodeID],
+			DownloadBytes: b.nodeDownloadBytes[nodeID],
+		})
+	}
+	return stats
+}
+
+func decodeFlexibleJSONInt64FromDecoder(decoder *json.Decoder) (int64, error) {
+	var raw json.RawMessage
+	if err := decoder.Decode(&raw); err != nil {
+		return 0, err
+	}
+	return decodeFlexibleJSONInt64(raw)
+}
+
+func decodeTrafficTickConnectionsArray(
+	decoder *json.Decoder,
+	builder *trafficTickConnectionsBuilder,
+) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return fmt.Errorf("decode connections array start failed: %w", err)
+	}
+	delim, ok := token.(json.Delim)
+	if !ok || delim != '[' {
+		return errors.New("connections is not an array")
+	}
+	for decoder.More() {
+		var record clashConnectionStatsRecord
+		if err := decoder.Decode(&record); err != nil {
+			return fmt.Errorf("decode connection record failed: %w", err)
+		}
+		builder.addConnection(
+			strings.ToLower(strings.TrimSpace(record.Network)),
+			maxInt64(record.Upload, record.UploadSnake),
+			maxInt64(record.Download, record.DownloadSnake),
+			record.Chains,
+		)
+	}
+	token, err = decoder.Token()
+	if err != nil {
+		return fmt.Errorf("decode connections array end failed: %w", err)
+	}
+	delim, ok = token.(json.Delim)
+	if !ok || delim != ']' {
+		return errors.New("connections array did not close correctly")
+	}
+	return nil
+}
+
+func buildTrafficTickFromConnectionsReader(reader io.Reader) (TrafficTickPayload, error) {
+	decoder := json.NewDecoder(reader)
+	token, err := decoder.Token()
+	if err != nil {
+		return TrafficTickPayload{}, fmt.Errorf("decode connections response start failed: %w", err)
+	}
+	delim, ok := token.(json.Delim)
+	if !ok || delim != '{' {
+		return TrafficTickPayload{}, errors.New("connections response is not an object")
+	}
+	builder := newTrafficTickConnectionsBuilder(0, 0)
+	for decoder.More() {
+		fieldToken, err := decoder.Token()
+		if err != nil {
+			return TrafficTickPayload{}, fmt.Errorf("decode connections field failed: %w", err)
+		}
+		fieldName, ok := fieldToken.(string)
+		if !ok {
+			return TrafficTickPayload{}, errors.New("connections field name is invalid")
+		}
+		switch fieldName {
+		case "uploadTotal", "upload_total":
+			value, err := decodeFlexibleJSONInt64FromDecoder(decoder)
+			if err != nil {
+				return TrafficTickPayload{}, fmt.Errorf("%s: %w", fieldName, err)
+			}
+			builder.setUploadBytes(value)
+		case "downloadTotal", "download_total":
+			value, err := decodeFlexibleJSONInt64FromDecoder(decoder)
+			if err != nil {
+				return TrafficTickPayload{}, fmt.Errorf("%s: %w", fieldName, err)
+			}
+			builder.setDownloadBytes(value)
+		case "connections":
+			if err := decodeTrafficTickConnectionsArray(decoder, &builder); err != nil {
+				return TrafficTickPayload{}, fmt.Errorf("connections: %w", err)
+			}
+		default:
+			var discarded any
+			if err := decoder.Decode(&discarded); err != nil {
+				return TrafficTickPayload{}, fmt.Errorf("skip connections field %s failed: %w", fieldName, err)
+			}
+		}
+	}
+	token, err = decoder.Token()
+	if err != nil {
+		return TrafficTickPayload{}, fmt.Errorf("decode connections response end failed: %w", err)
+	}
+	delim, ok = token.(json.Delim)
+	if !ok || delim != '}' {
+		return TrafficTickPayload{}, errors.New("connections response did not close correctly")
+	}
+	return builder.build(), nil
 }
 
 func newProxyRuntime(onLog func(level LogLevel, message string)) *proxyRuntime {
@@ -852,14 +1085,19 @@ func (r *proxyRuntime) CloseAllConnections() error {
 }
 
 func (r *proxyRuntime) QueryConnectionsStats() (TrafficTickPayload, error) {
-	payload, err := r.QueryConnectionsSnapshot()
+	response, err := r.queryConnectionsResponse()
 	if err != nil {
 		return TrafficTickPayload{}, err
 	}
-	return buildTrafficTickFromConnectionsSnapshot(payload), nil
+	defer response.Body.Close()
+	stats, err := buildTrafficTickFromConnectionsReader(response.Body)
+	if err != nil {
+		return TrafficTickPayload{}, fmt.Errorf("decode query connections response failed: %w", err)
+	}
+	return stats, nil
 }
 
-func (r *proxyRuntime) QueryConnectionsSnapshot() (clashConnectionsSnapshot, error) {
+func (r *proxyRuntime) queryConnectionsResponse() (*http.Response, error) {
 	controller := r.clashAPIControllerOrDefault()
 	request, err := http.NewRequest(
 		http.MethodGet,
@@ -867,24 +1105,33 @@ func (r *proxyRuntime) QueryConnectionsSnapshot() (clashConnectionsSnapshot, err
 		nil,
 	)
 	if err != nil {
-		return clashConnectionsSnapshot{}, fmt.Errorf("create query connections request failed: %w", err)
+		return nil, fmt.Errorf("create query connections request failed: %w", err)
 	}
 	client := &http.Client{
 		Timeout: 3 * time.Second,
 	}
 	response, err := client.Do(request)
 	if err != nil {
-		return clashConnectionsSnapshot{}, fmt.Errorf("query connections failed: %w", err)
+		return nil, fmt.Errorf("query connections failed: %w", err)
 	}
-	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(response.Body, 1024))
-		return clashConnectionsSnapshot{}, fmt.Errorf(
+		_ = response.Body.Close()
+		return nil, fmt.Errorf(
 			"query connections failed: status=%d body=%s",
 			response.StatusCode,
 			strings.TrimSpace(string(body)),
 		)
 	}
+	return response, nil
+}
+
+func (r *proxyRuntime) QueryConnectionsSnapshot() (clashConnectionsSnapshot, error) {
+	response, err := r.queryConnectionsResponse()
+	if err != nil {
+		return clashConnectionsSnapshot{}, err
+	}
+	defer response.Body.Close()
 	var payload clashConnectionsSnapshot
 	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
 		return clashConnectionsSnapshot{}, fmt.Errorf("decode query connections response failed: %w", err)
@@ -893,67 +1140,19 @@ func (r *proxyRuntime) QueryConnectionsSnapshot() (clashConnectionsSnapshot, err
 }
 
 func buildTrafficTickFromConnectionsSnapshot(payload clashConnectionsSnapshot) TrafficTickPayload {
-	stats := TrafficTickPayload{
-		UploadBytes:   maxInt64(payload.UploadTotal, payload.UploadTotalSnake),
-		DownloadBytes: maxInt64(payload.DownloadTotal, payload.DownloadTotalSnake),
-	}
-	if len(payload.Connections) == 0 {
-		return stats
-	}
-	stats.TotalConnections = int64(len(payload.Connections))
-	nodeUsage := map[string]int64{}
-	nodeUploadBytes := map[string]int64{}
-	nodeDownloadBytes := map[string]int64{}
+	builder := newTrafficTickConnectionsBuilder(
+		maxInt64(payload.UploadTotal, payload.UploadTotalSnake),
+		maxInt64(payload.DownloadTotal, payload.DownloadTotalSnake),
+	)
 	for _, connection := range payload.Connections {
-		network := strings.ToLower(strings.TrimSpace(connection.Metadata.Network))
-		switch {
-		case strings.HasPrefix(network, "tcp"):
-			stats.TCPConnections++
-		case strings.HasPrefix(network, "udp"):
-			stats.UDPConnections++
-		}
-		connectionUploadBytes := maxInt64(connection.Upload, connection.UploadSnake)
-		connectionDownloadBytes := maxInt64(connection.Download, connection.DownloadSnake)
-		connectionNodeIDs := map[string]struct{}{}
-		for _, chainTag := range connection.Chains {
-			nodeID, ok := parseRuntimeNodeIDFromTag(chainTag)
-			if !ok {
-				continue
-			}
-			connectionNodeIDs[nodeID] = struct{}{}
-		}
-		for nodeID := range connectionNodeIDs {
-			nodeUsage[nodeID]++
-			nodeUploadBytes[nodeID] += connectionUploadBytes
-			nodeDownloadBytes[nodeID] += connectionDownloadBytes
-		}
+		builder.addConnection(
+			strings.ToLower(strings.TrimSpace(connection.Metadata.Network)),
+			maxInt64(connection.Upload, connection.UploadSnake),
+			maxInt64(connection.Download, connection.DownloadSnake),
+			connection.Chains,
+		)
 	}
-	if len(nodeUsage) == 0 {
-		return stats
-	}
-	stats.ActiveNodeCount = int64(len(nodeUsage))
-	nodeIDs := make([]string, 0, len(nodeUsage))
-	for nodeID := range nodeUsage {
-		nodeIDs = append(nodeIDs, nodeID)
-	}
-	sort.Slice(nodeIDs, func(i, j int) bool {
-		left := nodeUsage[nodeIDs[i]]
-		right := nodeUsage[nodeIDs[j]]
-		if left == right {
-			return nodeIDs[i] < nodeIDs[j]
-		}
-		return left > right
-	})
-	stats.Nodes = make([]ActiveNodeConnection, 0, len(nodeIDs))
-	for _, nodeID := range nodeIDs {
-		stats.Nodes = append(stats.Nodes, ActiveNodeConnection{
-			NodeID:        nodeID,
-			Connections:   nodeUsage[nodeID],
-			UploadBytes:   nodeUploadBytes[nodeID],
-			DownloadBytes: nodeDownloadBytes[nodeID],
-		})
-	}
-	return stats
+	return builder.build()
 }
 
 func maxInt64(a int64, b int64) int64 {

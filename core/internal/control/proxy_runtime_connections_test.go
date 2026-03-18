@@ -2,6 +2,7 @@ package control
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -62,6 +63,88 @@ func TestBuildTrafficTickFromConnectionsSnapshot(t *testing.T) {
 		t.Fatalf("unexpected node[0]: %+v", stats.Nodes[0])
 	}
 	if stats.Nodes[0].UploadBytes != 160 || stats.Nodes[0].DownloadBytes != 280 {
+		t.Fatalf("unexpected node[0] bytes: %+v", stats.Nodes[0])
+	}
+	if stats.Nodes[1].NodeID != "beta" || stats.Nodes[1].Connections != 2 {
+		t.Fatalf("unexpected node[1]: %+v", stats.Nodes[1])
+	}
+	if stats.Nodes[1].UploadBytes != 80 || stats.Nodes[1].DownloadBytes != 120 {
+		t.Fatalf("unexpected node[1] bytes: %+v", stats.Nodes[1])
+	}
+}
+
+func TestBuildTrafficTickFromConnectionsReader(t *testing.T) {
+	raw := strings.NewReader(`{
+		"uploadTotal": "120",
+		"downloadTotal": 360,
+		"upload_total": "180",
+		"download_total": 240,
+		"ignored": {"nested": true},
+		"connections": [
+			{
+				"upload": "100",
+				"download": 200,
+				"upload_bytes": "150",
+				"download_bytes": 250,
+				"metadata": {
+					"network": "tcp"
+				},
+				"chains": ["proxy", "node-alpha"]
+			},
+			{
+				"upload": 20,
+				"download": 40,
+				"metadata": {
+					"network": "udp"
+				},
+				"chains": ["proxy", "node-beta"]
+			},
+			{
+				"upload": 60,
+				"download": 80,
+				"metadata": {
+					"network": "tcp4"
+				},
+				"chains": ["node-alpha", "node-beta", "node-alpha"]
+			},
+			{
+				"metadata": {
+					"network": "icmp"
+				},
+				"chains": ["direct"]
+			}
+		]
+	}`)
+
+	stats, err := buildTrafficTickFromConnectionsReader(raw)
+	if err != nil {
+		t.Fatalf("build traffic tick from reader failed: %v", err)
+	}
+	if stats.UploadBytes != 180 {
+		t.Fatalf("expected upload bytes 180, got %d", stats.UploadBytes)
+	}
+	if stats.DownloadBytes != 360 {
+		t.Fatalf("expected download bytes 360, got %d", stats.DownloadBytes)
+	}
+	if stats.TotalConnections != 4 {
+		t.Fatalf("expected total connections 4, got %d", stats.TotalConnections)
+	}
+	if stats.TCPConnections != 2 {
+		t.Fatalf("expected tcp connections 2, got %d", stats.TCPConnections)
+	}
+	if stats.UDPConnections != 1 {
+		t.Fatalf("expected udp connections 1, got %d", stats.UDPConnections)
+	}
+	if stats.ActiveNodeCount != 2 {
+		t.Fatalf("expected active node count 2, got %d", stats.ActiveNodeCount)
+	}
+	if len(stats.Nodes) != 2 {
+		t.Fatalf("expected two active nodes, got %d", len(stats.Nodes))
+	}
+	if stats.Nodes[0].NodeID != "alpha" || stats.Nodes[0].Connections != 2 {
+		t.Fatalf("unexpected node[0]: %+v", stats.Nodes[0])
+	}
+	if stats.Nodes[0].UploadBytes != 210 || stats.Nodes[0].DownloadBytes != 330 {
 		t.Fatalf("unexpected node[0] bytes: %+v", stats.Nodes[0])
 	}
 	if stats.Nodes[1].NodeID != "beta" || stats.Nodes[1].Connections != 2 {

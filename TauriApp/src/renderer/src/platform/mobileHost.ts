@@ -63,6 +63,17 @@ export interface WaterayMobileHostVersions {
   singBoxVersion: string;
 }
 
+export interface WaterayMobileInstalledAppSummary {
+  packageName: string;
+  label?: string;
+  uid?: number;
+}
+
+export interface WaterayMobileInstalledAppIconResult {
+  packageName: string;
+  dataUrl?: string;
+}
+
 export interface WaterayMobileHostStartRequest {
   configJson: string;
   profileName?: string;
@@ -182,6 +193,8 @@ export interface WaterayMobileRuleSetUpdateResult {
 export interface WaterayMobileHostApi {
   getStatus: () => Promise<WaterayMobileHostStatus>;
   getVersions: () => Promise<WaterayMobileHostVersions>;
+  listInstalledApps: () => Promise<WaterayMobileInstalledAppSummary[]>;
+  getInstalledAppIcon: (packageName: string, sizeDp?: number) => Promise<string | undefined>;
   prepare: () => Promise<WaterayMobileHostPrepareResult>;
   checkConfig: (configJson: string) => Promise<WaterayMobileHostCheckResult>;
   start: (request: WaterayMobileHostStartRequest) => Promise<WaterayMobileHostStatus>;
@@ -248,9 +261,33 @@ const mobileHostPushListeners = new Set<MobileHostPushListener>();
 const mobileHostTransportListeners = new Set<MobileHostTransportListener>();
 let latestMobileHostStatus: WaterayMobileHostStatus = { ...emptyMobileHostStatus };
 let mobileHostLoopbackClient: LoopbackRpcClient | null = null;
+const mobileHostInstalledAppsTimeoutMs = 15000;
+const mobileHostInstalledAppIconTimeoutMs = 8000;
 
 async function invokeMobileHost<T>(command: string, payload?: TauriInvokeArgs): Promise<T> {
   return invoke<T>(command, payload ?? {});
+}
+
+async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  message: string,
+): Promise<T> {
+  let timer: number | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_resolve, reject) => {
+        timer = window.setTimeout(() => {
+          reject(new Error(message));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) {
+      window.clearTimeout(timer);
+    }
+  }
 }
 
 function sleep(ms: number): Promise<void> {
@@ -333,6 +370,91 @@ function normalizeVersionsResult(payload: unknown): WaterayMobileHostVersions {
   return {
     waterayVersion: typeof source.waterayVersion === "string" ? source.waterayVersion : "",
     singBoxVersion: typeof source.singBoxVersion === "string" ? source.singBoxVersion : "",
+  };
+}
+
+function unwrapArrayPayload(payload: unknown): unknown[] {
+  if (Array.isArray(payload)) {
+    return payload;
+  }
+  if (typeof payload === "string") {
+    try {
+      return unwrapArrayPayload(JSON.parse(payload));
+    } catch {
+      return [];
+    }
+  }
+  if (!payload || typeof payload !== "object") {
+    return [];
+  }
+  const source = payload as Record<string, unknown>;
+  for (const key of ["items", "apps", "payload", "result", "data", "value"]) {
+    const nested = source[key];
+    if (Array.isArray(nested)) {
+      return nested;
+    }
+  }
+  const numericKeys = Object.keys(source)
+    .filter((key) => /^\d+$/.test(key))
+    .sort((left, right) => Number(left) - Number(right));
+  if (numericKeys.length > 0) {
+    return numericKeys.map((key) => source[key]);
+  }
+  return [];
+}
+
+function normalizeInstalledAppsResult(payload: unknown): WaterayMobileInstalledAppSummary[] {
+  const entries = unwrapArrayPayload(payload);
+  if (entries.length === 0) {
+    return [];
+  }
+  const result: WaterayMobileInstalledAppSummary[] = [];
+  const seen = new Set<string>();
+  for (const item of entries) {
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+    const record = item as Partial<WaterayMobileInstalledAppSummary>;
+    const packageName = typeof record.packageName === "string" ? record.packageName.trim() : "";
+    if (packageName === "") {
+      continue;
+    }
+    const uid =
+      typeof record.uid === "number" && Number.isFinite(record.uid)
+        ? Math.max(0, Math.trunc(record.uid))
+        : undefined;
+    const key = `${packageName.toLowerCase()}#${uid ?? 0}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    result.push({
+      packageName,
+      label:
+        typeof record.label === "string" && record.label.trim() !== ""
+          ? record.label.trim()
+          : undefined,
+      uid,
+    });
+  }
+  return result;
+}
+
+function normalizeInstalledAppIconResult(payload: unknown): WaterayMobileInstalledAppIconResult | null {
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+  const source = payload as Partial<WaterayMobileInstalledAppIconResult>;
+  const packageName = typeof source.packageName === "string" ? source.packageName.trim() : "";
+  if (packageName === "") {
+    return null;
+  }
+  return {
+    packageName,
+    dataUrl:
+      typeof source.dataUrl === "string" && source.dataUrl.trim() !== ""
+        ? source.dataUrl.trim()
+        : undefined,
   };
 }
 
@@ -679,6 +801,10 @@ function normalizeRuntimeApplyStatus(payload: unknown): RuntimeApplyStatus | nul
     rollbackApplied: source.rollbackApplied === true,
     restartRequired: source.restartRequired === true ? true : undefined,
     error: typeof source.error === "string" && source.error.trim() !== "" ? source.error.trim() : undefined,
+    warning:
+      typeof source.warning === "string" && source.warning.trim() !== ""
+        ? source.warning.trim()
+        : undefined,
     timestampMs:
       typeof source.timestampMs === "number" && Number.isFinite(source.timestampMs)
         ? Math.max(0, Math.trunc(source.timestampMs))
@@ -1125,6 +1251,51 @@ export function createWaterayMobileHostApi(): WaterayMobileHostApi {
           ),
       );
       return normalizeVersionsResult(payload);
+    },
+    async listInstalledApps() {
+      let payload: unknown;
+      try {
+        payload = await withTimeout(
+          callMobileHostLoopback<unknown>("host.listInstalledApps"),
+          mobileHostInstalledAppsTimeoutMs,
+          "读取安卓已安装应用超时，请重试",
+        );
+      } catch {
+        payload = await withTimeout(
+          invokeMobileHost<unknown>(
+            mobileHostContract.commands.listInstalledApps.invokeCommand,
+          ),
+          mobileHostInstalledAppsTimeoutMs,
+          "读取安卓已安装应用超时，请重试",
+        );
+      }
+      return normalizeInstalledAppsResult(payload);
+    },
+    async getInstalledAppIcon(packageName, sizeDp) {
+      const loopbackPayload = {
+        packageName,
+        sizeDp,
+      };
+      let payload: unknown;
+      try {
+        payload = await withTimeout(
+          callMobileHostLoopback<unknown>("host.getInstalledAppIcon", loopbackPayload),
+          mobileHostInstalledAppIconTimeoutMs,
+          "读取安卓应用图标超时",
+        );
+      } catch {
+        payload = await withTimeout(
+          invokeMobileHost<unknown>(
+            mobileHostContract.commands.getInstalledAppIcon.invokeCommand,
+            {
+              payload: loopbackPayload,
+            },
+          ),
+          mobileHostInstalledAppIconTimeoutMs,
+          "读取安卓应用图标超时",
+        );
+      }
+      return normalizeInstalledAppIconResult(payload)?.dataUrl;
     },
     async prepare() {
       const payload = await invokeMobileHost<unknown>(

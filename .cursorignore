@@ -8,3 +8,4 @@ scripts/build/__pycache__/
 TauriApp/node_modules/
 TauriApp/dist/
 TauriApp/src-tauri/target/
+temp/

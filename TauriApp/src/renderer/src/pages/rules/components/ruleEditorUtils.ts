@@ -35,7 +35,10 @@ export function hasAnyMatcher(match: RuleMatchV2): boolean {
     (match.ruleSetRefs?.length ?? 0) > 0 ||
     (match.process.nameContains?.length ?? 0) > 0 ||
     (match.process.pathContains?.length ?? 0) > 0 ||
-    (match.process.pathRegex?.length ?? 0) > 0
+    (match.process.pathRegex?.length ?? 0) > 0 ||
+    (match.process.app?.packageName?.length ?? 0) > 0 ||
+    (match.process.app?.label?.length ?? 0) > 0 ||
+    (match.process.app?.uid?.length ?? 0) > 0
   );
 }
 
@@ -46,6 +49,15 @@ export function summarizeRuleMatch(match: RuleMatchV2): string {
   }
   if ((match.process.pathContains?.length ?? 0) > 0) {
     parts.push(`进程路径 ${match.process.pathContains?.length}`);
+  }
+  if ((match.process.app?.packageName?.length ?? 0) > 0) {
+    parts.push(`应用包名 ${match.process.app?.packageName?.length}`);
+  }
+  if ((match.process.app?.label?.length ?? 0) > 0) {
+    parts.push(`应用名称 ${match.process.app?.label?.length}`);
+  }
+  if ((match.process.app?.uid?.length ?? 0) > 0) {
+    parts.push(`应用 UID ${match.process.app?.uid?.length}`);
   }
   if ((match.domain.exact?.length ?? 0) > 0) {
     parts.push(`域名精确 ${match.domain.exact?.length}`);

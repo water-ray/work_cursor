@@ -22,7 +22,7 @@ const tauriBin = join(
 const subcommand = process.argv[2] ?? "dev";
 const forwardedArgs = process.argv.slice(3);
 
-const linuxAppId = "com.wateray.desktop";
+const linuxAppId = "com.singbox.wateray";
 const linuxDesktopFileName = `${linuxAppId}.desktop`;
 const linuxDevIconPrefix = "wateray-tauri-dev-";
 const linuxIconSourcePath = join(__dirname, "../src-tauri/icons/128x128@2x.png");

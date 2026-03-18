@@ -1,5 +1,6 @@
 import {
   Button,
+  Checkbox,
   Collapse,
   Form,
   Input,
@@ -24,6 +25,10 @@ import { SwitchWithLabel } from "../../../components/form/SwitchWithLabel";
 import { useAppNotice } from "../../../components/notify/AppNoticeProvider";
 import { useDraftNavLock } from "../../../hooks/useDraftNavLock";
 import { useDraftNotice } from "../../../hooks/useDraftNotice";
+import {
+  createWaterayMobileHostApi,
+  type WaterayMobileInstalledAppSummary,
+} from "../../../platform/mobileHost";
 import { isMobileRuntime } from "../../../platform/runtimeStore";
 import {
   dispatchRulesUiState,
@@ -69,6 +74,16 @@ function unique(values: string[]): string[] {
   );
 }
 
+function uniqueInts(values: number[]): number[] {
+  return Array.from(
+    new Set(
+      values
+        .map((item) => Math.trunc(Number(item)))
+        .filter((item) => Number.isFinite(item) && item > 0),
+    ),
+  );
+}
+
 function normalizeInputLine(rawLine: string): string {
   const trimmed = rawLine.trim();
   if (trimmed === "" || trimmed.startsWith("#")) {
@@ -105,12 +120,170 @@ function ensureCaseInsensitiveRegex(rawPattern: string): string {
   return `(?i)${pattern}`;
 }
 
+const mobileAppPackagePrefixes = [
+  "package:",
+  "pkg:",
+  "package-name:",
+  "app.package:",
+  "app.packagename:",
+];
+
+const mobileAppLabelPrefixes = [
+  "label:",
+  "app:",
+  "app-label:",
+  "app.name:",
+  "app.label:",
+];
+
+const mobileAppUidPrefixes = ["uid:", "app.uid:"];
+
+function extractMobileRulePackageNamesFromContent(content: string): string[] {
+  const packages: string[] = [];
+  for (const line of splitLines(content)) {
+    const packageValue = valueAfterPrefix(line, mobileAppPackagePrefixes);
+    if (packageValue != null) {
+      packages.push(packageValue);
+      continue;
+    }
+    if (
+      valueAfterPrefix(line, mobileAppLabelPrefixes) != null ||
+      valueAfterPrefix(line, mobileAppUidPrefixes) != null ||
+      valueAfterPrefix(line, ["process:", "name:", "process-name:"]) != null ||
+      valueAfterPrefix(line, ["path:", "dir:", "process-path:"]) != null ||
+      valueAfterPrefix(line, ["regex:", "path-regex:", "process-regex:"]) != null
+    ) {
+      continue;
+    }
+    packages.push(line);
+  }
+  return unique(packages);
+}
+
+function appendMobileRulePackageNames(content: string, packageNames: string[]): string {
+  const existingPackages = new Set(
+    extractMobileRulePackageNamesFromContent(content).map((item) => item.toLowerCase()),
+  );
+  const additions = unique(packageNames)
+    .filter((item) => !existingPackages.has(item.toLowerCase()))
+    .map((item) => `package:${item}`);
+  if (additions.length === 0) {
+    return content;
+  }
+  const normalized = content.trimEnd();
+  return normalized === "" ? additions.join("\n") : `${normalized}\n${additions.join("\n")}`;
+}
+
+function buildInstalledAppSearchText(app: WaterayMobileInstalledAppSummary): string {
+  return [
+    String(app.label ?? ""),
+    String(app.packageName ?? ""),
+    Number.isFinite(app.uid) ? String(app.uid) : "",
+  ]
+    .join("\n")
+    .toLowerCase();
+}
+
+const androidSystemBasePackageExact = new Set([
+  "android",
+  "com.android.shell",
+  "com.android.systemui",
+  "com.android.keychain",
+  "com.android.pacprocessor",
+  "com.android.proxyhandler",
+  "com.android.traceur",
+  "com.android.virtualmachine.res",
+  "com.google.android.gms",
+  "com.google.android.gsf",
+  "com.google.android.permissioncontroller",
+  "com.google.android.webview",
+  "com.google.android.networkstack",
+  "com.google.android.networkstack.tethering",
+  "com.google.android.connectivity.resources",
+  "com.google.android.uwb.resources",
+  "com.google.android.safetycenter.resources",
+  "com.google.android.ext.services",
+  "com.google.android.ext.shared",
+  "com.google.android.modulemetadata",
+]);
+
+const androidSystemBasePackagePrefixes = [
+  "android.",
+  "com.android.internal.",
+  "com.google.android.overlay.",
+  "com.google.mainline.",
+];
+
+const androidSystemBasePackageFragments = [
+  ".auto_generated_",
+  ".overlay.",
+  ".internal.",
+  ".emulation.",
+  ".rro.",
+  ".rro_",
+  ".resource",
+  ".resources",
+];
+
+const androidSystemBaseLabelKeywords = [
+  "overlay",
+  "resource",
+  "resources",
+  "cutout",
+  "navigation bar",
+  "filled",
+  "system ui",
+  "system webview",
+  "services library",
+  "shared library",
+  "permission controller",
+  "connectivity resources",
+  "uwb resources",
+  "wifi resources",
+  "cell broadcast service",
+  "system tracing",
+];
+
+function isAndroidSystemBaseApp(app: WaterayMobileInstalledAppSummary): boolean {
+  const packageName = app.packageName.trim().toLowerCase();
+  const label = String(app.label ?? "").trim().toLowerCase();
+  const uid = Number.isFinite(app.uid) ? Math.trunc(Number(app.uid)) : undefined;
+  if (packageName === "") {
+    return true;
+  }
+  if (uid !== undefined && uid > 0 && uid < 10_000) {
+    return true;
+  }
+  if (androidSystemBasePackageExact.has(packageName)) {
+    return true;
+  }
+  if (androidSystemBasePackagePrefixes.some((prefix) => packageName.startsWith(prefix))) {
+    return true;
+  }
+  if (androidSystemBasePackageFragments.some((fragment) => packageName.includes(fragment))) {
+    return true;
+  }
+  if (
+    label !== "" &&
+    androidSystemBaseLabelKeywords.some((keyword) => label.includes(keyword))
+  ) {
+    return true;
+  }
+  if (packageName.startsWith("com.android.") && label.startsWith("com.android.")) {
+    return true;
+  }
+  return false;
+}
+
 function inferRuleType(item: RuleItemV2): RuleType {
   const match = item.match ?? { domain: {}, process: {} };
   const hasProcess =
     (match.process.nameContains?.length ?? 0) > 0 ||
     (match.process.pathContains?.length ?? 0) > 0 ||
-    (match.process.pathRegex?.length ?? 0) > 0;
+    (match.process.pathRegex?.length ?? 0) > 0 ||
+    (match.process.app?.packageName?.length ?? 0) > 0 ||
+    (match.process.app?.label?.length ?? 0) > 0 ||
+    (match.process.app?.uid?.length ?? 0) > 0;
   if (hasProcess) {
     return "process";
   }
@@ -127,7 +300,10 @@ function stringifyRuleContent(item: RuleItemV2, type: RuleType): string {
   const lines: string[] = [];
   const match = item.match ?? { domain: {}, process: {} };
   if (type === "process") {
-    lines.push(...(match.process.nameContains ?? []));
+    lines.push(...(match.process.app?.packageName ?? []).map((entry) => `package:${entry}`));
+    lines.push(...(match.process.app?.label ?? []).map((entry) => `label:${entry}`));
+    lines.push(...(match.process.app?.uid ?? []).map((entry) => `uid:${entry}`));
+    lines.push(...(match.process.nameContains ?? []).map((entry) => `name:${entry}`));
     lines.push(...(match.process.pathContains ?? []).map((entry) => `path:${entry}`));
     lines.push(...(match.process.pathRegex ?? []).map((entry) => `regex:${entry}`));
     return lines.join("\n");
@@ -147,15 +323,54 @@ function stringifyRuleContent(item: RuleItemV2, type: RuleType): string {
   return lines.join("\n");
 }
 
-function parseRuleContent(content: string, type: RuleType): RuleMatchV2 {
+function parseRuleContent(
+  content: string,
+  type: RuleType,
+  options: {
+    preferMobileAppPackageName?: boolean;
+  } = {},
+): RuleMatchV2 {
   const lines = splitLines(content);
   const match: RuleMatchV2 = { domain: {}, process: {} };
 
   if (type === "process") {
+    const appPackageName: string[] = [];
+    const appLabel: string[] = [];
+    const appUID: number[] = [];
     const nameContains: string[] = [];
     const pathContains: string[] = [];
     const pathRegex: string[] = [];
     for (const line of lines) {
+      const packageValue = valueAfterPrefix(line, [
+        "package:",
+        "pkg:",
+        "package-name:",
+        "app.package:",
+        "app.packagename:",
+      ]);
+      if (packageValue != null) {
+        appPackageName.push(packageValue);
+        continue;
+      }
+      const labelValue = valueAfterPrefix(line, [
+        "label:",
+        "app:",
+        "app-label:",
+        "app.name:",
+        "app.label:",
+      ]);
+      if (labelValue != null) {
+        appLabel.push(labelValue);
+        continue;
+      }
+      const uidValue = valueAfterPrefix(line, ["uid:", "app.uid:"]);
+      if (uidValue != null) {
+        const parsedUID = Math.trunc(Number(uidValue));
+        if (Number.isFinite(parsedUID) && parsedUID > 0) {
+          appUID.push(parsedUID);
+        }
+        continue;
+      }
       const pathValue = valueAfterPrefix(line, ["path:", "dir:", "process-path:"]);
       if (pathValue != null) {
         pathContains.push(pathValue);
@@ -175,12 +390,25 @@ function parseRuleContent(content: string, type: RuleType): RuleMatchV2 {
         "name:",
         "process-name:",
       ]);
-      nameContains.push(processValue ?? line);
+      if (processValue != null) {
+        nameContains.push(processValue);
+        continue;
+      }
+      if (options.preferMobileAppPackageName) {
+        appPackageName.push(line);
+      } else {
+        nameContains.push(line);
+      }
     }
     match.process = {
       nameContains: unique(nameContains),
       pathContains: unique(pathContains),
       pathRegex: unique(pathRegex),
+      app: {
+        packageName: unique(appPackageName),
+        label: unique(appLabel),
+        uid: uniqueInts(appUID),
+      },
     };
     return match;
   }
@@ -317,7 +545,7 @@ function actionLabel(mode: ActionMode, policyID: string, policyName?: string): s
   }
 }
 
-function ruleContentHelpText(type: RuleType): string {
+function ruleContentHelpText(type: RuleType, isMobileView = false): string {
   switch (type) {
     case "domain":
       return [
@@ -368,6 +596,31 @@ function ruleContentHelpText(type: RuleType): string {
         "- 空内容不会通过保存校验。",
       ].join("\n");
     default:
+      if (isMobileView) {
+        return [
+          "使用场景:",
+          "- 适合按 Android 应用包名、应用名称或应用 UID 匹配移动端应用流量。",
+          "",
+          "作用:",
+          "- 逐行填写一个应用匹配条件，或通过“从已安装应用选择”自动填入 package 规则。",
+          "",
+          "格式说明与示例:",
+          "- 支持: package / label / uid。",
+          "- 直接写包名也支持，默认按 package 处理。",
+          "- 示例:",
+          "  com.android.chrome",
+          "  package:com.android.chrome",
+          "  label:Chrome",
+          "  uid:10123",
+          "",
+          "注意点:",
+          "- 支持 # 注释（整行和行尾）。",
+          "- `label:` 和 `uid:` 会先按当前设备已安装应用解析成包名，再编译为内核规则。",
+          "- 当前设备解析不到的 `label:` / `uid:` 会自动跳过，不会阻断其他规则生效。",
+          "- 同名应用如果对应多个包名，会全部纳入匹配。",
+          "- 空内容不会通过保存校验。",
+        ].join("\n");
+      }
       return [
         "使用场景:",
         "- 适合按进程名称、进程路径或路径正则匹配桌面应用流量。",
@@ -399,7 +652,7 @@ function ruleContentHelpText(type: RuleType): string {
   }
 }
 
-function ruleContentPlaceholder(type: RuleType): string {
+function ruleContentPlaceholder(type: RuleType, isMobileView = false): string {
   switch (type) {
     case "domain":
       return [
@@ -420,6 +673,14 @@ function ruleContentPlaceholder(type: RuleType): string {
         "ruleset:google",
       ].join("\n");
     default:
+      if (isMobileView) {
+        return [
+          "com.android.chrome",
+          "package:com.android.chrome",
+          "label:Chrome",
+          "uid:10123",
+        ].join("\n");
+      }
       return [
         "# 例如目标进程路径:",
         "# C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
@@ -458,7 +719,12 @@ function buildRuleDraft(item?: RuleItemV2): RuleDraft {
   };
 }
 
-function buildRuleFromDraft(draft: RuleDraft): RuleItemV2 {
+function buildRuleFromDraft(
+  draft: RuleDraft,
+  options: {
+    preferMobileAppPackageName?: boolean;
+  } = {},
+): RuleItemV2 {
   const action =
     draft.actionMode === "reject"
       ? { type: "reject" as const, targetPolicy: "reject" }
@@ -475,7 +741,7 @@ function buildRuleFromDraft(draft: RuleDraft): RuleItemV2 {
     id: draft.id.trim(),
     name: (draft.name || draft.id).trim(),
     enabled: draft.enabled,
-    match: parseRuleContent(draft.content, draft.type),
+    match: parseRuleContent(draft.content, draft.type, options),
     action,
   };
 }
@@ -553,6 +819,11 @@ function cloneRuleItem(source: RuleItemV2): RuleItemV2 {
         nameContains: [...(source.match.process.nameContains ?? [])],
         pathContains: [...(source.match.process.pathContains ?? [])],
         pathRegex: [...(source.match.process.pathRegex ?? [])],
+        app: {
+          packageName: [...(source.match.process.app?.packageName ?? [])],
+          label: [...(source.match.process.app?.label ?? [])],
+          uid: [...(source.match.process.app?.uid ?? [])],
+        },
       },
     },
     action: {
@@ -666,6 +937,20 @@ export function ComposedRulesTabs({
   const [ruleModalOpen, setRuleModalOpen] = useState(false);
   const [editingRuleID, setEditingRuleID] = useState("");
   const [ruleDraft, setRuleDraft] = useState<RuleDraft>(() => buildRuleDraft());
+  const mobileHostApi = useMemo(
+    () => (isMobileView ? createWaterayMobileHostApi() : null),
+    [isMobileView],
+  );
+  const [appPickerOpen, setAppPickerOpen] = useState(false);
+  const [appPickerLoading, setAppPickerLoading] = useState(false);
+  const [appPickerLoaded, setAppPickerLoaded] = useState(false);
+  const [appPickerLoadError, setAppPickerLoadError] = useState("");
+  const [appPickerSearch, setAppPickerSearch] = useState("");
+  const [appPickerHideSystemApps, setAppPickerHideSystemApps] = useState(true);
+  const [installedApps, setInstalledApps] = useState<WaterayMobileInstalledAppSummary[]>([]);
+  const [selectedAppPackages, setSelectedAppPackages] = useState<string[]>([]);
+  const [appIconUrls, setAppIconUrls] = useState<Record<string, string | null>>({});
+  const [appIconLoading, setAppIconLoading] = useState<Record<string, boolean>>({});
   const normalizedGroups = draftGroups;
 
   const policyOptions = useMemo(
@@ -821,6 +1106,91 @@ export function ComposedRulesTabs({
   const resolvedActiveGroupName = String(
     resolvedActiveGroup?.name ?? resolvedActiveGroup?.id ?? "未设置",
   ).trim() || "未设置";
+  const filteredInstalledApps = useMemo(() => {
+    const baseApps = appPickerHideSystemApps
+      ? installedApps.filter((item) => !isAndroidSystemBaseApp(item))
+      : installedApps;
+    const keyword = appPickerSearch.trim().toLowerCase();
+    if (keyword === "") {
+      return baseApps;
+    }
+    return baseApps.filter((item) => buildInstalledAppSearchText(item).includes(keyword));
+  }, [appPickerHideSystemApps, appPickerSearch, installedApps]);
+  const appPickerEmptyText = useMemo(() => {
+    if (appPickerLoadError !== "") {
+      return appPickerLoadError;
+    }
+    return "当前没有可选应用";
+  }, [appPickerLoadError]);
+  const appPickerColumns = useMemo<ColumnsType<WaterayMobileInstalledAppSummary>>(
+    () => [
+      {
+        title: "应用",
+        dataIndex: "label",
+        key: "label",
+        width: isMobileView ? 180 : 240,
+        render: (_value, record) => {
+          const iconUrl = appIconUrls[record.packageName];
+          const label = record.label?.trim() || record.packageName;
+          return (
+            <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+              <div
+                style={{
+                  width: 28,
+                  height: 28,
+                  borderRadius: 8,
+                  overflow: "hidden",
+                  background: "#f5f5f5",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  flex: "0 0 auto",
+                  fontSize: 12,
+                  color: "#666",
+                }}
+              >
+                {iconUrl ? (
+                  <img
+                    src={iconUrl}
+                    alt={label}
+                    style={{ width: "100%", height: "100%", objectFit: "cover" }}
+                  />
+                ) : (
+                  label.slice(0, 1).toUpperCase()
+                )}
+              </div>
+              <div style={{ minWidth: 0 }}>
+                <Typography.Text ellipsis style={{ display: "block" }}>
+                  {label}
+                </Typography.Text>
+                {appIconLoading[record.packageName] ? (
+                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                    图标读取中
+                  </Typography.Text>
+                ) : null}
+              </div>
+            </div>
+          );
+        },
+      },
+      {
+        title: "包名",
+        dataIndex: "packageName",
+        key: "packageName",
+        width: isMobileView ? 280 : 360,
+        ellipsis: true,
+        render: (value: string) => <Typography.Text ellipsis>{value}</Typography.Text>,
+      },
+      {
+        title: "UID",
+        dataIndex: "uid",
+        key: "uid",
+        width: 110,
+        render: (value?: number) => value ?? "-",
+      },
+    ],
+    [appIconLoading, appIconUrls, isMobileView],
+  );
 
   useEffect(() => {
     if (!isMobileView) {
@@ -838,6 +1208,135 @@ export function ComposedRulesTabs({
       dispatchRulesUiState({});
     };
   }, []);
+
+  useEffect(() => {
+    if (ruleModalOpen && isMobileView && ruleDraft.type === "process") {
+      return;
+    }
+    setAppPickerOpen(false);
+  }, [isMobileView, ruleDraft.type, ruleModalOpen]);
+
+  useEffect(() => {
+    if (!appPickerOpen || !mobileHostApi || appPickerLoaded || appPickerLoading) {
+      return;
+    }
+    let cancelled = false;
+    setAppPickerLoading(true);
+    setAppPickerLoadError("");
+    void mobileHostApi
+      .listInstalledApps()
+      .then((apps) => {
+        if (cancelled) {
+          return;
+        }
+        setInstalledApps(apps);
+        setAppPickerLoaded(true);
+      })
+      .catch((error) => {
+        if (cancelled) {
+          return;
+        }
+        const message = error instanceof Error ? error.message : "读取安卓已安装应用失败";
+        setAppPickerLoadError(message);
+        setAppPickerLoaded(true);
+        notice.error(message);
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setAppPickerLoading(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [appPickerLoaded, appPickerOpen, mobileHostApi, notice]);
+
+  useEffect(() => {
+    if (!appPickerOpen || !mobileHostApi) {
+      return;
+    }
+    const packages = filteredInstalledApps
+      .map((item) => item.packageName)
+      .filter(
+        (packageName) =>
+          appIconUrls[packageName] === undefined && appIconLoading[packageName] !== true,
+      )
+      .slice(0, 24);
+    if (packages.length === 0) {
+      return;
+    }
+    // Keep icon requests alive across rerenders so slower responses
+    // can still populate the cache instead of being dropped mid-flight.
+    packages.forEach((packageName) => {
+      setAppIconLoading((current) => {
+        if (current[packageName]) {
+          return current;
+        }
+        return {
+          ...current,
+          [packageName]: true,
+        };
+      });
+      void mobileHostApi
+        .getInstalledAppIcon(packageName, 40)
+        .then((dataUrl) => {
+          setAppIconUrls((current) => {
+            if (current[packageName] !== undefined) {
+              return current;
+            }
+            return {
+              ...current,
+              [packageName]: dataUrl ?? null,
+            };
+          });
+        })
+        .finally(() => {
+          setAppIconLoading((current) => ({
+            ...current,
+            [packageName]: false,
+          }));
+        });
+    });
+  }, [
+    appIconUrls,
+    appPickerOpen,
+    filteredInstalledApps,
+    mobileHostApi,
+  ]);
+
+  const openAppPicker = () => {
+    if (!mobileHostApi) {
+      notice.warning("当前环境不支持读取安卓已安装应用");
+      return;
+    }
+    if (appPickerLoadError !== "" && installedApps.length === 0) {
+      setAppPickerLoaded(false);
+      setAppPickerLoadError("");
+    }
+    setSelectedAppPackages(extractMobileRulePackageNamesFromContent(ruleDraft.content));
+    setAppPickerSearch("");
+    setAppPickerOpen(true);
+  };
+
+  const confirmAppPickerSelection = () => {
+    if (selectedAppPackages.length === 0) {
+      notice.warning("请先选择至少一个应用");
+      return;
+    }
+    const beforeCount = extractMobileRulePackageNamesFromContent(ruleDraft.content).length;
+    const nextContent = appendMobileRulePackageNames(ruleDraft.content, selectedAppPackages);
+    const afterCount = extractMobileRulePackageNamesFromContent(nextContent).length;
+    setRuleDraft((current) => ({
+      ...current,
+      content: nextContent,
+    }));
+    setAppPickerOpen(false);
+    if (afterCount > beforeCount) {
+      notice.success(`已加入 ${afterCount - beforeCount} 个应用到匹配内容`);
+      return;
+    }
+    notice.info("所选应用已存在于匹配内容中");
+  };
 
   const commitGroups = async (nextGroups: RuleGroup[], nextActiveGroupID: string) => {
     const normalized = normalizeGroups(nextGroups);
@@ -2206,12 +2705,17 @@ export function ComposedRulesTabs({
             }
             const currentRules = currentGroup.rules ?? [];
             const nextRuleID = editingRuleID || buildRandomRuleID(currentRules);
-            const nextRule = buildRuleFromDraft({
-              ...ruleDraft,
-              id: nextRuleID,
-              name: trimmedName,
-              policyID: ruleDraft.policyID.trim(),
-            });
+            const nextRule = buildRuleFromDraft(
+              {
+                ...ruleDraft,
+                id: nextRuleID,
+                name: trimmedName,
+                policyID: ruleDraft.policyID.trim(),
+              },
+              {
+                preferMobileAppPackageName: isMobileView,
+              },
+            );
             if (!hasAnyMatcher(nextRule.match)) {
               notice.warning("规则匹配内容不能为空");
               return;
@@ -2298,7 +2802,7 @@ export function ComposedRulesTabs({
                       label="规则类型"
                       helpContent={[
                         "使用场景:",
-                        "- 按目标特征选择匹配方式：域名 / IP / 进程。",
+                        `- 按目标特征选择匹配方式：域名 / IP / ${isMobileView ? "应用" : "进程"}。`,
                         "",
                         "作用:",
                         "- 决定“匹配内容”每行如何被解析并编译到内核规则。",
@@ -2316,7 +2820,7 @@ export function ComposedRulesTabs({
                     options={[
                       { label: "域名规则", value: "domain" },
                       { label: "IP规则", value: "ip" },
-                      { label: "进程规则", value: "process" },
+                      { label: isMobileView ? "应用规则" : "进程规则", value: "process" },
                     ]}
                     onChange={(value) =>
                       setRuleDraft((current) => ({ ...current, type: value }))
@@ -2417,11 +2921,28 @@ export function ComposedRulesTabs({
             </div>
 
             <div>
+              {isMobileView && ruleDraft.type === "process" ? (
+                <Space
+                  size={8}
+                  wrap
+                  style={{ display: "flex", marginBottom: 12, justifyContent: "space-between" }}
+                >
+                  <Button
+                    onClick={openAppPicker}
+                    disabled={isRuleModalReadonly}
+                  >
+                    从已安装应用选择
+                  </Button>
+                  <Typography.Text type="secondary">
+                    选中后会自动追加为 `package:` 匹配行
+                  </Typography.Text>
+                </Space>
+              ) : null}
               <Form.Item
                 label={
                   <HelpLabel
                     label="匹配内容"
-                    helpContent={ruleContentHelpText(ruleDraft.type)}
+                    helpContent={ruleContentHelpText(ruleDraft.type, isMobileView)}
                   />
                 }
                 style={{ marginBottom: 0 }}
@@ -2433,12 +2954,66 @@ export function ComposedRulesTabs({
                   onChange={(event) =>
                     setRuleDraft((current) => ({ ...current, content: event.target.value }))
                   }
-                  placeholder={ruleContentPlaceholder(ruleDraft.type)}
+                  placeholder={ruleContentPlaceholder(ruleDraft.type, isMobileView)}
                 />
               </Form.Item>
             </div>
           </div>
         </Form>
+      </Modal>
+
+      <Modal
+        title="选择已安装应用"
+        open={appPickerOpen}
+        onOk={confirmAppPickerSelection}
+        onCancel={() => {
+          setAppPickerOpen(false);
+        }}
+        okText="加入匹配内容"
+        cancelText="取消"
+        width={isMobileView ? "calc(100vw - 16px)" : 860}
+        destroyOnClose={false}
+      >
+        <Space direction="vertical" size={12} style={{ display: "flex" }}>
+          <Input.Search
+            value={appPickerSearch}
+            allowClear
+            onChange={(event) => setAppPickerSearch(event.target.value)}
+            placeholder="按应用名、包名或 UID 搜索"
+          />
+          <Space size={[16, 8]} wrap>
+            <Checkbox
+              checked={appPickerHideSystemApps}
+              onChange={(event) => setAppPickerHideSystemApps(event.target.checked)}
+            >
+              过滤系统
+            </Checkbox>
+          </Space>
+          <Typography.Text type="secondary">
+            已识别 {installedApps.length} 个应用，筛选后 {filteredInstalledApps.length} 个，当前选中{" "}
+            {selectedAppPackages.length} 个。
+          </Typography.Text>
+          <Table<WaterayMobileInstalledAppSummary>
+            size="small"
+            rowKey={(record) => record.packageName}
+            loading={appPickerLoading}
+            columns={appPickerColumns}
+            dataSource={filteredInstalledApps}
+            pagination={{
+              pageSize: 12,
+              showSizeChanger: false,
+            }}
+            rowSelection={{
+              selectedRowKeys: selectedAppPackages,
+              onChange: (keys) =>
+                setSelectedAppPackages(keys.map((item) => String(item)).filter((item) => item !== "")),
+            }}
+            locale={{
+              emptyText: appPickerEmptyText,
+            }}
+            scroll={{ x: isMobileView ? 760 : 980, y: isMobileView ? 420 : 480 }}
+          />
+        </Space>
       </Modal>
     </Space>
   );

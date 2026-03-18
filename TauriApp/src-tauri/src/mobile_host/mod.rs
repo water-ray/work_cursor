@@ -29,6 +29,14 @@ struct MobileHostCheckConfigArgs {
 #[cfg(target_os = "android")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct MobileHostGetInstalledAppIconArgs {
+    package_name: String,
+    size_dp: Option<i32>,
+}
+
+#[cfg(target_os = "android")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct MobileHostStartArgs {
     config_json: String,
     profile_name: Option<String>,
@@ -183,6 +191,49 @@ pub fn mobile_host_get_versions<R: Runtime>(
             &app,
             platform_contracts::MOBILE_HOST_GET_VERSIONS_PLUGIN_COMMAND,
             serde_json::json!({}),
+        )
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        Err("移动端代理宿主仅在 Android 平台可用".to_string())
+    }
+}
+
+#[cfg_attr(not(target_os = "android"), allow(unused_variables))]
+#[tauri::command]
+pub fn mobile_host_list_installed_apps<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<serde_json::Value, String> {
+    #[cfg(target_os = "android")]
+    {
+        run_mobile_host_command(
+            &app,
+            platform_contracts::MOBILE_HOST_LIST_INSTALLED_APPS_PLUGIN_COMMAND,
+            serde_json::json!({}),
+        )
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        Err("移动端代理宿主仅在 Android 平台可用".to_string())
+    }
+}
+
+#[cfg_attr(not(target_os = "android"), allow(unused_variables))]
+#[tauri::command]
+pub fn mobile_host_get_installed_app_icon<R: Runtime>(
+    app: AppHandle<R>,
+    payload: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    #[cfg(target_os = "android")]
+    {
+        let args: MobileHostGetInstalledAppIconArgs =
+            serde_json::from_value(payload).map_err(|error| error.to_string())?;
+        run_mobile_host_command(
+            &app,
+            platform_contracts::MOBILE_HOST_GET_INSTALLED_APP_ICON_PLUGIN_COMMAND,
+            args,
         )
     }
 
