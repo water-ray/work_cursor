@@ -39,7 +39,7 @@ func TestValidateSubscriptionURLRejectsUnsafeTargets(t *testing.T) {
 	})
 }
 
-func TestDownloadTextRejectsUnexpectedContentType(t *testing.T) {
+func TestDownloadTextAllowsUnexpectedContentType(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = io.WriteString(w, "<html>blocked</html>")
@@ -47,12 +47,18 @@ func TestDownloadTextRejectsUnexpectedContentType(t *testing.T) {
 	defer server.Close()
 
 	parser := &SubscriptionParser{client: server.Client()}
-	_, statusCode, _, err := parser.downloadText(context.Background(), server.URL)
-	if err == nil || !strings.Contains(err.Error(), "unexpected content-type") {
-		t.Fatalf("expected content-type rejection, got %v", err)
+	body, statusCode, bytesLen, err := parser.downloadText(context.Background(), server.URL)
+	if err != nil {
+		t.Fatalf("expected html content-type to be accepted, got %v", err)
 	}
 	if statusCode != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", statusCode)
+	}
+	if bytesLen != len("<html>blocked</html>") {
+		t.Fatalf("expected bytes len %d, got %d", len("<html>blocked</html>"), bytesLen)
+	}
+	if body != "<html>blocked</html>" {
+		t.Fatalf("expected html body returned, got %q", body)
 	}
 }
 

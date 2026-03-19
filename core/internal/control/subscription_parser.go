@@ -318,27 +318,6 @@ func isBlockedSubscriptionIP(ip net.IP) bool {
 		ip.IsUnspecified()
 }
 
-func isAllowedSubscriptionContentType(raw string) bool {
-	value := strings.ToLower(strings.TrimSpace(strings.Split(raw, ";")[0]))
-	if value == "" {
-		return true
-	}
-	switch value {
-	case "text/plain",
-		"application/json",
-		"application/yaml",
-		"application/x-yaml",
-		"text/yaml",
-		"text/x-yaml",
-		"application/octet-stream":
-		return true
-	}
-	if strings.HasPrefix(value, "text/") && value != "text/html" {
-		return true
-	}
-	return false
-}
-
 func readLimitedBody(reader io.Reader, limit int64) ([]byte, error) {
 	limited := &io.LimitedReader{R: reader, N: limit + 1}
 	body, err := io.ReadAll(limited)
@@ -493,10 +472,6 @@ func (p *SubscriptionParser) downloadText(ctx context.Context, rawURL string) (s
 		return "", 0, 0, fmt.Errorf("download failed: %w", err)
 	}
 	defer resp.Body.Close()
-	if !isAllowedSubscriptionContentType(resp.Header.Get("Content-Type")) {
-		return "", resp.StatusCode, 0, fmt.Errorf("unexpected content-type: %s", strings.TrimSpace(resp.Header.Get("Content-Type")))
-	}
-
 	body, err := readLimitedBody(resp.Body, maxSubscriptionResponseBytes)
 	if err != nil {
 		return "", resp.StatusCode, len(body), fmt.Errorf("read response failed: %w", err)
