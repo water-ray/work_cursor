@@ -186,6 +186,54 @@ function parseTransportHeaders(value: string): Record<string, string> {
   return result;
 }
 
+function normalizeShadowsocksPluginName(value: string): string {
+  switch (value.trim().toLowerCase()) {
+    case "simple-obfs":
+    case "obfs":
+    case "obfs-local":
+      return "obfs-local";
+    default:
+      return value.trim();
+  }
+}
+
+function buildShadowsocksPluginOptionsText(value: unknown): string {
+  const record = asRecord(value);
+  if (Object.keys(record).length === 0) {
+    return "";
+  }
+  const parts: string[] = [];
+  const mode = firstNonEmptyString(record.obfs, record.mode);
+  const host = firstNonEmptyString(record["obfs-host"], record.host);
+  if (mode !== "") {
+    parts.push(`obfs=${mode}`);
+  }
+  if (host !== "") {
+    parts.push(`obfs-host=${host}`);
+  }
+  for (const key of ["uri", "path", "mux", "tls"]) {
+    const item = asString(record[key]);
+    if (item !== "") {
+      parts.push(`${key}=${item}`);
+    }
+  }
+  return parts.join(";");
+}
+
+function readShadowsocksPluginOptions(...values: unknown[]): string {
+  for (const value of values) {
+    const text = asString(value);
+    if (text !== "") {
+      return text;
+    }
+    const recordText = buildShadowsocksPluginOptionsText(value);
+    if (recordText !== "") {
+      return recordText;
+    }
+  }
+  return "";
+}
+
 function resolveTransportPayload(
   protocol: NodeProtocol,
   values: SubscriptionNodeFormValues,
@@ -297,6 +345,8 @@ export function encodeNodeFormToCreatePayload(
   const password = safeString(values.password);
   const method = safeString(values.method);
   const username = safeString(values.username);
+  const plugin = safeString(values.plugin);
+  const pluginOptions = safeString(values.pluginOptions);
   const tlsMode = safeString(values.tlsMode);
   const sni = safeString(values.sni);
   const vmessCipher = safeString(values.vmessCipher);
@@ -388,6 +438,15 @@ export function encodeNodeFormToCreatePayload(
       raw.transport = "-";
       (raw.display as Record<string, unknown>).transport = "-";
       (raw.display as Record<string, unknown>).security = method;
+      if (plugin !== "") {
+        raw.plugin = normalizeShadowsocksPluginName(plugin);
+      }
+      if (plugin !== "" && pluginOptions !== "") {
+        raw.plugin_opts = pluginOptions;
+      }
+      if (normalizeShadowsocksPluginName(plugin) === "obfs-local") {
+        raw.network = "tcp";
+      }
       break;
     case "socks5":
       if (username !== "") {
@@ -505,6 +564,15 @@ export function decodeNodeToFormValues(
     flow: firstNonEmptyString(raw.flow, outbound.flow),
     password: firstNonEmptyString(raw.password, outbound.password),
     method: firstNonEmptyString(raw.method, outbound.method, raw.security, outbound.security, values.method),
+    plugin: firstNonEmptyString(raw.plugin, outbound.plugin),
+    pluginOptions: readShadowsocksPluginOptions(
+      raw.plugin_opts,
+      raw["plugin-opts"],
+      raw.pluginOpts,
+      outbound.plugin_opts,
+      outbound["plugin-opts"],
+      outbound.pluginOpts,
+    ),
     username: firstNonEmptyString(raw.username, outbound.username),
     tlsEnabled:
       hasTLSConfig(raw.tls) ||

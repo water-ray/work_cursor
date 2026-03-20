@@ -8,7 +8,8 @@ const subscriptionsContextSubmenuClassName = "subscriptions-context-submenu";
 interface BuildSubscriptionsContextMenuParams {
   canPullSubscription: boolean;
   canUseAnchorNode: boolean;
-  canEditAnchorNode: boolean;
+  canOpenAnchorNodeEditor: boolean;
+  anchorNodeEditorLabel: string;
   canAddNode: boolean;
   canMoveRows: boolean;
   canCopyRows: boolean;
@@ -30,7 +31,8 @@ interface BuildSubscriptionsContextMenuParams {
 export function buildSubscriptionsContextMenuItems({
   canPullSubscription,
   canUseAnchorNode,
-  canEditAnchorNode,
+  canOpenAnchorNodeEditor,
+  anchorNodeEditorLabel,
   canAddNode,
   canMoveRows,
   canCopyRows,
@@ -84,10 +86,10 @@ export function buildSubscriptionsContextMenuItems({
       icon: createElement(BiIcon, { name: "cursor-fill" }),
     });
   }
-  if (canEditAnchorNode) {
+  if (canOpenAnchorNodeEditor) {
     items.push({
       key: "edit-node",
-      label: renderMenuLabel("编辑节点", "Ctrl+回车 / Ctrl+双击"),
+      label: renderMenuLabel(anchorNodeEditorLabel, "Ctrl+回车 / Ctrl+双击"),
       icon: createElement(BiIcon, { name: "pencil-square" }),
     });
   }

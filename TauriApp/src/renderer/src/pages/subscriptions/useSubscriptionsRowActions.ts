@@ -20,7 +20,7 @@ interface UseSubscriptionsRowActionsParams {
   openNodeEditor: (
     state:
       | { mode: "add"; protocol: NodeProtocol; groupId: string }
-      | { mode: "edit"; row: NodeRow },
+      | { mode: "edit"; row: NodeRow; readOnly?: boolean },
   ) => void;
   setSelectedRowKeys: (value: string[] | ((previous: string[]) => string[])) => void;
   activateNode: (row: NodeRow) => Promise<void>;
@@ -195,7 +195,18 @@ export function useSubscriptionsRowActions({
       return;
     }
     const group = orderedGroups.find((item) => item.id === anchorRow.groupId);
-    if (!group || group.kind !== "manual") {
+    if (!group) {
+      return;
+    }
+    if (group.kind === "subscription") {
+      openNodeEditor({
+        mode: "edit",
+        row: anchorRow,
+        readOnly: true,
+      });
+      return;
+    }
+    if (group.kind !== "manual") {
       return;
     }
     openNodeEditor({

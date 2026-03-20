@@ -1389,6 +1389,9 @@ body.settings-draft-nav-lock .bottom-nav-menu.ant-menu {
   align-items: center;
   gap: 6px;
   min-height: 22px;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
 }
 
 .subscriptions-node-flag {
@@ -1408,7 +1411,9 @@ body.settings-draft-nav-lock .bottom-nav-menu.ant-menu {
 
 .subscriptions-node-name-text {
   display: inline-block;
-  max-width: 102px;
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

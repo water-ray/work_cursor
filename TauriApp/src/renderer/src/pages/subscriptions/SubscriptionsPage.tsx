@@ -180,6 +180,7 @@ interface NodeEditorState {
   protocol: NodeProtocol;
   groupId: string;
   row?: NodeRow;
+  readOnly?: boolean;
 }
 
 function isUpdateManualNodePayload(
@@ -817,7 +818,13 @@ export function SubscriptionsPage({
   const canOperateRows = operationRows.length > 0;
   const canPullSubscription = currentTabGroup?.kind === "subscription";
   const canUseAnchorNode = Boolean(anchorRow);
-  const canEditAnchorNode = Boolean(anchorRow && anchorGroup?.kind === "manual");
+  const anchorNodeEditorLabel =
+    anchorGroup?.kind === "subscription"
+      ? "查看节点"
+      : anchorGroup?.kind === "manual"
+        ? "编辑节点"
+        : "";
+  const canOpenAnchorNodeEditor = Boolean(anchorRow && anchorNodeEditorLabel !== "");
   const canAddNodeFromContext = currentTabGroup?.kind === "manual";
   const canMoveRows = operationRows.length > 0 && operationRows.every((row) => {
     const group = orderedGroups.find((item) => item.id === row.groupId);
@@ -2023,7 +2030,8 @@ export function SubscriptionsPage({
       buildSubscriptionsContextMenuItems({
         canPullSubscription,
         canUseAnchorNode,
-        canEditAnchorNode,
+        canOpenAnchorNodeEditor,
+        anchorNodeEditorLabel,
         canAddNode: Boolean(canAddNodeFromContext),
         canMoveRows,
         canCopyRows,
@@ -2044,7 +2052,8 @@ export function SubscriptionsPage({
     [
       canPullSubscription,
       canUseAnchorNode,
-      canEditAnchorNode,
+      canOpenAnchorNodeEditor,
+      anchorNodeEditorLabel,
       canAddNodeFromContext,
       canMoveRows,
       canCopyRows,
@@ -2130,7 +2139,7 @@ export function SubscriptionsPage({
     (
       state:
         | { mode: "add"; protocol: NodeProtocol; groupId: string }
-        | { mode: "edit"; row: NodeRow },
+        | { mode: "edit"; row: NodeRow; readOnly?: boolean },
     ) => {
       if (state.mode === "edit") {
         setNodeEditorState({
@@ -2138,6 +2147,7 @@ export function SubscriptionsPage({
           protocol: state.row.node.protocol,
           groupId: state.row.groupId,
           row: state.row,
+          readOnly: Boolean(state.readOnly),
         });
         return;
       }
@@ -2150,13 +2160,24 @@ export function SubscriptionsPage({
     [],
   );
 
-  const openManualRowEditor = useCallback(
+  const openNodeEditorForRow = useCallback(
     (row: NodeRow | null) => {
       if (!row) {
         return;
       }
       const group = orderedGroups.find((item) => item.id === row.groupId);
-      if (!group || group.kind !== "manual") {
+      if (!group) {
+        return;
+      }
+      if (group.kind === "subscription") {
+        openNodeEditor({
+          mode: "edit",
+          row,
+          readOnly: true,
+        });
+        return;
+      }
+      if (group.kind !== "manual") {
         return;
       }
       openNodeEditor({
@@ -2375,7 +2396,7 @@ export function SubscriptionsPage({
     (row: NodeRow) => ({
       onDoubleClick: (event: ReactMouseEvent<HTMLElement>) => {
         if (event.ctrlKey || event.metaKey) {
-          openManualRowEditor(row);
+          openNodeEditorForRow(row);
           return;
         }
         void activateNode(row);
@@ -2392,7 +2413,7 @@ export function SubscriptionsPage({
       onMouseMove: handleRowSortPreview(row),
       onMouseUp: handleRowSortCommit(row),
     }),
-    [activateNode, handleRowSortCommit, handleRowSortLeave, handleRowSortPreview, openManualRowEditor],
+    [activateNode, handleRowSortCommit, handleRowSortLeave, handleRowSortPreview, openNodeEditorForRow],
   );
 
   const handleSubmitNodeEditor = useCallback(
@@ -2449,7 +2470,7 @@ export function SubscriptionsPage({
         }
         event.preventDefault();
         if (event.ctrlKey || event.metaKey) {
-          openManualRowEditor(hoveredRow);
+          openNodeEditorForRow(hoveredRow);
           return;
         }
         void activateNode(hoveredRow);
@@ -2487,7 +2508,7 @@ export function SubscriptionsPage({
     return () => {
       window.removeEventListener("keydown", onKeyDown);
     };
-  }, [activateNode, copyNodesToClipboard, deleteRowsWithConfirm, openManualRowEditor, pasteNodesFromClipboard, selectedRowKeys]);
+  }, [activateNode, copyNodesToClipboard, deleteRowsWithConfirm, openNodeEditorForRow, pasteNodesFromClipboard, selectedRowKeys]);
 
   const subscriptionById = useMemo(
     () => new Map(subscriptions.map((item) => [item.id, item])),
@@ -2974,7 +2995,7 @@ export function SubscriptionsPage({
                                           icon: <BiIcon name="pencil-square" />,
                                           disabled: mobileExpandedGroup.kind !== "manual",
                                           onClick: () => {
-                                            openManualRowEditor(row);
+                                            openNodeEditorForRow(row);
                                           },
                                         },
                                         {
@@ -3832,6 +3853,7 @@ export function SubscriptionsPage({
       <SubscriptionNodeEditorModal
         open={nodeEditorState != null}
         mode={nodeEditorState?.mode ?? "add"}
+        readOnly={Boolean(nodeEditorState?.readOnly)}
         manualGroups={manualGroups}
         initialProtocol={nodeEditorState?.protocol ?? supportedNodeProtocols[0]}
         initialGroupId={nodeEditorState?.groupId ?? manualGroups[0]?.id ?? ""}

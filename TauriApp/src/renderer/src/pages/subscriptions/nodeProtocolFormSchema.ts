@@ -15,6 +15,8 @@ export type SubscriptionNodeFieldKey =
   | "flow"
   | "password"
   | "method"
+  | "plugin"
+  | "pluginOptions"
   | "username"
   | "tlsEnabled"
   | "tlsMode"
@@ -54,6 +56,8 @@ export interface SubscriptionNodeFormValues {
   flow: string;
   password: string;
   method: string;
+  plugin: string;
+  pluginOptions: string;
   username: string;
   tlsEnabled: boolean;
   tlsMode: string;
@@ -234,6 +238,15 @@ export const shadowsocksMethodOptions = [
   label: value,
 }));
 
+export const shadowsocksPluginOptions = [
+  { value: "simple-obfs", label: "simple-obfs" },
+  { value: "obfs-local", label: "obfs-local" },
+  { value: "v2ray-plugin", label: "v2ray-plugin" },
+].map((item) => ({
+  value: item.value,
+  label: item.label,
+}));
+
 export const nodeProtocolFormSpecs: Record<NodeProtocol, NodeProtocolFormSpec> = {
   vmess: {
     protocol: "vmess",
@@ -313,11 +326,11 @@ export const nodeProtocolFormSpecs: Record<NodeProtocol, NodeProtocolFormSpec> =
   shadowsocks: {
     protocol: "shadowsocks",
     label: "Shadowsocks",
-    description: "基础字段为加密方法与密码，不额外展示 TLS/传输层。",
+    description: "基础字段为加密方法与密码，可选 SIP003 插件与插件参数。",
     defaultTransport: "-",
     supportedTransports: ["-"],
     authFields: ["method", "password"],
-    transportFields: [],
+    transportFields: ["plugin", "pluginOptions"],
     tlsFields: [],
     advancedFields: [],
   },
@@ -500,6 +513,8 @@ export function createDefaultNodeFormValues(
     flow: "",
     password: "",
     method: "aes-256-gcm",
+    plugin: "",
+    pluginOptions: "",
     username: "",
     tlsEnabled: tlsEnabledByDefault,
     tlsMode: "tls",

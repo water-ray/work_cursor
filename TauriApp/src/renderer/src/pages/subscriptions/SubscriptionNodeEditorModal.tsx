@@ -1,4 +1,4 @@
-import { Alert, AutoComplete, Card, Col, Form, Input, InputNumber, Modal, Row, Select, Space, Switch, Typography, message } from "antd";
+import { Alert, AutoComplete, Button, Card, Col, Form, Input, InputNumber, Modal, Row, Select, Space, Switch, Typography, message } from "antd";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { NodeGroup, NodeProtocol, VpnNode } from "../../../../shared/daemon";
 import { countryMetadataList } from "../../app/data/countryMetadata";
@@ -19,6 +19,7 @@ import {
   protocolLabel,
   type SubscriptionNodeFieldKey,
   shadowsocksMethodOptions,
+  shadowsocksPluginOptions,
   supportedNodeProtocols,
   supportsGRPCKeepalive,
   supportsHTTPTimeouts,
@@ -42,6 +43,7 @@ interface EditingNodeContext {
 interface SubscriptionNodeEditorModalProps {
   open: boolean;
   mode: "add" | "edit";
+  readOnly?: boolean;
   manualGroups: NodeGroup[];
   initialProtocol: NodeProtocol;
   initialGroupId: string;
@@ -147,6 +149,18 @@ const fieldHelpMap: Partial<Record<SubscriptionNodeFieldKey | "address" | "port"
     effect: "决定 Shadowsocks 使用的 cipher。",
     caution: "必须和服务端完全一致。",
     recommendation: "优先使用 AEAD/2022 系列，除非服务端只支持旧方法。",
+  },
+  plugin: {
+    scene: "Shadowsocks 需要 SIP003 插件时使用。",
+    effect: "会写入节点 rawConfig 的 `plugin` 字段，决定是否启用 `obfs-local`、`v2ray-plugin` 等插件。",
+    caution: "sing-box 对 simple-obfs 的实际插件名是 `obfs-local`；如果填 `simple-obfs`，Wateray 保存时会自动转换。",
+    recommendation: "没有插件就留空；simple-obfs 建议直接选 `simple-obfs` 或 `obfs-local`。",
+  },
+  pluginOptions: {
+    scene: "Shadowsocks SIP003 插件参数。",
+    effect: "会写入 rawConfig 的 `plugin_opts`，例如 `obfs=http;obfs-host=example.com`。",
+    caution: "参数必须和服务端插件配置一致，分号分隔的键值对不要写错。",
+    recommendation: "simple-obfs 常见写法是 `obfs=http;obfs-host=你的伪装域名`。",
   },
   username: {
     scene: "SOCKS5/HTTP 开启认证时使用。",
@@ -380,6 +394,7 @@ function resolveUserAgentPreset(headersText: string): string {
 export function SubscriptionNodeEditorModal({
   open,
   mode,
+  readOnly,
   manualGroups,
   initialProtocol,
   initialGroupId,
@@ -389,6 +404,7 @@ export function SubscriptionNodeEditorModal({
   onSubmit,
 }: SubscriptionNodeEditorModalProps) {
   const isMobileView = isMobileRuntime();
+  const isReadOnly = Boolean(readOnly);
   const [form] = Form.useForm<SubscriptionNodeFormValues>();
   const initializedStateRef = useRef<string>("");
   const [transportHeadersExpanded, setTransportHeadersExpanded] = useState(false);
@@ -466,6 +482,10 @@ export function SubscriptionNodeEditorModal({
   }, [editingNode, form, initialGroupId, initialProtocol, initializeStateKey, mode, open]);
 
   const handleFinish = async () => {
+    if (isReadOnly) {
+      onCancel();
+      return;
+    }
     try {
       await form.validateFields();
     } catch (error) {
@@ -496,14 +516,15 @@ export function SubscriptionNodeEditorModal({
 
   return (
     <Modal
-      title={mode === "edit" ? "编辑节点" : "添加节点"}
+      title={isReadOnly ? "查看节点配置" : mode === "edit" ? "编辑节点" : "添加节点"}
       open={open}
       width={isMobileView ? "calc(100vw - 16px)" : 1120}
       destroyOnHidden
       maskClosable={false}
       okText={mode === "edit" ? "保存" : "添加"}
       cancelText="取消"
-      confirmLoading={submitting}
+      confirmLoading={isReadOnly ? false : submitting}
+      footer={isReadOnly ? [<Button key="close" type="primary" onClick={onCancel}>关闭</Button>] : undefined}
       styles={{
         body: {
           padding: isMobileView ? 12 : undefined,
@@ -514,7 +535,14 @@ export function SubscriptionNodeEditorModal({
         void handleFinish();
       }}
     >
-      {manualGroups.length === 0 ? (
+      {isReadOnly ? (
+        <Alert
+          type="info"
+          showIcon
+          message="订阅分组节点仅支持查看"
+          description="该节点来自订阅源，这里可以查看节点配置，但不能直接修改；如需调整，请修改订阅源或复制到普通分组后编辑。"
+        />
+      ) : manualGroups.length === 0 ? (
         <Alert
           type="warning"
           showIcon
@@ -529,6 +557,7 @@ export function SubscriptionNodeEditorModal({
         labelCol={isMobileView ? undefined : formLabelCol}
         wrapperCol={isMobileView ? undefined : formWrapperCol}
         form={form}
+        disabled={isReadOnly}
         size={isMobileView ? "small" : "middle"}
         style={{ marginTop: 8 }}
         onValuesChange={(changedValues, allValues) => {
@@ -740,6 +769,37 @@ export function SubscriptionNodeEditorModal({
                 {protocolSpec.transportFields.includes("transport") ? (
                   <Form.Item label={fieldLabel("transport", "传输协议")} name="transport" style={{ marginBottom: 12 }}>
                     <Select options={transportSelectOptions} />
+                  </Form.Item>
+                ) : null}
+                {protocolSpec.transportFields.includes("plugin") ? (
+                  <Form.Item
+                    label={fieldLabel("plugin", "插件", "Plugin")}
+                    name="plugin"
+                    style={{ marginBottom: 12 }}
+                    {...compactFormItemLayout}
+                  >
+                    <AutoComplete
+                      options={shadowsocksPluginOptions}
+                      placeholder="留空表示不使用插件；simple-obfs 会自动转为 obfs-local"
+                      filterOption={(inputValue, option) =>
+                        `${String(option?.value ?? "")} ${String(option?.label ?? "")}`
+                          .toLowerCase()
+                          .includes(inputValue.toLowerCase())
+                      }
+                    />
+                  </Form.Item>
+                ) : null}
+                {protocolSpec.transportFields.includes("pluginOptions") ? (
+                  <Form.Item
+                    label={fieldLabel("pluginOptions", "插件参数", "Plugin Options")}
+                    name="pluginOptions"
+                    style={{ marginBottom: 12 }}
+                    {...compactFormItemLayout}
+                  >
+                    <Input.TextArea
+                      autoSize={{ minRows: 2, maxRows: 4 }}
+                      placeholder="例如：obfs=http;obfs-host=cdn.example.com"
+                    />
                   </Form.Item>
                 ) : null}
                 {supportsTransportHost(currentTransport) || supportsTransportPath(currentTransport) ? (
