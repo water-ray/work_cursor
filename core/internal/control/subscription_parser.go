@@ -1207,6 +1207,11 @@ func parseShadowsocksNode(line string, groupID string, index int) (Node, bool) {
 	if name == "" {
 		name = fmt.Sprintf("ss-%s:%d", host, port)
 	}
+	pluginName, pluginOptions := resolveShadowsocksPluginFromURI(line)
+	network := ""
+	if pluginName == "obfs-local" {
+		network = "tcp"
+	}
 	rawConfig := marshalRawConfig(map[string]any{
 		"schema":      "wateray.node.v1",
 		"source":      "ss_uri",
@@ -1217,7 +1222,10 @@ func parseShadowsocksNode(line string, groupID string, index int) (Node, bool) {
 		"method":      strings.TrimSpace(method),
 		"password":    strings.TrimSpace(password),
 		"transport":   "",
+		"network":     network,
 		"security":    strings.TrimSpace(method),
+		"plugin":      pluginName,
+		"plugin_opts": pluginOptions,
 		"display": map[string]any{
 			"address":   host,
 			"port":      port,
@@ -1315,18 +1323,29 @@ func (p *SubscriptionParser) parseClashYAML(content string, groupID string) []No
 			strings.TrimSpace(toString(item["method"])),
 			strings.TrimSpace(toString(item["security"])),
 		)
+		pluginName, pluginOptions := normalizeShadowsocksPluginConfig(
+			strings.TrimSpace(toString(item["plugin"])),
+			firstNonEmptyPluginOptions(item["plugin-opts"], item["plugin_opts"]),
+		)
+		network := strings.TrimSpace(toString(item["network"]))
+		if network == "" && pluginName == "obfs-local" {
+			network = "tcp"
+		}
 		rawConfig := marshalRawConfig(map[string]any{
 			"schema":       "wateray.node.v1",
 			"source":       "clash",
 			"protocol":     string(protocol),
 			"server":       host,
 			"server_port":  port,
+			"network":      network,
 			"transport":    transport,
 			"uuid":         strings.TrimSpace(toString(item["uuid"])),
 			"alter_id":     toInt(item["alterId"]),
 			"security":     method,
 			"password":     strings.TrimSpace(toString(item["password"])),
 			"method":       method,
+			"plugin":       pluginName,
+			"plugin_opts":  pluginOptions,
 			"flow":         strings.TrimSpace(toString(item["flow"])),
 			"sni":          strings.TrimSpace(toString(item["servername"])),
 			"host":         strings.TrimSpace(toString(item["host"])),
@@ -1567,6 +1586,169 @@ func resolveTransport(query url.Values) string {
 		return v
 	}
 	return "tcp"
+}
+
+func resolveShadowsocksPluginFromURI(line string) (string, string) {
+	rawQuery := extractURIRawQuery(line)
+	if rawQuery == "" {
+		return "", ""
+	}
+	queryValues := parseURIQueryPreservingSemicolon(rawQuery)
+	return normalizeShadowsocksPluginConfig(strings.TrimSpace(queryValues["plugin"]), "")
+}
+
+func extractURIRawQuery(line string) string {
+	withoutFragment := line
+	if fragmentIndex := strings.Index(withoutFragment, "#"); fragmentIndex >= 0 {
+		withoutFragment = withoutFragment[:fragmentIndex]
+	}
+	queryIndex := strings.Index(withoutFragment, "?")
+	if queryIndex < 0 || queryIndex >= len(withoutFragment)-1 {
+		return ""
+	}
+	return strings.TrimSpace(withoutFragment[queryIndex+1:])
+}
+
+func parseURIQueryPreservingSemicolon(rawQuery string) map[string]string {
+	result := map[string]string{}
+	for _, part := range strings.Split(rawQuery, "&") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		key, value, hasValue := strings.Cut(part, "=")
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		if decodedKey, err := url.QueryUnescape(key); err == nil {
+			key = strings.TrimSpace(decodedKey)
+		}
+		decodedValue := ""
+		if hasValue {
+			decodedValue = value
+			if unescaped, err := url.QueryUnescape(value); err == nil {
+				decodedValue = unescaped
+			}
+			decodedValue = strings.TrimSpace(decodedValue)
+		}
+		result[key] = decodedValue
+	}
+	return result
+}
+
+func firstNonEmptyPluginOptions(values ...any) string {
+	for _, rawValue := range values {
+		if item, ok := rawValue.(map[string]any); ok {
+			if normalized := buildShadowsocksPluginOptionsFromMap(item); normalized != "" {
+				return normalized
+			}
+			continue
+		}
+		if text := strings.TrimSpace(toString(rawValue)); text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
+func normalizeShadowsocksPluginConfig(pluginName string, pluginOptions string) (string, string) {
+	pluginName = strings.TrimSpace(pluginName)
+	pluginOptions = strings.TrimSpace(pluginOptions)
+	if pluginName == "" && pluginOptions == "" {
+		return "", ""
+	}
+	if strings.Contains(pluginName, ";") {
+		parts := strings.Split(pluginName, ";")
+		pluginName = strings.TrimSpace(parts[0])
+		if pluginOptions == "" && len(parts) > 1 {
+			pluginOptions = strings.Join(parts[1:], ";")
+		}
+	}
+	pluginName = normalizeShadowsocksPluginName(pluginName)
+	pluginOptions = normalizeShadowsocksPluginOptions(pluginName, pluginOptions)
+	return pluginName, pluginOptions
+}
+
+func normalizeShadowsocksPluginName(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "simple-obfs", "obfs", "obfs-local":
+		return "obfs-local"
+	default:
+		return strings.TrimSpace(raw)
+	}
+}
+
+func buildShadowsocksPluginOptionsFromMap(source map[string]any) string {
+	if len(source) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(source))
+	appendOption := func(key string, rawValue any) {
+		value := strings.TrimSpace(toString(rawValue))
+		if key == "" || value == "" {
+			return
+		}
+		parts = append(parts, key+"="+value)
+	}
+	appendOption("obfs", firstNonEmpty(toString(source["obfs"]), toString(source["mode"])))
+	appendOption("obfs-host", firstNonEmpty(toString(source["obfs-host"]), toString(source["host"])))
+	for _, key := range []string{"uri", "path", "mux", "tls"} {
+		appendOption(key, source[key])
+	}
+	return strings.Join(parts, ";")
+}
+
+func normalizeShadowsocksPluginOptions(pluginName string, raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if pluginName != "obfs-local" {
+		return raw
+	}
+	mode := ""
+	host := ""
+	extras := make([]string, 0)
+	for _, item := range strings.Split(raw, ";") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		key, value, hasValue := strings.Cut(item, "=")
+		if !hasValue {
+			switch strings.ToLower(item) {
+			case "http", "tls":
+				mode = strings.ToLower(item)
+			default:
+				extras = append(extras, item)
+			}
+			continue
+		}
+		normalizedKey := strings.ToLower(strings.TrimSpace(key))
+		normalizedValue := strings.TrimSpace(value)
+		switch normalizedKey {
+		case "mode":
+			mode = normalizedValue
+		case "host":
+			host = normalizedValue
+		case "obfs":
+			mode = normalizedValue
+		case "obfs-host":
+			host = normalizedValue
+		default:
+			extras = append(extras, strings.TrimSpace(key)+"="+normalizedValue)
+		}
+	}
+	parts := make([]string, 0, 2+len(extras))
+	if mode != "" {
+		parts = append(parts, "obfs="+mode)
+	}
+	if host != "" {
+		parts = append(parts, "obfs-host="+host)
+	}
+	parts = append(parts, extras...)
+	return strings.Join(parts, ";")
 }
 
 func decodeFragment(fragment string) string {

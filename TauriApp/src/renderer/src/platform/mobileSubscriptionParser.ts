@@ -301,6 +301,164 @@ function resolveTransport(query: URLSearchParams): string {
   );
 }
 
+function extractUriRawQuery(line: string): string {
+  const withoutFragment = line.split("#")[0] || line;
+  const queryIndex = withoutFragment.indexOf("?");
+  if (queryIndex < 0 || queryIndex >= withoutFragment.length - 1) {
+    return "";
+  }
+  return withoutFragment.slice(queryIndex + 1).trim();
+}
+
+function safeDecodeURIComponent(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function parseQueryPreservingSemicolon(rawQuery: string): Record<string, string> {
+  const result: Record<string, string> = {};
+  for (const part of rawQuery.split("&")) {
+    const segment = part.trim();
+    if (segment === "") {
+      continue;
+    }
+    const separatorIndex = segment.indexOf("=");
+    const rawKey = separatorIndex >= 0 ? segment.slice(0, separatorIndex) : segment;
+    const rawValue = separatorIndex >= 0 ? segment.slice(separatorIndex + 1) : "";
+    const key = safeDecodeURIComponent(rawKey).trim();
+    if (key === "") {
+      continue;
+    }
+    result[key] = safeDecodeURIComponent(rawValue).trim();
+  }
+  return result;
+}
+
+function buildShadowsocksPluginOptionsFromRecord(record: UnknownRecord): string {
+  const parts: string[] = [];
+  const mode = firstNonEmptyString(record, "obfs", "mode");
+  const host = firstNonEmptyString(record, "obfs-host", "host");
+  if (mode !== "") {
+    parts.push(`obfs=${mode}`);
+  }
+  if (host !== "") {
+    parts.push(`obfs-host=${host}`);
+  }
+  for (const key of ["uri", "path", "mux", "tls"]) {
+    const value = toStringValue(record[key]);
+    if (value !== "") {
+      parts.push(`${key}=${value}`);
+    }
+  }
+  return parts.join(";");
+}
+
+function firstNonEmptyPluginOptions(...values: unknown[]): string {
+  for (const value of values) {
+    if (typeof value === "string") {
+      const text = value.trim();
+      if (text !== "") {
+        return text;
+      }
+      continue;
+    }
+    if (isRecord(value)) {
+      const text = buildShadowsocksPluginOptionsFromRecord(value);
+      if (text !== "") {
+        return text;
+      }
+    }
+  }
+  return "";
+}
+
+function normalizeShadowsocksPluginName(value: string): string {
+  switch (value.trim().toLowerCase()) {
+    case "simple-obfs":
+    case "obfs":
+    case "obfs-local":
+      return "obfs-local";
+    default:
+      return value.trim();
+  }
+}
+
+function normalizeShadowsocksPluginOptions(pluginName: string, raw: string): string {
+  const text = raw.trim();
+  if (text === "" || pluginName !== "obfs-local") {
+    return text;
+  }
+  let mode = "";
+  let host = "";
+  const extras: string[] = [];
+  for (const item of text.split(";")) {
+    const segment = item.trim();
+    if (segment === "") {
+      continue;
+    }
+    const separatorIndex = segment.indexOf("=");
+    if (separatorIndex < 0) {
+      if (segment === "http" || segment === "tls") {
+        mode = segment;
+      } else {
+        extras.push(segment);
+      }
+      continue;
+    }
+    const key = segment.slice(0, separatorIndex).trim().toLowerCase();
+    const value = segment.slice(separatorIndex + 1).trim();
+    switch (key) {
+      case "mode":
+      case "obfs":
+        mode = value;
+        break;
+      case "host":
+      case "obfs-host":
+        host = value;
+        break;
+      default:
+        extras.push(`${segment.slice(0, separatorIndex).trim()}=${value}`);
+        break;
+    }
+  }
+  const parts: string[] = [];
+  if (mode !== "") {
+    parts.push(`obfs=${mode}`);
+  }
+  if (host !== "") {
+    parts.push(`obfs-host=${host}`);
+  }
+  parts.push(...extras);
+  return parts.join(";");
+}
+
+function normalizeShadowsocksPluginConfig(pluginName: string, pluginOptions: string): [string, string] {
+  let nextName = pluginName.trim();
+  let nextOptions = pluginOptions.trim();
+  if (nextName.includes(";")) {
+    const [head, ...rest] = nextName.split(";");
+    nextName = head.trim();
+    if (nextOptions === "" && rest.length > 0) {
+      nextOptions = rest.join(";").trim();
+    }
+  }
+  nextName = normalizeShadowsocksPluginName(nextName);
+  nextOptions = normalizeShadowsocksPluginOptions(nextName, nextOptions);
+  return [nextName, nextOptions];
+}
+
+function resolveShadowsocksPluginFromUri(line: string): [string, string] {
+  const rawQuery = extractUriRawQuery(line);
+  if (rawQuery === "") {
+    return ["", ""];
+  }
+  const query = parseQueryPreservingSemicolon(rawQuery);
+  return normalizeShadowsocksPluginConfig(query.plugin || "", "");
+}
+
 function buildUriRawConfig(
   line: string,
   protocol: NodeProtocol,
@@ -503,6 +661,8 @@ function parseShadowsocksNode(line: string, groupId: string, index: number): Vpn
     parsedUrl = null;
   }
   const name = decodeFragment(parsedUrl?.hash || "") || `ss-${hostPort.host}:${hostPort.port}`;
+  const [pluginName, pluginOptions] = resolveShadowsocksPluginFromUri(line);
+  const network = pluginName === "obfs-local" ? "tcp" : "";
   const rawConfig = buildRawConfig({
     schema: "wateray.node.v1",
     source: "ss_uri",
@@ -513,7 +673,10 @@ function parseShadowsocksNode(line: string, groupId: string, index: number): Vpn
     method,
     password,
     transport: "",
+    network,
     security: method,
+    plugin: pluginName,
+    plugin_opts: pluginOptions,
     display: {
       address: hostPort.host,
       port: hostPort.port,
@@ -667,18 +830,26 @@ function parseClashYaml(content: string, groupId: string): VpnNode[] {
       name,
     );
     const method = firstNonEmptyString(item.cipher, item.method, item.security);
+    const [pluginName, pluginOptions] = normalizeShadowsocksPluginConfig(
+      toStringValue(item.plugin),
+      firstNonEmptyPluginOptions(item["plugin-opts"], item.plugin_opts),
+    );
+    const network = firstNonEmptyString(item.network) || (pluginName === "obfs-local" ? "tcp" : "");
     const rawConfig = buildRawConfig({
       schema: "wateray.node.v1",
       source: "clash",
       protocol,
       server,
       server_port: port,
+      network,
       transport,
       uuid: toStringValue(item.uuid),
       alter_id: toIntValue(item.alterId),
       security: method,
       password: toStringValue(item.password),
       method,
+      plugin: pluginName,
+      plugin_opts: pluginOptions,
       flow: toStringValue(item.flow),
       sni: toStringValue(item.servername),
       host: toStringValue(item.host),

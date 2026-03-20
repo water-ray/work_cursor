@@ -545,6 +545,35 @@ func TestBuildNodeOutboundAppliesHTTPAndGrpcAdvancedTransportFields(t *testing.T
 	}
 }
 
+func TestBuildNodeOutboundAppliesShadowsocksSimpleObfsPlugin(t *testing.T) {
+	node := Node{
+		ID:       "node-ss-obfs",
+		Name:     "node-ss-obfs",
+		Protocol: NodeProtocol("shadowsocks"),
+		Address:  "gz-cloud1.233netboom.com",
+		Port:     12001,
+		RawConfig: `{
+  "method": "aes-128-gcm",
+  "password": "Sj10bnYDe7w6V29E",
+  "plugin": "simple-obfs",
+  "plugin_opts": "obfs=http;obfs-host=bfd5a72b22.m.ctrip.com"
+}`,
+	}
+	outbound, err := buildNodeOutbound(node, ProxyMuxConfig{})
+	if err != nil {
+		t.Fatalf("build shadowsocks outbound failed: %v", err)
+	}
+	if outbound["plugin"] != "obfs-local" {
+		t.Fatalf("expected obfs-local plugin, got %#v", outbound["plugin"])
+	}
+	if outbound["plugin_opts"] != "obfs=http;obfs-host=bfd5a72b22.m.ctrip.com" {
+		t.Fatalf("expected plugin_opts preserved, got %#v", outbound["plugin_opts"])
+	}
+	if outbound["network"] != "tcp" {
+		t.Fatalf("expected plugin-backed shadowsocks network tcp, got %#v", outbound["network"])
+	}
+}
+
 func TestPrepareRuntimeConfigForMinimalMode(t *testing.T) {
 	runtime := newProxyRuntime(nil)
 	snapshot := defaultSnapshot("test-runtime", "test-core")

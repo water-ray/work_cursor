@@ -254,6 +254,113 @@ function toFlatStringMap(value: unknown): UnknownRecord {
   return result;
 }
 
+function buildShadowsocksPluginOptionsFromRecord(record: UnknownRecord): string {
+  const parts: string[] = [];
+  const mode = firstNonEmptyString(record, "obfs", "mode");
+  const host = firstNonEmptyString(record, "obfs-host", "host");
+  if (mode !== "") {
+    parts.push(`obfs=${mode}`);
+  }
+  if (host !== "") {
+    parts.push(`obfs-host=${host}`);
+  }
+  for (const key of ["uri", "path", "mux", "tls"]) {
+    const value = toStringValue(record[key]);
+    if (value !== "") {
+      parts.push(`${key}=${value}`);
+    }
+  }
+  return parts.join(";");
+}
+
+function normalizeShadowsocksPluginName(value: string): string {
+  switch (value.trim().toLowerCase()) {
+    case "simple-obfs":
+    case "obfs":
+    case "obfs-local":
+      return "obfs-local";
+    default:
+      return value.trim();
+  }
+}
+
+function normalizeShadowsocksPluginOptions(pluginName: string, raw: string): string {
+  const text = raw.trim();
+  if (text === "" || pluginName !== "obfs-local") {
+    return text;
+  }
+  let mode = "";
+  let host = "";
+  const extras: string[] = [];
+  for (const item of text.split(";")) {
+    const segment = item.trim();
+    if (segment === "") {
+      continue;
+    }
+    const separatorIndex = segment.indexOf("=");
+    if (separatorIndex < 0) {
+      if (segment === "http" || segment === "tls") {
+        mode = segment;
+      } else {
+        extras.push(segment);
+      }
+      continue;
+    }
+    const key = segment.slice(0, separatorIndex).trim().toLowerCase();
+    const value = segment.slice(separatorIndex + 1).trim();
+    switch (key) {
+      case "mode":
+      case "obfs":
+        mode = value;
+        break;
+      case "host":
+      case "obfs-host":
+        host = value;
+        break;
+      default:
+        extras.push(`${segment.slice(0, separatorIndex).trim()}=${value}`);
+        break;
+    }
+  }
+  const parts: string[] = [];
+  if (mode !== "") {
+    parts.push(`obfs=${mode}`);
+  }
+  if (host !== "") {
+    parts.push(`obfs-host=${host}`);
+  }
+  parts.push(...extras);
+  return parts.join(";");
+}
+
+function resolveShadowsocksPluginConfig(raw: UnknownRecord): [string, string] {
+  const pluginName = normalizeShadowsocksPluginName(firstNonEmptyString(raw, "plugin"));
+  let pluginOptions = firstNonEmptyString(raw, "plugin_opts", "plugin-opts", "pluginOpts");
+  if (pluginOptions === "") {
+    const optionRecords = [raw.plugin_opts, raw["plugin-opts"], raw.pluginOpts];
+    for (const item of optionRecords) {
+      if (isRecord(item)) {
+        pluginOptions = buildShadowsocksPluginOptionsFromRecord(item);
+        if (pluginOptions !== "") {
+          break;
+        }
+      }
+    }
+  }
+  return [pluginName, normalizeShadowsocksPluginOptions(pluginName, pluginOptions)];
+}
+
+function normalizeShadowsocksNetwork(raw: string): string {
+  switch (raw.trim().toLowerCase()) {
+    case "tcp":
+      return "tcp";
+    case "udp":
+      return "udp";
+    default:
+      return "";
+  }
+}
+
 function parseNodeRawConfig(rawConfig: string): UnknownRecord {
   try {
     const parsed = JSON.parse(rawConfig) as unknown;
@@ -1488,6 +1595,19 @@ function buildNodeOutbound(node: VpnNode, tag: string): UnknownRecord {
         method,
         password,
       };
+      const [pluginName, pluginOptions] = resolveShadowsocksPluginConfig(raw);
+      if (pluginName !== "") {
+        outbound.plugin = pluginName;
+      }
+      if (pluginOptions !== "") {
+        outbound.plugin_opts = pluginOptions;
+      }
+      const network = normalizeShadowsocksNetwork(firstNonEmptyString(raw, "network", "net"));
+      if (network !== "") {
+        outbound.network = network;
+      } else if (pluginName === "obfs-local") {
+        outbound.network = "tcp";
+      }
       applyOutboundDomainResolver(outbound, server);
       return outbound;
     }

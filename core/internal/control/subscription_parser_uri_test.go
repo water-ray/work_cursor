@@ -90,6 +90,29 @@ func TestParseURILinesBase64WholeContentDoesNotDuplicateNodes(t *testing.T) {
 	}
 }
 
+func TestParseShadowsocksURIPreservesSimpleObfsPlugin(t *testing.T) {
+	parser := NewSubscriptionParser()
+	node, ok := parser.parseURINode(
+		"ss://YWVzLTEyOC1nY206U2oxMGJuWURlN3c2VjI5RQ@gz-cloud1.233netboom.com:12001/?plugin=simple-obfs;obfs=http;obfs-host=bfd5a72b22.m.ctrip.com#香港高级 IEPL 专线 3",
+		"group-1",
+		3,
+	)
+	if !ok {
+		t.Fatal("expected shadowsocks uri with simple-obfs to parse")
+	}
+
+	raw := decodeNodeRawConfig(t, node.RawConfig)
+	if raw["plugin"] != "obfs-local" {
+		t.Fatalf("expected plugin obfs-local, got %#v", raw["plugin"])
+	}
+	if raw["plugin_opts"] != "obfs=http;obfs-host=bfd5a72b22.m.ctrip.com" {
+		t.Fatalf("expected plugin_opts preserved, got %#v", raw["plugin_opts"])
+	}
+	if raw["network"] != "tcp" {
+		t.Fatalf("expected network tcp for obfs plugin, got %#v", raw["network"])
+	}
+}
+
 func decodeNodeRawConfig(t *testing.T, rawConfig string) map[string]any {
 	t.Helper()
 	var payload map[string]any

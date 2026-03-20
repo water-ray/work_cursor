@@ -3054,6 +3054,18 @@ func buildNodeOutbound(node Node, muxConfig ProxyMuxConfig) (map[string]any, err
 			"method":      method,
 			"password":    password,
 		}
+		pluginName, pluginOptions := resolveShadowsocksPluginRuntimeConfig(raw)
+		if pluginName != "" {
+			outbound["plugin"] = pluginName
+		}
+		if pluginOptions != "" {
+			outbound["plugin_opts"] = pluginOptions
+		}
+		if network := normalizeShadowsocksNetwork(firstNonEmptyString(raw, "network", "net")); network != "" {
+			outbound["network"] = network
+		} else if pluginName == "obfs-local" {
+			outbound["network"] = "tcp"
+		}
 		applyOutboundMultiplex(outbound, muxConfig)
 		applyOutboundDomainResolver(outbound, server)
 		return outbound, nil
@@ -3342,6 +3354,32 @@ func firstNonEmptyString(source map[string]any, keys ...string) string {
 		}
 	}
 	return ""
+}
+
+func resolveShadowsocksPluginRuntimeConfig(raw map[string]any) (string, string) {
+	pluginName := normalizeShadowsocksPluginName(firstNonEmptyString(raw, "plugin"))
+	pluginOptions := firstNonEmptyString(raw, "plugin_opts", "plugin-opts", "pluginOpts")
+	if pluginOptions == "" {
+		if item, ok := toAnyMap(raw["plugin_opts"]); ok {
+			pluginOptions = buildShadowsocksPluginOptionsFromMap(item)
+		} else if item, ok := toAnyMap(raw["plugin-opts"]); ok {
+			pluginOptions = buildShadowsocksPluginOptionsFromMap(item)
+		} else if item, ok := toAnyMap(raw["pluginOpts"]); ok {
+			pluginOptions = buildShadowsocksPluginOptionsFromMap(item)
+		}
+	}
+	return normalizeShadowsocksPluginConfig(pluginName, pluginOptions)
+}
+
+func normalizeShadowsocksNetwork(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "tcp":
+		return "tcp"
+	case "udp":
+		return "udp"
+	default:
+		return ""
+	}
 }
 
 func anyToString(raw any) string {
