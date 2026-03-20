@@ -535,21 +535,7 @@ export function SubscriptionNodeEditorModal({
         void handleFinish();
       }}
     >
-      {isReadOnly ? (
-        <Alert
-          type="info"
-          showIcon
-          message="订阅分组节点仅支持查看"
-          description="该节点来自订阅源，这里可以查看节点配置，但不能直接修改；如需调整，请修改订阅源或复制到普通分组后编辑。"
-        />
-      ) : manualGroups.length === 0 ? (
-        <Alert
-          type="warning"
-          showIcon
-          message="当前没有可写入的普通分组"
-          description="请先创建一个普通分组，再添加或编辑手动节点。"
-        />
-      ) : null}
+      
       <Form<SubscriptionNodeFormValues>
         layout={mainFormLayout}
         colon={false}
