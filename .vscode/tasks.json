@@ -337,23 +337,6 @@
       }
     },
     {
-      "label": "私有源码：提交并推送当前分支",
-      "type": "shell",
-      "command": "python scripts/git/private_source_tasks.py commit-push-current --remote \"${input:githubPrivateRemoteName}\"",
-      "options": {
-        "cwd": "${workspaceFolder}",
-        "env": {
-          "WATERAY_GIT_COMMIT_MESSAGE": "${input:gitCommitMessage}"
-        }
-      },
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "focus": true
-      }
-    },
-    {
       "label": "私有源码：推送到指定分支+++",
       "type": "shell",
       "command": "python scripts/git/private_source_tasks.py push-main --remote \"${input:githubPrivateRemoteName}\" --branch \"${input:githubPrivateTargetBranch}\"",
