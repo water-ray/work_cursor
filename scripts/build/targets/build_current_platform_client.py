@@ -32,12 +32,19 @@ def run_command(command: list[str]) -> None:
         raise CurrentPlatformBuildError(f"命令执行失败：{' '.join(command)}")
 
 
+def resolve_build_script(platform_id: str) -> Path:
+    if platform_id == "macos":
+        return ROOT_DIR / "scripts" / "build" / "desktop" / "build_macos_dmg.py"
+    return ROOT_DIR / "scripts" / "build" / "desktop" / "build_current_host.py"
+
+
 def main() -> int:
     try:
         platform_id = resolve_current_platform_id()
         print_rule_set_sync_summary(ensure_default_rule_sets_synced())
-        print(f"当前平台：{platform_id}，转发到 scripts/build/desktop/build_current_host.py")
-        run_command([sys.executable, str(ROOT_DIR / "scripts" / "build" / "desktop" / "build_current_host.py")])
+        build_script = resolve_build_script(platform_id)
+        print(f"当前平台：{platform_id}，转发到 {build_script.relative_to(ROOT_DIR)}")
+        run_command([sys.executable, str(build_script)])
         return 0
     except CurrentPlatformBuildError as err:
         print(f"构建失败：[current_platform_client] {err}", file=sys.stderr)

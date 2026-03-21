@@ -14,3 +14,6 @@ TARGET = DesktopBuildTarget(
     frontend_entry_name="Wateray.app",
     tauri_binary_name="wateray_tauri",
 )
+
+APP_OUTPUT_DIR_NAME = f"{TARGET.output_dir_name}-app"
+DMG_FILE_NAME = f"{TARGET.output_dir_name}.dmg"

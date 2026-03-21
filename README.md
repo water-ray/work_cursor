@@ -117,7 +117,9 @@ docs/            # 架构、测试与设计文档
   - `客户端：构建：当前平台客户端`
   - Windows 会生成 `Bin/Wateray-windows`
   - Linux 会生成 `Bin/Wateray-linux`
-  - macOS 会生成 `Bin/Wateray-linux`
+  - macOS 会生成 `Bin/Wateray-macos`
+  - macOS 原始 App 目录为 `Bin/Wateray-macos/Wateray-macos-app`
+  - macOS 安装镜像为 `Bin/Wateray-macos/Wateray-macos.dmg`
 - 构建 Android 客户端：
   - `客户端：构建：Android`
   - 生成 `Bin/Wateray-Android`

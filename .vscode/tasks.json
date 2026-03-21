@@ -176,7 +176,7 @@
         "command": "/bin/zsh",
         "args": [
           "-lc",
-          "if [ -f \"$HOME/.cargo/env\" ]; then source \"$HOME/.cargo/env\"; fi; exec python3 scripts/build/desktop/build_macos_dmg.py"
+          "if [ -f \"$HOME/.cargo/env\" ]; then source \"$HOME/.cargo/env\"; fi; exec python3 scripts/build/targets/build_current_platform_client.py"
         ]
       },
       "options": {

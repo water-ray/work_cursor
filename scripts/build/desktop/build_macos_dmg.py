@@ -31,13 +31,15 @@ from scripts.build.common.desktop_builder import (  # noqa: E402
     print_step,
     run_command,
 )
-from scripts.build.platforms.macos import TARGET  # noqa: E402
+from scripts.build.platforms.macos import APP_OUTPUT_DIR_NAME, DMG_FILE_NAME, TARGET  # noqa: E402
 
 
 TAURI_MACOS_BUNDLE_DIR = TAURI_DIR / "src-tauri" / "target" / "release" / "bundle" / "macos"
 MACOS_TEMP_DIR = ROOT_DIR / "temp" / "macos"
 DMG_STAGE_DIR = MACOS_TEMP_DIR / "dmg-stage"
-DMG_OUTPUT_PATH = BIN_DIR / f"{TARGET.output_dir_name}.dmg"
+APP_OUTPUT_DIR = TARGET.bin_dir / APP_OUTPUT_DIR_NAME
+DMG_OUTPUT_PATH = TARGET.bin_dir / DMG_FILE_NAME
+LEGACY_DMG_OUTPUT_PATH = BIN_DIR / DMG_FILE_NAME
 DMG_VOLUME_NAME = "Wateray"
 
 
@@ -90,15 +92,25 @@ def inject_packaged_daemon(app_bundle_path: Path) -> Path:
     return daemon_target_path
 
 
+def cleanup_legacy_dmg_output() -> None:
+    remove_path(LEGACY_DMG_OUTPUT_PATH)
+
+
+def cleanup_packaged_backend_staging() -> None:
+    remove_path(TARGET.bin_core_dir)
+
+
 def assemble_unsigned_bundle(source_app: Path, release_version: str) -> tuple[Path, Path]:
-    print_step(f"整理 macOS App 到 {TARGET.bin_dir}")
-    target_app_path = TARGET.bin_dir / TARGET.frontend_entry_name
+    print_step(f"整理 macOS App 到 {APP_OUTPUT_DIR}")
+    remove_path(APP_OUTPUT_DIR)
+    target_app_path = APP_OUTPUT_DIR / TARGET.frontend_entry_name
     copy_app_bundle(source_app, target_app_path, stage="assemble", code=33)
     packaged_daemon_path = inject_packaged_daemon(target_app_path)
     write_manifest(
-        TARGET.bin_dir / DESKTOP_BUILD_MANIFEST_NAME,
+        APP_OUTPUT_DIR / DESKTOP_BUILD_MANIFEST_NAME,
         build_desktop_bundle_manifest(TARGET.platform_id, release_version, TARGET.output_dir_name),
     )
+    cleanup_packaged_backend_staging()
     print(f"打包版本 -> {release_version}")
     return target_app_path, packaged_daemon_path
 
@@ -160,10 +172,11 @@ def print_summary(
     elapsed = time.time() - start_ts
     print_step("构建完成")
     print(f"- 平台：{TARGET.display_name}")
+    print(f"- 目录：{TARGET.bin_dir}")
+    print(f"- App 目录：{APP_OUTPUT_DIR}")
     print(f"- App：{app_bundle_path} ({format_size(path_size_bytes(app_bundle_path))})")
     print(f"- 内核：{packaged_daemon_path} ({format_size(packaged_daemon_path.stat().st_size)})")
     print(f"- DMG：{dmg_path} ({format_size(dmg_path.stat().st_size)})")
-    print(f"- 结构：{TARGET.bin_dir}")
     print(f"- 统一版本：{release_version}")
     print(f"- 总耗时：{elapsed:.1f}s")
 
@@ -175,6 +188,7 @@ def main() -> int:
         ensure_required_files(TARGET)
         release_version = load_release_version()
         clean_outputs(TARGET)
+        cleanup_legacy_dmg_output()
         build_backend_release(TARGET, release_version)
         ensure_frontend_deps()
         source_app_path = build_tauri_macos_app()

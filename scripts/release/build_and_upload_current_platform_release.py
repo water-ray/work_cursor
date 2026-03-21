@@ -15,7 +15,11 @@ from scripts.build.common.build_manifest import (
     build_desktop_bundle_manifest,
     manifest_matches,
 )
-from scripts.build.platforms.macos import TARGET as MACOS_TARGET
+from scripts.build.platforms.macos import (
+    APP_OUTPUT_DIR_NAME as MACOS_APP_OUTPUT_DIR_NAME,
+    DMG_FILE_NAME as MACOS_DMG_FILE_NAME,
+    TARGET as MACOS_TARGET,
+)
 from scripts.build.platforms.windows import TARGET as WINDOWS_TARGET
 from scripts.build.targets.linux_package import linux_packages_are_current
 from scripts.build.targets.desktop import resolve_current_platform_id
@@ -57,10 +61,11 @@ def current_platform_release_assets_ready(platform_id: str, version: str) -> boo
         return manifest_matches(bundle_dir / DESKTOP_BUILD_MANIFEST_NAME, expected_manifest)
     if platform_id == "macos":
         bundle_dir = ROOT_DIR / "Bin" / MACOS_TARGET.output_dir_name
-        dmg_path = ROOT_DIR / "Bin" / f"{MACOS_TARGET.output_dir_name}.dmg"
+        app_dir = bundle_dir / MACOS_APP_OUTPUT_DIR_NAME
+        dmg_path = bundle_dir / MACOS_DMG_FILE_NAME
         required_paths = [
-            bundle_dir / MACOS_TARGET.frontend_entry_name,
-            bundle_dir / MACOS_TARGET.frontend_entry_name / "Contents" / "MacOS" / "core" / MACOS_TARGET.daemon_binary_name,
+            app_dir / MACOS_TARGET.frontend_entry_name,
+            app_dir / MACOS_TARGET.frontend_entry_name / "Contents" / "MacOS" / "core" / MACOS_TARGET.daemon_binary_name,
             dmg_path,
         ]
         if not all(path.exists() for path in required_paths):
@@ -70,7 +75,7 @@ def current_platform_release_assets_ready(platform_id: str, version: str) -> boo
             version,
             MACOS_TARGET.output_dir_name,
         )
-        return manifest_matches(bundle_dir / DESKTOP_BUILD_MANIFEST_NAME, expected_manifest)
+        return manifest_matches(app_dir / DESKTOP_BUILD_MANIFEST_NAME, expected_manifest)
     return False
 
 

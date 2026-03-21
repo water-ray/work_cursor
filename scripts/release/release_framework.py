@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from scripts.build.platforms.macos import DMG_FILE_NAME as MACOS_DMG_FILE_NAME
 from scripts.build.targets.linux_package import linux_bundle_is_current, linux_packages_are_current
 
 
@@ -392,7 +393,7 @@ def resolve_local_asset_source(expected: ExpectedReleaseAsset) -> tuple[str, Pat
     if expected.platform_id == "linux":
         return ("file", LINUX_PACKAGE_OUTPUT_DIR / expected.asset_name)
     if expected.platform_id == "macos":
-        return ("file", BIN_DIR / f"{PLATFORM_DIRECTORY_NAMES['macos']}.dmg")
+        return ("file", BIN_DIR / PLATFORM_DIRECTORY_NAMES["macos"] / MACOS_DMG_FILE_NAME)
     if expected.platform_id == "android":
         return ("file", BIN_DIR / PLATFORM_DIRECTORY_NAMES["android"] / expected.asset_name)
     raise ReleaseFrameworkError(f"无法解析本地发布资产来源：{expected.asset_name}")
