@@ -1,3 +1,4 @@
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -7,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, UNIX_EPOCH};
 
 #[cfg(not(target_os = "linux"))]
 use std::process::Stdio;
@@ -254,16 +255,22 @@ pub struct DaemonBaseUrlState {
     base_url: Mutex<Option<String>>,
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Default)]
 struct InstalledDesktopAppCandidatesCache {
     refreshed_this_launch: bool,
     candidates: Vec<InstalledDesktopAppCandidate>,
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Default)]
 pub struct InstalledDesktopAppCandidatesState {
     cache: Mutex<InstalledDesktopAppCandidatesCache>,
 }
+
+#[cfg(not(target_os = "macos"))]
+#[derive(Default)]
+pub struct InstalledDesktopAppCandidatesState;
 
 impl DaemonBaseUrlState {
     fn remember(&self, raw_base_url: &str) {
@@ -414,6 +421,7 @@ async fn close_panel_keep_core(app: AppHandle) {
     close_panel_keep_core_now(app);
 }
 
+#[cfg(target_os = "macos")]
 fn quit_all_after_daemon_shutdown(app: AppHandle) {
     trace_window_flow("quit_all.begin", "");
     trace_window_flow("quit_all.daemon_shutdown_already_handled", "");
@@ -629,6 +637,7 @@ fn normalize_file_icon_size(size_px: Option<u32>) -> u32 {
         .clamp(MIN_FILE_ICON_SIZE_PX, MAX_FILE_ICON_SIZE_PX)
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn image_mime_from_path(path: &Path) -> Option<&'static str> {
     let extension = path.extension()?.to_str()?.trim();
     if extension.is_empty() {
@@ -645,6 +654,7 @@ fn image_mime_from_path(path: &Path) -> Option<&'static str> {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn encode_image_data_url(mime: &str, bytes: &[u8]) -> String {
     format!(
         "data:{mime};base64,{}",
@@ -652,14 +662,16 @@ fn encode_image_data_url(mime: &str, bytes: &[u8]) -> String {
     )
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn read_image_file_data_url(path: &Path) -> Option<String> {
     let mime = image_mime_from_path(path)?;
     let bytes = fs::read(path).ok()?;
     Some(encode_image_data_url(mime, &bytes))
 }
 
+#[cfg(target_os = "macos")]
 fn create_temp_icon_output_dir(prefix: &str) -> Option<PathBuf> {
-    let unique_suffix = SystemTime::now()
+    let unique_suffix = std::time::SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()?
         .as_nanos();
@@ -671,6 +683,7 @@ fn create_temp_icon_output_dir(prefix: &str) -> Option<PathBuf> {
     Some(output_dir)
 }
 
+#[cfg(target_os = "macos")]
 fn cleanup_temp_icon_output_dir(path: &Path) {
     let _ = fs::remove_dir_all(path);
 }
@@ -703,6 +716,7 @@ fn resolve_file_icon_cache_dir(app: &AppHandle) -> Option<PathBuf> {
         .map(|path| path.join("cache").join("appicons"))
 }
 
+#[cfg(target_os = "macos")]
 fn resolve_installed_app_candidates_cache_path(app: &AppHandle) -> Option<PathBuf> {
     Some(resolve_file_icon_cache_dir(app)?.join("macos-installed-apps.json"))
 }

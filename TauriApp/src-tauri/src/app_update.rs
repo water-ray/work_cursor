@@ -1086,7 +1086,7 @@ impl AppUpdateManager {
                             "更新已准备完成，客户端即将退出并自动替换到新版本。".to_string();
                         session.public_state.last_error.clear();
                     })?;
-                    runtime::window_quit_all(app.clone())?;
+                    runtime::window_quit_all(app.clone(), None, None)?;
                     Ok(state)
                 }
                 #[cfg(not(target_os = "windows"))]

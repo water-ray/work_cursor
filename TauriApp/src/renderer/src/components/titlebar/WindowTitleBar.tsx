@@ -1,3 +1,4 @@
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Button, Checkbox, Modal, Radio, Space, Typography } from "antd";
 import { useEffect, useMemo, useState } from "react";
 import type { DaemonSnapshot, ProxyMode, VpnConnectionStage } from "../../../../shared/daemon";
@@ -63,20 +64,13 @@ function formatWindowActionError(error: unknown, fallback: string): string {
   return normalized === "" ? fallback : normalized;
 }
 
-function describeWindowEventTarget(target: EventTarget | null): string {
+function shouldStartDragging(target: EventTarget | null): boolean {
   if (!(target instanceof HTMLElement)) {
-    return "unknown";
+    return true;
   }
-  const tagName = target.tagName.toLowerCase();
-  const classTokens =
-    typeof target.className === "string"
-      ? target.className
-          .split(/\s+/)
-          .map((item) => item.trim())
-          .filter(Boolean)
-          .slice(0, 4)
-      : [];
-  return classTokens.length > 0 ? `${tagName}.${classTokens.join(".")}` : tagName;
+  return !target.closest(
+    "button, a, input, textarea, select, option, label, summary, [role='button'], .ant-btn, .ant-modal, .ant-checkbox, .ant-radio, .ant-select, .ant-switch",
+  );
 }
 
 function WindowMaximizeIcon({ maximized }: { maximized: boolean }) {
@@ -482,17 +476,16 @@ export function WindowTitleBar({
     event.stopPropagation();
   };
 
-  const handleDragRegionMouseDownCapture = (
-    region: "brand" | "title",
-    event: React.MouseEvent<HTMLElement>,
-  ) => {
-    if (event.button !== 0) {
+  const handleTitleBarMouseDown = (event: React.MouseEvent<HTMLDivElement>) => {
+    if (isToolbarLayout || event.button !== 0 || !shouldStartDragging(event.target)) {
       return;
     }
-    traceWindowEvent(
-      "titlebar.drag_region.mousedown",
-      `region=${region}; detail=${event.detail}; target=${describeWindowEventTarget(event.target)}`,
-    );
+    void getCurrentWindow().startDragging().catch((error) => {
+      traceWindowEvent(
+        "titlebar.drag.start_rejected",
+        formatWindowActionError(error, "窗口拖动失败"),
+      );
+    });
   };
 
   const handleMinimizeClick = () => {
@@ -667,14 +660,10 @@ export function WindowTitleBar({
           {actionButtons}
         </div>
       ) : (
-        <div className="window-titlebar">
+        <div className="window-titlebar" onMouseDown={handleTitleBarMouseDown}>
           <div className="window-brand">
             <div
               className="window-brand-main"
-              data-tauri-drag-region=""
-              onMouseDownCapture={(event) => {
-                handleDragRegionMouseDownCapture("brand", event);
-              }}
             >
               {appIconUrl ? (
                 <img className="window-app-icon-image" src={appIconUrl} alt="Wateray" />
@@ -693,10 +682,6 @@ export function WindowTitleBar({
           </div>
           <div
             className="window-title-wrap"
-            data-tauri-drag-region=""
-            onMouseDownCapture={(event) => {
-              handleDragRegionMouseDownCapture("title", event);
-            }}
           >
             <Typography.Text className="window-title">{title}</Typography.Text>
           </div>
