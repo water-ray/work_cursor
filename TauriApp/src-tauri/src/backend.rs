@@ -1080,7 +1080,8 @@ fn read_macos_icns_data_url(icon_path: &Path, size_px: u32) -> Option<String> {
     let file = fs::File::open(icon_path).ok()?;
     let family = IconFamily::read(BufReader::new(file)).ok()?;
     let requested_size = size_px.clamp(MIN_FILE_ICON_SIZE_PX, MAX_FILE_ICON_SIZE_PX);
-    let icon_type = family.available_icons().iter().max_by_key(|icon_type| {
+    let available_icons = family.available_icons();
+    let icon_type = available_icons.into_iter().max_by_key(|icon_type| {
         let width = icon_type.pixel_width();
         let height = icon_type.pixel_height();
         let max_side = width.max(height);
@@ -1090,7 +1091,7 @@ fn read_macos_icns_data_url(icon_path: &Path, size_px: u32) -> Option<String> {
             width.saturating_mul(height),
         )
     })?;
-    let image = family.get_icon_with_type(*icon_type).ok()?;
+    let image = family.get_icon_with_type(icon_type).ok()?;
     let mut png_bytes = Vec::new();
     image.write_png(&mut png_bytes).ok()?;
     Some(encode_image_data_url("image/png", &png_bytes))
