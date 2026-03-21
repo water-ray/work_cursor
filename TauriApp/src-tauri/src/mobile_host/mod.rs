@@ -1,7 +1,6 @@
 use tauri::{
     plugin::{Builder as PluginBuilder, TauriPlugin},
-    AppHandle,
-    Runtime,
+    AppHandle, Runtime,
 };
 
 use crate::platform_contracts;
@@ -294,7 +293,11 @@ pub fn mobile_host_start<R: Runtime>(
     {
         let args: MobileHostStartArgs =
             serde_json::from_value(payload).map_err(|error| error.to_string())?;
-        run_mobile_host_command(&app, platform_contracts::MOBILE_HOST_START_PLUGIN_COMMAND, args)
+        run_mobile_host_command(
+            &app,
+            platform_contracts::MOBILE_HOST_START_PLUGIN_COMMAND,
+            args,
+        )
     }
 
     #[cfg(not(target_os = "android"))]
@@ -351,7 +354,11 @@ pub fn mobile_host_probe<R: Runtime>(
     {
         let args: MobileHostProbeArgs =
             serde_json::from_value(payload).map_err(|error| error.to_string())?;
-        run_mobile_host_command(&app, platform_contracts::MOBILE_HOST_PROBE_PLUGIN_COMMAND, args)
+        run_mobile_host_command(
+            &app,
+            platform_contracts::MOBILE_HOST_PROBE_PLUGIN_COMMAND,
+            args,
+        )
     }
 
     #[cfg(not(target_os = "android"))]

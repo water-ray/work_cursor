@@ -1,4 +1,4 @@
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -14,8 +14,16 @@ use std::time::{Duration, UNIX_EPOCH};
 use std::process::Stdio;
 
 #[cfg(target_os = "windows")]
-use std::os::windows::process::CommandExt;
+use std::ffi::c_void;
+#[cfg(target_os = "macos")]
+use std::io::BufReader;
+#[cfg(target_os = "windows")]
+use std::os::windows::{ffi::OsStrExt, process::CommandExt};
 
+#[cfg(target_os = "macos")]
+use icns::IconFamily;
+#[cfg(target_os = "macos")]
+use plist::{Dictionary as PlistDictionary, Value as PlistValue};
 use serde::{Deserialize, Serialize};
 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 use tauri::menu::MenuBuilder;
@@ -24,8 +32,8 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{AppHandle, Manager, State};
 use tokio::time::sleep;
 
-use tauri_plugin_http::reqwest;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+use tauri_plugin_http::reqwest;
 
 use crate::platform_contracts;
 
@@ -34,12 +42,22 @@ use webview2_com_sys::Microsoft::Web::WebView2::Win32::GetAvailableCoreWebView2B
 #[cfg(target_os = "windows")]
 use windows::core::{PCWSTR, PWSTR};
 #[cfg(target_os = "windows")]
+use windows::Win32::Graphics::Gdi::{
+    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject, BITMAPINFO,
+    BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HGDIOBJ,
+};
+#[cfg(target_os = "windows")]
+use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
+#[cfg(target_os = "windows")]
 use windows::Win32::System::Com::CoTaskMemFree;
 #[cfg(target_os = "windows")]
-use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::Shell::{
+    SHGetFileInfoW, ShellExecuteW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_SMALLICON,
+};
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::{
-    MessageBoxW, SW_HIDE, MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
+    DestroyIcon, DrawIconEx, MessageBoxW, DI_NORMAL, MB_ICONERROR, MB_OK, MB_SETFOREGROUND,
+    MB_TOPMOST, SW_HIDE,
 };
 
 const DEFAULT_DAEMON_BASE_URL: &str = "http://127.0.0.1:59500";
@@ -376,12 +394,11 @@ fn should_restore_main_window_from_tray_event(event: &TrayIconEvent) -> bool {
         TrayIconEvent::DoubleClick {
             button: MouseButton::Left,
             ..
+        } | TrayIconEvent::Click {
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Up,
+            ..
         }
-            | TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
-                ..
-            }
     )
 }
 
@@ -523,9 +540,8 @@ pub fn cleanup_stale_linux_dev_desktop_override() {
             }
             let file_name = entry.file_name();
             let file_name = file_name.to_string_lossy();
-            let is_dev_icon =
-                file_name.starts_with(LINUX_TAURI_DEV_ICON_PREFIX)
-                    || file_name.starts_with(LINUX_ELECTRON_DEV_ICON_PREFIX);
+            let is_dev_icon = file_name.starts_with(LINUX_TAURI_DEV_ICON_PREFIX)
+                || file_name.starts_with(LINUX_ELECTRON_DEV_ICON_PREFIX);
             if is_dev_icon {
                 let _ = fs::remove_file(path);
                 cleaned = true;
@@ -669,27 +685,9 @@ fn read_image_file_data_url(path: &Path) -> Option<String> {
     Some(encode_image_data_url(mime, &bytes))
 }
 
-#[cfg(target_os = "macos")]
-fn create_temp_icon_output_dir(prefix: &str) -> Option<PathBuf> {
-    let unique_suffix = std::time::SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_nanos();
-    let output_dir = std::env::temp_dir()
-        .join("wateray")
-        .join("icons")
-        .join(format!("{prefix}-{}-{unique_suffix}", std::process::id()));
-    fs::create_dir_all(&output_dir).ok()?;
-    Some(output_dir)
-}
-
-#[cfg(target_os = "macos")]
-fn cleanup_temp_icon_output_dir(path: &Path) {
-    let _ = fs::remove_dir_all(path);
-}
-
 fn build_file_icon_cache_key(target_path: &Path, size_px: u32) -> String {
-    let normalized_path = fs::canonicalize(target_path).unwrap_or_else(|_| target_path.to_path_buf());
+    let normalized_path =
+        fs::canonicalize(target_path).unwrap_or_else(|_| target_path.to_path_buf());
     let metadata = fs::metadata(&normalized_path).ok();
     let modified_ms = metadata
         .as_ref()
@@ -722,7 +720,9 @@ fn resolve_installed_app_candidates_cache_path(app: &AppHandle) -> Option<PathBu
 }
 
 #[cfg(target_os = "macos")]
-fn read_cached_macos_installed_app_candidates(app: &AppHandle) -> Option<Vec<InstalledDesktopAppCandidate>> {
+fn read_cached_macos_installed_app_candidates(
+    app: &AppHandle,
+) -> Option<Vec<InstalledDesktopAppCandidate>> {
     let cache_path = resolve_installed_app_candidates_cache_path(app)?;
     let cached = fs::read_to_string(cache_path).ok()?;
     serde_json::from_str::<Vec<InstalledDesktopAppCandidate>>(&cached).ok()
@@ -776,13 +776,16 @@ fn build_macos_installed_app_candidate(app_path: &Path) -> Option<InstalledDeskt
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("");
-    let name = read_macos_plist_string(&info_plist_path, "CFBundleDisplayName")
-        .or_else(|| read_macos_plist_string(&info_plist_path, "CFBundleName"))
-        .unwrap_or_else(|| fallback_name.to_string());
-    let executable_name = read_macos_plist_string(&info_plist_path, "CFBundleExecutable")
-        .unwrap_or_default();
-    let bundle_id = read_macos_plist_string(&info_plist_path, "CFBundleIdentifier")
-        .unwrap_or_default();
+    let metadata = read_macos_bundle_metadata(&info_plist_path).unwrap_or_default();
+    let name = if !metadata.display_name.is_empty() {
+        metadata.display_name
+    } else if !metadata.bundle_name.is_empty() {
+        metadata.bundle_name
+    } else {
+        fallback_name.to_string()
+    };
+    let executable_name = metadata.executable_name;
+    let bundle_id = metadata.bundle_id;
     let normalized_name = name.trim().to_string();
     if normalized_name.is_empty() {
         return None;
@@ -835,7 +838,11 @@ fn scan_macos_installed_app_candidates() -> Vec<InstalledDesktopAppCandidate> {
         left.name
             .to_ascii_lowercase()
             .cmp(&right.name.to_ascii_lowercase())
-            .then_with(|| left.path.to_ascii_lowercase().cmp(&right.path.to_ascii_lowercase()))
+            .then_with(|| {
+                left.path
+                    .to_ascii_lowercase()
+                    .cmp(&right.path.to_ascii_lowercase())
+            })
     });
     candidates
 }
@@ -878,7 +885,11 @@ fn list_installed_app_candidates_impl(
     Vec::new()
 }
 
-fn resolve_file_icon_cache_path(app: &AppHandle, target_path: &Path, size_px: u32) -> Option<PathBuf> {
+fn resolve_file_icon_cache_path(
+    app: &AppHandle,
+    target_path: &Path,
+    size_px: u32,
+) -> Option<PathBuf> {
     Some(resolve_file_icon_cache_dir(app)?.join(format!(
         "{}.txt",
         build_file_icon_cache_key(target_path, size_px)
@@ -908,7 +919,7 @@ fn write_cached_file_icon_data_url(
 ) {
     let Some(cache_path) = resolve_file_icon_cache_path(app, target_path, size_px) else {
         return;
-    };    
+    };
     let Some(payload) = data_url else {
         let _ = fs::remove_file(cache_path);
         return;
@@ -953,11 +964,13 @@ fn resolve_file_icon_data_url(app: &AppHandle, target_path: &Path, size_px: u32)
 
 #[cfg(target_os = "macos")]
 fn resolve_known_macos_owner_bundle_roots(target_path: &Path) -> Vec<PathBuf> {
-    let normalized_path = fs::canonicalize(target_path).unwrap_or_else(|_| target_path.to_path_buf());
+    let normalized_path =
+        fs::canonicalize(target_path).unwrap_or_else(|_| target_path.to_path_buf());
     let normalized_text = normalized_path.to_string_lossy().to_ascii_lowercase();
     let mut bundles = Vec::new();
     if normalized_text.contains("/library/apple/system/library/stagedframeworks/safari/")
-        || (normalized_text.contains("/webkit.framework/") && normalized_text.contains("com.apple.webkit.networking"))
+        || (normalized_text.contains("/webkit.framework/")
+            && normalized_text.contains("com.apple.webkit.networking"))
     {
         let safari_app = PathBuf::from("/Applications/Safari.app");
         if safari_app.is_dir() {
@@ -994,20 +1007,36 @@ fn collect_macos_bundle_roots(target_path: &Path) -> Vec<PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
-fn read_macos_plist_string(info_plist_path: &Path, key_path: &str) -> Option<String> {
-    let output = Command::new("/usr/bin/plutil")
-        .args(["-extract", key_path, "raw", "-o", "-"])
-        .arg(info_plist_path)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if value.is_empty() {
-        return None;
-    }
-    Some(value)
+fn read_macos_plist_string(dict: &PlistDictionary, key_path: &str) -> String {
+    dict.get(key_path)
+        .and_then(|value| value.as_string())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct MacosBundleMetadata {
+    display_name: String,
+    bundle_name: String,
+    executable_name: String,
+    bundle_id: String,
+    icon_file: String,
+}
+
+#[cfg(target_os = "macos")]
+fn read_macos_bundle_metadata(info_plist_path: &Path) -> Option<MacosBundleMetadata> {
+    let plist_value = PlistValue::from_file(info_plist_path).ok()?;
+    let dict = plist_value.as_dictionary()?;
+    Some(MacosBundleMetadata {
+        display_name: read_macos_plist_string(dict, "CFBundleDisplayName"),
+        bundle_name: read_macos_plist_string(dict, "CFBundleName"),
+        executable_name: read_macos_plist_string(dict, "CFBundleExecutable"),
+        bundle_id: read_macos_plist_string(dict, "CFBundleIdentifier"),
+        icon_file: read_macos_plist_string(dict, "CFBundleIconFile"),
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -1018,15 +1047,16 @@ fn resolve_macos_bundle_icon_path(bundle_root: &Path) -> Option<PathBuf> {
     }
     let resources_dir = bundle_root.join("Contents/Resources");
     let mut candidates = Vec::new();
-    if let Some(icon_value) = read_macos_plist_string(&info_plist_path, "CFBundleIconFile") {
-        let direct_candidate = resources_dir.join(&icon_value);
+    let metadata = read_macos_bundle_metadata(&info_plist_path).unwrap_or_default();
+    if !metadata.icon_file.is_empty() {
+        let direct_candidate = resources_dir.join(&metadata.icon_file);
         candidates.push(direct_candidate.clone());
-        if Path::new(&icon_value).extension().is_none() {
-            candidates.push(resources_dir.join(format!("{icon_value}.icns")));
+        if Path::new(&metadata.icon_file).extension().is_none() {
+            candidates.push(resources_dir.join(format!("{}.icns", metadata.icon_file)));
         }
     }
-    if let Some(executable_name) = read_macos_plist_string(&info_plist_path, "CFBundleExecutable") {
-        candidates.push(resources_dir.join(format!("{executable_name}.icns")));
+    if !metadata.executable_name.is_empty() {
+        candidates.push(resources_dir.join(format!("{}.icns", metadata.executable_name)));
     }
     if let Some(existing) = candidates.into_iter().find(|path| path.is_file()) {
         return Some(existing);
@@ -1046,101 +1076,191 @@ fn resolve_macos_bundle_icon_path(bundle_root: &Path) -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
+fn read_macos_icns_data_url(icon_path: &Path, size_px: u32) -> Option<String> {
+    let file = fs::File::open(icon_path).ok()?;
+    let family = IconFamily::read(BufReader::new(file)).ok()?;
+    let requested_size = size_px.clamp(MIN_FILE_ICON_SIZE_PX, MAX_FILE_ICON_SIZE_PX);
+    let icon_type = family.available_icons().iter().max_by_key(|icon_type| {
+        let width = icon_type.pixel_width();
+        let height = icon_type.pixel_height();
+        let max_side = width.max(height);
+        (
+            u8::from(max_side >= requested_size),
+            max_side,
+            width.saturating_mul(height),
+        )
+    })?;
+    let image = family.get_icon_with_type(*icon_type).ok()?;
+    let mut png_bytes = Vec::new();
+    image.write_png(&mut png_bytes).ok()?;
+    Some(encode_image_data_url("image/png", &png_bytes))
+}
+
+#[cfg(target_os = "macos")]
 fn resolve_macos_file_icon_data_url(target_path: &Path, size_px: u32) -> Option<String> {
     let icon_path = resolve_known_macos_owner_bundle_roots(target_path)
         .into_iter()
         .chain(collect_macos_bundle_roots(target_path))
         .into_iter()
         .find_map(|bundle_root| resolve_macos_bundle_icon_path(&bundle_root))?;
-    let output_dir = create_temp_icon_output_dir("macos")?;
-    let output_path = output_dir.join("icon.png");
-    let output = Command::new("/usr/bin/sips")
-        .args(["-s", "format", "png"])
-        .arg(&icon_path)
-        .arg("--resampleHeightWidthMax")
-        .arg(size_px.to_string())
-        .arg("--out")
-        .arg(&output_path)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        cleanup_temp_icon_output_dir(&output_dir);
+    let is_icns = icon_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.eq_ignore_ascii_case("icns"))
+        .unwrap_or(false);
+    if is_icns {
+        return read_macos_icns_data_url(&icon_path, size_px);
+    }
+    read_image_file_data_url(&icon_path)
+}
+
+#[cfg(target_os = "windows")]
+fn encode_windows_rgba_png_data_url(rgba: &[u8], width: u32, height: u32) -> Option<String> {
+    let mut png_bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut png_bytes, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().ok()?;
+        writer.write_image_data(rgba).ok()?;
+    }
+    Some(format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(png_bytes)
+    ))
+}
+
+#[cfg(target_os = "windows")]
+fn render_windows_icon_data_url(
+    icon: windows::Win32::UI::WindowsAndMessaging::HICON,
+    width: i32,
+    height: i32,
+) -> Option<String> {
+    if width <= 0 || height <= 0 {
         return None;
     }
-    let data_url = read_image_file_data_url(&output_path);
-    cleanup_temp_icon_output_dir(&output_dir);
+    let bitmap_info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            biHeight: -height,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut pixels_ptr: *mut c_void = std::ptr::null_mut();
+    let hdc = unsafe { CreateCompatibleDC(None) };
+    if hdc.0.is_null() {
+        return None;
+    }
+    let hbitmap = unsafe {
+        CreateDIBSection(
+            Some(hdc),
+            &bitmap_info,
+            DIB_RGB_COLORS,
+            &mut pixels_ptr,
+            None,
+            0,
+        )
+    }
+    .ok()?;
+    if hbitmap.0.is_null() || pixels_ptr.is_null() {
+        unsafe {
+            let _ = DeleteDC(hdc);
+        }
+        return None;
+    }
+    let previous_object = unsafe { SelectObject(hdc, HGDIOBJ(hbitmap.0)) };
+    let pixel_len = width as usize * height as usize * 4;
+    unsafe {
+        std::ptr::write_bytes(pixels_ptr as *mut u8, 0, pixel_len);
+    }
+    let data_url =
+        if unsafe { DrawIconEx(hdc, 0, 0, icon, width, height, 0, None, DI_NORMAL) }.is_ok() {
+            let bgra = unsafe { std::slice::from_raw_parts(pixels_ptr as *const u8, pixel_len) };
+            let mut rgba = Vec::with_capacity(pixel_len);
+            for chunk in bgra.chunks_exact(4) {
+                rgba.extend_from_slice(&[chunk[2], chunk[1], chunk[0], chunk[3]]);
+            }
+            encode_windows_rgba_png_data_url(&rgba, width as u32, height as u32)
+        } else {
+            None
+        };
+    unsafe {
+        if !previous_object.0.is_null() {
+            let _ = SelectObject(hdc, previous_object);
+        }
+        let _ = DeleteObject(HGDIOBJ(hbitmap.0));
+        let _ = DeleteDC(hdc);
+    }
     data_url
 }
 
 #[cfg(target_os = "windows")]
-fn resolve_windows_file_icon_data_url(target_path: &Path, _size_px: u32) -> Option<String> {
-    let script = r#"
-$ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName System.Drawing
-$path = $env:WATERAY_ICON_TARGET
-if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path -LiteralPath $path)) {
-  exit 0
-}
-$icon = [System.Drawing.Icon]::ExtractAssociatedIcon($path)
-if ($null -eq $icon) {
-  exit 0
-}
-$bitmap = $icon.ToBitmap()
-$stream = New-Object System.IO.MemoryStream
-try {
-  $bitmap.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
-  [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-  Write-Output ([Convert]::ToBase64String($stream.ToArray()))
-} finally {
-  if ($stream) { $stream.Dispose() }
-  if ($bitmap) { $bitmap.Dispose() }
-  if ($icon) { $icon.Dispose() }
-}
-"#;
-    let output = Command::new("powershell.exe")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            script,
-        ])
-        .env("WATERAY_ICON_TARGET", target_path.as_os_str())
-        .output()
-        .ok()?;
-    if !output.status.success() {
+fn resolve_windows_file_icon_data_url(target_path: &Path, size_px: u32) -> Option<String> {
+    let path_wide = target_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<u16>>();
+    let icon_size = size_px.clamp(MIN_FILE_ICON_SIZE_PX, MAX_FILE_ICON_SIZE_PX) as i32;
+    let mut file_info = SHFILEINFOW::default();
+    let flags = SHGFI_ICON
+        | if icon_size <= 16 {
+            SHGFI_SMALLICON
+        } else {
+            SHGFI_LARGEICON
+        };
+    let result = unsafe {
+        SHGetFileInfoW(
+            PCWSTR(path_wide.as_ptr()),
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            Some(&mut file_info),
+            std::mem::size_of::<SHFILEINFOW>() as u32,
+            flags,
+        )
+    };
+    if result == 0 || file_info.hIcon.0.is_null() {
         return None;
     }
-    let encoded = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if encoded.is_empty() {
-        return None;
+    let data_url = render_windows_icon_data_url(file_info.hIcon, icon_size, icon_size);
+    unsafe {
+        let _ = DestroyIcon(file_info.hIcon);
     }
-    Some(format!("data:image/png;base64,{encoded}"))
+    data_url
 }
 
 #[cfg(target_os = "linux")]
 fn resolve_linux_file_icon_data_url(target_path: &Path, size_px: u32) -> Option<String> {
-    let normalized_target = fs::canonicalize(target_path).unwrap_or_else(|_| target_path.to_path_buf());
+    let normalized_target =
+        fs::canonicalize(target_path).unwrap_or_else(|_| target_path.to_path_buf());
     let icon_path = resolve_linux_desktop_entry_icon_path(&normalized_target, size_px)
-        .or_else(|| resolve_linux_gio_icon_path(&normalized_target, size_px))?;
+        .or_else(|| resolve_linux_executable_icon_path(&normalized_target, size_px))?;
     read_image_file_data_url(&icon_path)
 }
 
 #[cfg(target_os = "linux")]
 fn resolve_linux_desktop_entry_icon_path(target_path: &Path, size_px: u32) -> Option<PathBuf> {
+    let mut best_match: Option<(i32, PathBuf)> = None;
     for entry_path in collect_linux_desktop_entry_paths() {
         let Some((exec_value, icon_value)) = parse_linux_desktop_entry(&entry_path) else {
             continue;
         };
-        if !linux_desktop_entry_matches_target(&exec_value, target_path) {
+        let score = score_linux_desktop_entry_match(&exec_value, target_path);
+        if score <= 0 {
             continue;
         }
         if let Some(icon_path) = resolve_linux_icon_value_path(&icon_value, size_px) {
-            return Some(icon_path);
+            match &best_match {
+                Some((best_score, _)) if *best_score >= score => {}
+                _ => best_match = Some((score, icon_path)),
+            }
         }
     }
-    None
+    best_match.map(|(_, path)| path)
 }
 
 #[cfg(target_os = "linux")]
@@ -1231,11 +1351,13 @@ fn parse_linux_desktop_entry(entry_path: &Path) -> Option<(String, String)> {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_desktop_entry_matches_target(exec_value: &str, target_path: &Path) -> bool {
+fn score_linux_desktop_entry_match(exec_value: &str, target_path: &Path) -> i32 {
     let Some(program) = resolve_linux_exec_program(exec_value) else {
-        return false;
+        return 0;
     };
-    let normalized_target = fs::canonicalize(target_path).unwrap_or_else(|_| target_path.to_path_buf());
+    let normalized_target =
+        fs::canonicalize(target_path).unwrap_or_else(|_| target_path.to_path_buf());
+    let normalized_target_text = normalized_target.to_string_lossy().to_ascii_lowercase();
     let target_name = normalized_target
         .file_name()
         .and_then(|value| value.to_str())
@@ -1248,14 +1370,38 @@ fn linux_desktop_entry_matches_target(exec_value: &str, target_path: &Path) -> b
         .unwrap_or_default();
     let program_path = PathBuf::from(&program);
     if program_path.is_absolute() && linux_paths_equal(&program_path, &normalized_target) {
-        return true;
+        return 320;
     }
     let program_name = program_path
         .file_name()
         .and_then(|value| value.to_str())
         .map(|value| value.trim().to_ascii_lowercase())
         .unwrap_or_default();
-    !program_name.is_empty() && (program_name == target_name || program_name == target_stem)
+    let program_stem = program_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    let mut score = 0;
+    if !program_name.is_empty() && program_name == target_name {
+        score += 180;
+    }
+    if !program_stem.is_empty() && program_stem == target_stem {
+        score += 160;
+    }
+    if !program_name.is_empty() && normalized_target_text.contains(&format!("/{program_name}")) {
+        score += 40;
+    }
+    if !program_stem.is_empty() && normalized_target_text.contains(&format!("/{program_stem}")) {
+        score += 36;
+    }
+    if !program_name.is_empty() && target_name.contains(&program_name) {
+        score += 28;
+    }
+    if !program_stem.is_empty() && target_stem.contains(&program_stem) {
+        score += 24;
+    }
+    score
 }
 
 #[cfg(target_os = "linux")]
@@ -1334,44 +1480,49 @@ fn tokenize_linux_exec_command(raw: &str) -> Vec<String> {
 }
 
 #[cfg(target_os = "linux")]
-fn resolve_linux_gio_icon_path(target_path: &Path, size_px: u32) -> Option<PathBuf> {
-    let args = vec![
-        "info".to_string(),
-        "-a".to_string(),
-        "standard::icon".to_string(),
-        target_path.to_string_lossy().to_string(),
-    ];
-    let output = run_command_capture("gio", &args, None).ok()?;
-    if !output.status.success() {
-        return None;
+fn collect_linux_executable_icon_names(target_path: &Path) -> Vec<String> {
+    let mut result = Vec::new();
+    let push_unique = |items: &mut Vec<String>, value: &str| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if items.iter().any(|item| item.eq_ignore_ascii_case(trimmed)) {
+            return;
+        }
+        items.push(trimmed.to_string());
+    };
+    if let Some(file_name) = target_path.file_name().and_then(|value| value.to_str()) {
+        push_unique(&mut result, file_name);
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    for icon_name in parse_linux_gio_icon_names(&text) {
+    if let Some(file_stem) = target_path.file_stem().and_then(|value| value.to_str()) {
+        push_unique(&mut result, file_stem);
+        for suffix in [".bin", "-bin", ".sh", "-wrapper", "-wrapped", "-launcher"] {
+            if let Some(stripped) = file_stem.strip_suffix(suffix) {
+                push_unique(&mut result, stripped);
+            }
+        }
+        if file_stem.eq_ignore_ascii_case("AppRun") {
+            if let Some(parent_name) = target_path
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|value| value.to_str())
+            {
+                push_unique(&mut result, parent_name);
+            }
+        }
+    }
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_linux_executable_icon_path(target_path: &Path, size_px: u32) -> Option<PathBuf> {
+    for icon_name in collect_linux_executable_icon_names(target_path) {
         if let Some(icon_path) = resolve_linux_icon_value_path(&icon_name, size_px) {
             return Some(icon_path);
         }
     }
     None
-}
-
-#[cfg(target_os = "linux")]
-fn parse_linux_gio_icon_names(text: &str) -> Vec<String> {
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if !trimmed.starts_with("standard::icon:") {
-            continue;
-        }
-        let Some((_, raw_values)) = trimmed.split_once(':') else {
-            continue;
-        };
-        return raw_values
-            .split(',')
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned)
-            .collect();
-    }
-    Vec::new()
 }
 
 #[cfg(target_os = "linux")]
@@ -1419,7 +1570,9 @@ fn search_linux_icon_path(icon_name: &str, size_px: u32) -> Option<PathBuf> {
                     .and_then(|value| value.to_str())
                     .map(str::trim)
                     .unwrap_or("");
-                if stem != normalized_icon_name || image_mime_from_path(&path).is_none() {
+                if !stem.eq_ignore_ascii_case(normalized_icon_name)
+                    || image_mime_from_path(&path).is_none()
+                {
                     continue;
                 }
                 let score = score_linux_icon_path(&path, size_px);
@@ -1563,7 +1716,9 @@ async fn find_reachable_daemon_base_url() -> Option<String> {
     None
 }
 
-async fn read_daemon_transport_bootstrap(base_url: &str) -> Result<LoopbackTransportBootstrap, String> {
+async fn read_daemon_transport_bootstrap(
+    base_url: &str,
+) -> Result<LoopbackTransportBootstrap, String> {
     let client = build_local_reqwest_client(DAEMON_PROBE_TIMEOUT_MS)
         .await
         .ok_or_else(|| "无法创建本地 loopback 客户端".to_string())?;
@@ -1860,11 +2015,17 @@ fn extract_embedded_linux_packaged_assets() -> Result<PathBuf, String> {
         .map_err(|error| format!("创建 Linux 临时资源目录失败：{error}"))?;
     for asset in EMBEDDED_LINUX_RELEASE_ASSETS {
         let asset_path = extraction_dir.join(asset.file_name);
-        fs::write(&asset_path, asset.bytes)
-            .map_err(|error| format!("写入 Linux 临时资源失败 {}: {error}", asset_path.display()))?;
-        fs::set_permissions(&asset_path, fs::Permissions::from_mode(asset.mode)).map_err(|error| {
-            format!("设置 Linux 临时资源权限失败 {}: {error}", asset_path.display())
+        fs::write(&asset_path, asset.bytes).map_err(|error| {
+            format!("写入 Linux 临时资源失败 {}: {error}", asset_path.display())
         })?;
+        fs::set_permissions(&asset_path, fs::Permissions::from_mode(asset.mode)).map_err(
+            |error| {
+                format!(
+                    "设置 Linux 临时资源权限失败 {}: {error}",
+                    asset_path.display()
+                )
+            },
+        )?;
     }
     Ok(extraction_dir)
 }
@@ -2127,7 +2288,10 @@ async fn shutdown_daemon_best_effort(
     let candidates =
         build_daemon_base_url_candidates(explicit_daemon_base_url, remembered_daemon_base_url);
     for base_url in candidates {
-        trace_window_flow("shutdown_daemon_best_effort.try", &format!("base_url={base_url}"));
+        trace_window_flow(
+            "shutdown_daemon_best_effort.try",
+            &format!("base_url={base_url}"),
+        );
         match post_daemon_shutdown(&client, &base_url).await {
             Ok(status) => {
                 trace_window_flow(
@@ -2167,39 +2331,39 @@ pub async fn ensure_packaged_daemon_running_impl() -> Result<(), String> {
 
     #[cfg(not(target_os = "linux"))]
     {
-    let daemon_executable_path = resolve_daemon_executable_path()?;
-    if !daemon_executable_path.exists() {
-        return Err(format!(
-            "发布态内核文件不存在：{}",
-            daemon_executable_path.display()
-        ));
-    }
+        let daemon_executable_path = resolve_daemon_executable_path()?;
+        if !daemon_executable_path.exists() {
+            return Err(format!(
+                "发布态内核文件不存在：{}",
+                daemon_executable_path.display()
+            ));
+        }
 
-    match spawn_daemon_detached(&daemon_executable_path) {
-        Ok(()) => {}
-        Err(error) => {
-            if !is_permission_denied_error(&error) {
-                return Err(format!("拉起内核失败：{error}"));
-            }
+        match spawn_daemon_detached(&daemon_executable_path) {
+            Ok(()) => {}
+            Err(error) => {
+                if !is_permission_denied_error(&error) {
+                    return Err(format!("拉起内核失败：{error}"));
+                }
 
-            if !spawn_daemon_elevated_via_uac(&daemon_executable_path) {
-                return Err(format!(
-                    "启动内核需要管理员权限，请在系统弹出的授权窗口中允许 {} 运行。",
-                    daemon_executable_path.display()
-                ));
+                if !spawn_daemon_elevated_via_uac(&daemon_executable_path) {
+                    return Err(format!(
+                        "启动内核需要管理员权限，请在系统弹出的授权窗口中允许 {} 运行。",
+                        daemon_executable_path.display()
+                    ));
+                }
             }
         }
-    }
 
-    if wait_daemon_ready().await {
-        return Ok(());
-    }
+        if wait_daemon_ready().await {
+            return Ok(());
+        }
 
-    Err(format!(
-        "内核进程已尝试启动，但在 {} 秒内未就绪：{}",
-        DAEMON_READY_TIMEOUT_MS / 1000,
-        daemon_executable_path.display()
-    ))
+        Err(format!(
+            "内核进程已尝试启动，但在 {} 秒内未就绪：{}",
+            DAEMON_READY_TIMEOUT_MS / 1000,
+            daemon_executable_path.display()
+        ))
     }
 }
 

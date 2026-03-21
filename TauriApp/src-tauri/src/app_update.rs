@@ -284,7 +284,8 @@ fn resolve_current_install_dir() -> Result<PathBuf, String> {
 
 fn read_version_from_bundle_manifest(install_dir: &Path) -> Option<String> {
     let manifest_path = install_dir.join(BUNDLE_MANIFEST_FILE_NAME);
-    let payload = serde_json::from_slice::<serde_json::Value>(&fs::read(&manifest_path).ok()?).ok()?;
+    let payload =
+        serde_json::from_slice::<serde_json::Value>(&fs::read(&manifest_path).ok()?).ok()?;
     let version = payload.get("version")?.as_str()?.trim();
     if version.is_empty() {
         None
@@ -333,7 +334,9 @@ fn resolve_runtime_version(app: &AppHandle, install_dir: &Path) -> String {
 #[cfg(target_os = "linux")]
 fn detect_linux_install_kind(install_dir: &Path) -> (String, bool, String) {
     let normalized = install_dir.to_string_lossy().replace('\\', "/");
-    if normalized == LINUX_DEB_INSTALL_DIR || normalized.starts_with(&format!("{LINUX_DEB_INSTALL_DIR}/")) {
+    if normalized == LINUX_DEB_INSTALL_DIR
+        || normalized.starts_with(&format!("{LINUX_DEB_INSTALL_DIR}/"))
+    {
         return ("deb".to_string(), true, String::new());
     }
     if normalized.contains("/wateray/appimage/current") {
@@ -574,7 +577,8 @@ fn write_json_file(prefix: &str, payload: &serde_json::Value) -> Result<PathBuf,
 }
 
 fn compute_sha256(path: &Path) -> Result<String, String> {
-    let bytes = fs::read(path).map_err(|error| format!("读取文件失败：{} ({error})", path.display()))?;
+    let bytes =
+        fs::read(path).map_err(|error| format!("读取文件失败：{} ({error})", path.display()))?;
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     Ok(format!("{:x}", hasher.finalize()))
@@ -597,7 +601,10 @@ fn update_download_progress(state: &mut AppUpdateState, downloaded_bytes: u64, t
     state.download_progress_percent = if total_bytes == 0 {
         0
     } else {
-        downloaded_bytes.saturating_mul(100).min(total_bytes.saturating_mul(100)) / total_bytes
+        downloaded_bytes
+            .saturating_mul(100)
+            .min(total_bytes.saturating_mul(100))
+            / total_bytes
     };
 }
 
@@ -626,8 +633,14 @@ fn select_release_asset(
         .assets
         .iter()
         .find(|asset| {
-            asset.platform.trim().eq_ignore_ascii_case(&context.current_platform)
-                && asset.kind.trim().eq_ignore_ascii_case(&context.install_kind)
+            asset
+                .platform
+                .trim()
+                .eq_ignore_ascii_case(&context.current_platform)
+                && asset
+                    .kind
+                    .trim()
+                    .eq_ignore_ascii_case(&context.install_kind)
                 && !asset.name.trim().is_empty()
                 && !asset.download_url.trim().is_empty()
                 && !asset.sha256.trim().is_empty()
@@ -658,8 +671,8 @@ async fn fetch_latest_release_metadata() -> Result<ReleaseMetadata, String> {
         .bytes()
         .await
         .map_err(|error| format!("读取更新清单内容失败：{error}"))?;
-    let metadata =
-        serde_json::from_slice::<ReleaseMetadata>(&bytes).map_err(|error| format!("解析更新清单失败：{error}"))?;
+    let metadata = serde_json::from_slice::<ReleaseMetadata>(&bytes)
+        .map_err(|error| format!("解析更新清单失败：{error}"))?;
     validate_release_metadata(&metadata)?;
     Ok(metadata)
 }
@@ -707,10 +720,7 @@ fn spawn_detached_command(program: &str, args: &[String]) -> Result<(), String> 
     Ok(())
 }
 
-fn emit_state_after_update(
-    app: &AppHandle,
-    session: &AppUpdateSession,
-) -> AppUpdateState {
+fn emit_state_after_update(app: &AppHandle, session: &AppUpdateSession) -> AppUpdateState {
     let state = session.public_state.clone();
     emit_update_state(app, &state);
     state
@@ -799,7 +809,8 @@ impl AppUpdateManager {
             }
         };
 
-        let comparison = compare_semver_versions(metadata.version.trim(), context.current_version.trim());
+        let comparison =
+            compare_semver_versions(metadata.version.trim(), context.current_version.trim());
         let cached_path = downloaded_asset_path(&asset.name)?;
         let cached_ready = file_matches_sha256(&cached_path, &asset.sha256);
 
@@ -827,8 +838,10 @@ impl AppUpdateManager {
             };
             if cached_ready {
                 session.public_state.stage = "downloaded".to_string();
-                session.public_state.status_message =
-                    format!("新版本 {} 已准备完成，可以立即安装。", metadata.version.trim());
+                session.public_state.status_message = format!(
+                    "新版本 {} 已准备完成，可以立即安装。",
+                    metadata.version.trim()
+                );
                 update_download_progress(
                     &mut session.public_state,
                     asset.size_bytes,
@@ -870,8 +883,10 @@ impl AppUpdateManager {
             return self.mutate_state(app, |session, _| {
                 session.downloaded_file_path = Some(final_path.clone());
                 session.public_state.stage = "downloaded".to_string();
-                session.public_state.status_message =
-                    format!("新版本 {} 已准备完成，可以立即安装。", selected_release.metadata.version);
+                session.public_state.status_message = format!(
+                    "新版本 {} 已准备完成，可以立即安装。",
+                    selected_release.metadata.version
+                );
                 session.public_state.last_error.clear();
                 update_download_progress(
                     &mut session.public_state,
@@ -935,8 +950,9 @@ impl AppUpdateManager {
                     });
                 }
 
-                file.write_all(&chunk)
-                    .map_err(|error| format!("写入更新缓存失败：{} ({error})", part_path.display()))?;
+                file.write_all(&chunk).map_err(|error| {
+                    format!("写入更新缓存失败：{} ({error})", part_path.display())
+                })?;
                 hasher.update(&chunk);
                 downloaded_bytes = downloaded_bytes.saturating_add(chunk.len() as u64);
 
@@ -984,14 +1000,12 @@ impl AppUpdateManager {
             self.mutate_state(app, |session, _| {
                 session.downloaded_file_path = Some(final_path.clone());
                 session.public_state.stage = "downloaded".to_string();
-                session.public_state.status_message =
-                    format!("新版本 {} 已准备完成，可以立即安装。", selected_release.metadata.version);
-                session.public_state.last_error.clear();
-                update_download_progress(
-                    &mut session.public_state,
-                    response_total,
-                    response_total,
+                session.public_state.status_message = format!(
+                    "新版本 {} 已准备完成，可以立即安装。",
+                    selected_release.metadata.version
                 );
+                session.public_state.last_error.clear();
+                update_download_progress(&mut session.public_state, response_total, response_total);
             })
         }
         .await;
@@ -1064,8 +1078,8 @@ impl AppUpdateManager {
                             .to_string(),
                         frontend_exe_name: WINDOWS_FRONTEND_EXECUTABLE_NAME.to_string(),
                     };
-                    let plan_value =
-                        serde_json::to_value(&plan).map_err(|error| format!("序列化更新计划失败：{error}"))?;
+                    let plan_value = serde_json::to_value(&plan)
+                        .map_err(|error| format!("序列化更新计划失败：{error}"))?;
                     let plan_path = write_json_file("windows-update-plan", &plan_value)?;
                     let script_path =
                         write_script_file("windows-apply-update", ".ps1", windows_update_script())?;
@@ -1120,8 +1134,7 @@ impl AppUpdateManager {
                                 ".sh",
                                 linux_relaunch_script(),
                             )?;
-                            let relaunch_program =
-                                relaunch_script.to_string_lossy().to_string();
+                            let relaunch_program = relaunch_script.to_string_lossy().to_string();
                             spawn_detached_command(
                                 relaunch_program.as_str(),
                                 &[
@@ -1146,9 +1159,8 @@ impl AppUpdateManager {
                             let appimage_root = resolve_linux_appimage_root();
                             let releases_dir = appimage_root.join("releases");
                             ensure_directory(&releases_dir)?;
-                            let release_path = releases_dir.join(safe_asset_file_name(
-                                &selected_release.asset.name,
-                            )?);
+                            let release_path = releases_dir
+                                .join(safe_asset_file_name(&selected_release.asset.name)?);
                             fs::copy(&_downloaded_file_path, &release_path).map_err(|error| {
                                 format!(
                                     "写入 AppImage 发布文件失败：{} -> {} ({error})",
@@ -1158,11 +1170,11 @@ impl AppUpdateManager {
                             })?;
                             fs::set_permissions(&release_path, fs::Permissions::from_mode(0o755))
                                 .map_err(|error| {
-                                    format!(
-                                        "设置 AppImage 可执行权限失败：{} ({error})",
-                                        release_path.display()
-                                    )
-                                })?;
+                                format!(
+                                    "设置 AppImage 可执行权限失败：{} ({error})",
+                                    release_path.display()
+                                )
+                            })?;
                             let manifest = AppImageRuntimeManifest {
                                 version: selected_release.metadata.version.clone(),
                                 asset_name: selected_release.asset.name.clone(),
@@ -1173,8 +1185,10 @@ impl AppUpdateManager {
                             let manifest_path =
                                 appimage_root.join(APPIMAGE_RUNTIME_MANIFEST_FILE_NAME);
                             ensure_directory(&appimage_root)?;
-                            let manifest_bytes = serde_json::to_vec_pretty(&manifest)
-                                .map_err(|error| format!("序列化 AppImage 运行清单失败：{error}"))?;
+                            let manifest_bytes =
+                                serde_json::to_vec_pretty(&manifest).map_err(|error| {
+                                    format!("序列化 AppImage 运行清单失败：{error}")
+                                })?;
                             fs::write(&manifest_path, manifest_bytes).map_err(|error| {
                                 format!(
                                     "写入 AppImage 运行清单失败：{} ({error})",
@@ -1187,8 +1201,7 @@ impl AppUpdateManager {
                                 ".sh",
                                 linux_relaunch_script(),
                             )?;
-                            let relaunch_program =
-                                relaunch_script.to_string_lossy().to_string();
+                            let relaunch_program = relaunch_script.to_string_lossy().to_string();
                             spawn_detached_command(
                                 relaunch_program.as_str(),
                                 &[
@@ -1207,7 +1220,8 @@ impl AppUpdateManager {
                         }
                         _ => {
                             let error =
-                                "当前 Linux 运行来源暂不支持自动安装，请使用 .deb 或 AppImage。".to_string();
+                                "当前 Linux 运行来源暂不支持自动安装，请使用 .deb 或 AppImage。"
+                                    .to_string();
                             let _ = self.mutate_state(app, |session, _| {
                                 session.public_state.stage = "error".to_string();
                                 session.public_state.status_message = error.clone();
@@ -1477,7 +1491,10 @@ mod tests {
 
     #[test]
     fn compare_semver_versions_prefers_numeric_order() {
-        assert_eq!(compare_semver_versions("1.2.10", "1.2.2"), Ordering::Greater);
+        assert_eq!(
+            compare_semver_versions("1.2.10", "1.2.2"),
+            Ordering::Greater
+        );
         assert_eq!(compare_semver_versions("1.2.2", "1.2.10"), Ordering::Less);
         assert_eq!(compare_semver_versions("1.2.2", "1.2.2"), Ordering::Equal);
     }

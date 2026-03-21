@@ -111,7 +111,12 @@ fn normalize_geo_rule_set_value(raw_value: &str) -> String {
 }
 
 fn normalize_download_mode(raw_mode: Option<&str>) -> RuleSetDownloadMode {
-    match raw_mode.unwrap_or_default().trim().to_ascii_lowercase().as_str() {
+    match raw_mode
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "direct" => RuleSetDownloadMode::Direct,
         "proxy" => RuleSetDownloadMode::Proxy,
         _ => RuleSetDownloadMode::Auto,
@@ -173,11 +178,9 @@ fn ensure_bundled_rule_set_ready<R: Runtime>(
         return Ok(());
     };
     if let Some(parent) = target.path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("创建移动端规则集目录失败: {error}"))?;
+        fs::create_dir_all(parent).map_err(|error| format!("创建移动端规则集目录失败: {error}"))?;
     }
-    fs::copy(&source_path, &target.path)
-        .map_err(|error| format!("复制内置规则集失败: {error}"))?;
+    fs::copy(&source_path, &target.path).map_err(|error| format!("复制内置规则集失败: {error}"))?;
     Ok(())
 }
 
@@ -266,14 +269,18 @@ fn collect_rule_set_targets<R: Runtime>(
     Ok(targets_by_tag.into_values().collect())
 }
 
-async fn download_rule_set_file(url: &str, target_path: &Path, proxy_url: Option<&str>) -> Result<(), String> {
+async fn download_rule_set_file(
+    url: &str,
+    target_path: &Path,
+    proxy_url: Option<&str>,
+) -> Result<(), String> {
     if url.trim().is_empty() {
         return Err("rule-set url is empty".to_string());
     }
     let mut client_builder = reqwest::Client::builder().timeout(Duration::from_secs(45));
     if let Some(proxy) = proxy_url.map(str::trim).filter(|value| !value.is_empty()) {
-        let parsed_proxy =
-            reqwest::Proxy::all(proxy).map_err(|error| format!("invalid proxy url {proxy:?}: {error}"))?;
+        let parsed_proxy = reqwest::Proxy::all(proxy)
+            .map_err(|error| format!("invalid proxy url {proxy:?}: {error}"))?;
         client_builder = client_builder.proxy(parsed_proxy);
     }
     let client = client_builder
@@ -328,7 +335,8 @@ async fn download_target_by_mode(
             .map_err(|error| format!("{} 更新失败（直连: {error}）", target.tag)),
         RuleSetDownloadMode::Proxy => {
             if let Some(proxy) = non_empty_proxy_url {
-                let proxy_result = download_rule_set_file(&target.url, &target.path, Some(proxy)).await;
+                let proxy_result =
+                    download_rule_set_file(&target.url, &target.path, Some(proxy)).await;
                 if proxy_result.is_ok() {
                     return Ok(());
                 }
@@ -359,7 +367,8 @@ async fn download_target_by_mode(
         }
         RuleSetDownloadMode::Auto => {
             if let Some(proxy) = non_empty_proxy_url {
-                let proxy_error = download_rule_set_file(&target.url, &target.path, Some(proxy)).await;
+                let proxy_error =
+                    download_rule_set_file(&target.url, &target.path, Some(proxy)).await;
                 if proxy_error.is_ok() {
                     return Ok(());
                 }

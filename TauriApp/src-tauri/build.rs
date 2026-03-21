@@ -19,10 +19,7 @@ fn sync_windows_icon(source: &str, target: &str) {
     }
     if let Some(parent) = target_path.parent() {
         fs::create_dir_all(parent).unwrap_or_else(|error| {
-            panic!(
-                "failed to create icon dir {}: {error}",
-                parent.display()
-            )
+            panic!("failed to create icon dir {}: {error}", parent.display())
         });
     }
     fs::write(target_path, source_bytes)
@@ -71,10 +68,7 @@ fn sync_default_rule_sets(source: &str, target: &str) {
                 .unwrap_or_else(|| panic!("invalid rule-set file name: {}", entry_path.display())),
         );
         let source_bytes = fs::read(&entry_path).unwrap_or_else(|error| {
-            panic!(
-                "failed to read rule-set {}: {error}",
-                entry_path.display()
-            )
+            panic!("failed to read rule-set {}: {error}", entry_path.display())
         });
         let needs_write = match fs::read(&target_file_path) {
             Ok(current_bytes) => current_bytes != source_bytes,
@@ -98,7 +92,8 @@ fn main() {
     println!("cargo:rerun-if-changed=gen/android/app/src/main/assets/_up_/default-config/rule-set");
 
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let android_rule_set_source = manifest_dir.join("gen/android/app/src/main/assets/_up_/default-config/rule-set");
+    let android_rule_set_source =
+        manifest_dir.join("gen/android/app/src/main/assets/_up_/default-config/rule-set");
     let default_rule_set_target = manifest_dir.join("../default-config/rule-set");
 
     sync_windows_icon("../ico.ico", "icons/icon.ico");
