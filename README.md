@@ -7,7 +7,7 @@
 ## 项目目标
 
 - 提供类似 v2rayN 的易用体验与完整配置能力。
-- 当前已提供 Windows / Linux / Android 客户端；macOS / iOS 计划下个月发布。
+- 当前已提供 Windows / Linux / Android / macOS 客户端； iOS 计划下个月发布。
 - 使用前后端分离架构：Tauri 前端控制台 + Go 核心守护进程。
 
 ## 技术栈
@@ -48,7 +48,7 @@ docs/            # 架构、测试与设计文档
 - 相比 `1.3.0`，新增 Android 客户端链路与构建/发布接入。
 - 桌面端新增“请求监控”功能，可记录请求并按进程、域名、IP 进行筛选与生成规则草案。
 - Go 内核当前绑定 `sing-box 1.12.25`。
-- macOS / iOS 版本计划下个月发布。
+- iOS 版本计划下个月发布。
 
 ## 当前状态
 
@@ -117,7 +117,7 @@ docs/            # 架构、测试与设计文档
   - `客户端：构建：当前平台客户端`
   - Windows 会生成 `Bin/Wateray-windows`
   - Linux 会生成 `Bin/Wateray-linux`
-  - macOS 桌面端计划下个月发布
+  - macOS 会生成 `Bin/Wateray-linux`
 - 构建 Android 客户端：
   - `客户端：构建：Android`
   - 生成 `Bin/Wateray-Android`
