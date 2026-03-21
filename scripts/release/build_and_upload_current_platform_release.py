@@ -15,6 +15,7 @@ from scripts.build.common.build_manifest import (
     build_desktop_bundle_manifest,
     manifest_matches,
 )
+from scripts.build.platforms.macos import TARGET as MACOS_TARGET
 from scripts.build.platforms.windows import TARGET as WINDOWS_TARGET
 from scripts.build.targets.linux_package import linux_packages_are_current
 from scripts.build.targets.desktop import resolve_current_platform_id
@@ -54,6 +55,22 @@ def current_platform_release_assets_ready(platform_id: str, version: str) -> boo
             WINDOWS_TARGET.output_dir_name,
         )
         return manifest_matches(bundle_dir / DESKTOP_BUILD_MANIFEST_NAME, expected_manifest)
+    if platform_id == "macos":
+        bundle_dir = ROOT_DIR / "Bin" / MACOS_TARGET.output_dir_name
+        dmg_path = ROOT_DIR / "Bin" / f"{MACOS_TARGET.output_dir_name}.dmg"
+        required_paths = [
+            bundle_dir / MACOS_TARGET.frontend_entry_name,
+            bundle_dir / MACOS_TARGET.frontend_entry_name / "Contents" / "MacOS" / "core" / MACOS_TARGET.daemon_binary_name,
+            dmg_path,
+        ]
+        if not all(path.exists() for path in required_paths):
+            return False
+        expected_manifest = build_desktop_bundle_manifest(
+            MACOS_TARGET.platform_id,
+            version,
+            MACOS_TARGET.output_dir_name,
+        )
+        return manifest_matches(bundle_dir / DESKTOP_BUILD_MANIFEST_NAME, expected_manifest)
     return False
 
 
@@ -71,6 +88,9 @@ def build_current_platform_assets(platform_id: str, version: str) -> None:
                 "all",
             ]
         )
+        return
+    if platform_id == "macos":
+        run_command([sys.executable, str(ROOT_DIR / "scripts" / "build" / "desktop" / "build_macos_dmg.py")])
         return
     run_command([sys.executable, str(ROOT_DIR / "scripts" / "build" / "targets" / "build_current_platform_client.py")])
 

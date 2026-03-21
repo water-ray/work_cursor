@@ -14,9 +14,18 @@ import type {
   DaemonResponsePayload,
   TransportStatus,
 } from "@shared/daemon";
-import type { PlatformUpdateState, WaterayPlatformAdapter } from "../platform/adapterTypes";
+import type {
+  InstalledDesktopAppCandidate,
+  PlatformUpdateState,
+  WaterayPlatformAdapter,
+} from "../platform/adapterTypes";
+import {
+  clearWindowShutdownRequested,
+  markWindowShutdownRequested,
+} from "../platform/windowShutdownState";
 
 import { daemonTransportManager } from "./daemonTransportManager";
+import { getDaemonBaseURL } from "./daemonClient";
 import { destroyTray, ensureTray, restoreMainWindow } from "./tray";
 
 type WaterayDesktopApi = WaterayPlatformAdapter;
@@ -158,6 +167,50 @@ function createAppUpdateStateChangeListener(
   };
 }
 
+function formatWindowTraceError(error: unknown): string {
+  if (error instanceof Error && error.message.trim() !== "") {
+    return error.message.trim();
+  }
+  return String(error ?? "").trim() || "unknown";
+}
+
+function emitWindowFlowTrace(_stage: string, _detail?: string): void {}
+
+function prepareWindowShutdown(reason: string): void {
+  emitWindowFlowTrace("desktop_window.prepare_shutdown", reason);
+  markWindowShutdownRequested();
+}
+
+async function shutdownDaemonFromDesktop(reason: string): Promise<boolean> {
+  emitWindowFlowTrace("desktop_window.daemon_shutdown.request_start", reason);
+  const response = await daemonTransportManager.request({
+    method: "POST",
+    path: "/v1/system/shutdown",
+    body: {},
+    timeoutMs: 5000,
+  });
+  if (!response.ok) {
+    emitWindowFlowTrace(
+      "desktop_window.daemon_shutdown.request_failed",
+      response.error ?? "daemon request failed",
+    );
+    return false;
+  }
+  emitWindowFlowTrace("desktop_window.daemon_shutdown.request_resolved", reason);
+  return true;
+}
+
+function pauseDaemonTransportForWindowShutdown(reason: string): void {
+  emitWindowFlowTrace("desktop_window.transport_pause.start", reason);
+  daemonTransportManager.pauseReconnectForWindowShutdown();
+  emitWindowFlowTrace("desktop_window.transport_pause.done", reason);
+}
+
+function rollbackWindowShutdownPreparation(): void {
+  emitWindowFlowTrace("desktop_window.rollback_shutdown");
+  clearWindowShutdownRequested();
+}
+
 function createDesktopApi(): WaterayDesktopApi {
   return {
     window: {
@@ -183,16 +236,81 @@ function createDesktopApi(): WaterayDesktopApi {
         return true;
       },
       close: async () => {
-        await invoke("window_close_panel_keep_core");
+        emitWindowFlowTrace("desktop_window.close.invoke_start");
+        prepareWindowShutdown("close");
+        try {
+          await invoke("window_close_panel_keep_core");
+          emitWindowFlowTrace("desktop_window.close.invoke_resolved");
+        } catch (error) {
+          emitWindowFlowTrace(
+            "desktop_window.close.invoke_rejected",
+            formatWindowTraceError(error),
+          );
+          rollbackWindowShutdownPreparation();
+          throw error;
+        }
       },
       closePanelKeepCore: async () => {
-        await invoke("window_close_panel_keep_core");
+        emitWindowFlowTrace("desktop_window.close_panel_keep_core.invoke_start");
+        prepareWindowShutdown("close_panel_keep_core");
+        try {
+          await invoke("window_close_panel_keep_core");
+          emitWindowFlowTrace("desktop_window.close_panel_keep_core.invoke_resolved");
+        } catch (error) {
+          emitWindowFlowTrace(
+            "desktop_window.close_panel_keep_core.invoke_rejected",
+            formatWindowTraceError(error),
+          );
+          rollbackWindowShutdownPreparation();
+          throw error;
+        }
       },
       quitApp: async () => {
-        await invoke("window_quit_app");
+        emitWindowFlowTrace("desktop_window.quit_app.invoke_start");
+        prepareWindowShutdown("quit_app");
+        try {
+          await invoke("window_quit_app");
+          emitWindowFlowTrace("desktop_window.quit_app.invoke_resolved");
+        } catch (error) {
+          emitWindowFlowTrace(
+            "desktop_window.quit_app.invoke_rejected",
+            formatWindowTraceError(error),
+          );
+          rollbackWindowShutdownPreparation();
+          throw error;
+        }
       },
       quitAll: async () => {
-        await invoke("window_quit_all");
+        const daemonBaseUrl = getDaemonBaseURL();
+        emitWindowFlowTrace(
+          "desktop_window.quit_all.invoke_start",
+          `daemonBaseUrl=${daemonBaseUrl}`,
+        );
+        prepareWindowShutdown("quit_all");
+        try {
+          const daemonShutdownHandled = await shutdownDaemonFromDesktop("quit_all");
+          emitWindowFlowTrace(
+            "desktop_window.quit_all.daemon_shutdown_result",
+            `handled=${daemonShutdownHandled}`,
+          );
+          pauseDaemonTransportForWindowShutdown("quit_all");
+          emitWindowFlowTrace(
+            "desktop_window.quit_all.window_invoke_start",
+            `daemonBaseUrl=${daemonBaseUrl}; handled=${daemonShutdownHandled}`,
+          );
+          await invoke("window_quit_all", {
+            daemonBaseUrl,
+            daemonShutdownHandled,
+          });
+          emitWindowFlowTrace("desktop_window.quit_all.invoke_resolved");
+        } catch (error) {
+          emitWindowFlowTrace(
+            "desktop_window.quit_all.invoke_rejected",
+            formatWindowTraceError(error),
+          );
+          rollbackWindowShutdownPreparation();
+          throw error;
+        }
       },
       getAppIconDataUrl: () => resolveAppIconDataUrl(),
       isMaximized: () => getCurrentWindow().isMaximized(),
@@ -239,6 +357,10 @@ function createDesktopApi(): WaterayDesktopApi {
         invoke("system_write_text_file", { path, content }),
       writeTempTextFile: (fileName: string, content: string): Promise<string> =>
         invoke("system_write_temp_text_file", { fileName, content }),
+      getFileIconDataUrl: async (path: string, sizePx?: number): Promise<string | null> =>
+        invoke<string | null>("system_get_file_icon_data_url", { path, sizePx }),
+      listInstalledAppCandidates: async (): Promise<InstalledDesktopAppCandidate[]> =>
+        invoke<InstalledDesktopAppCandidate[]>("system_list_installed_app_candidates"),
       readClipboardText: async (): Promise<string> => readClipboardText(),
       writeClipboardText: async (content: string): Promise<void> => {
         await writeClipboardText(content ?? "");
@@ -274,6 +396,9 @@ function createDesktopApi(): WaterayDesktopApi {
 
 export async function installWaterayDesktop(): Promise<WaterayPlatformAdapter> {
   const desktopWindow = window as DesktopWindow;
+  clearWindowShutdownRequested();
+  daemonTransportManager.resumeAfterWindowShutdownPause();
+  emitWindowFlowTrace("desktop_window.install");
   const desktopApi = desktopWindow.__waterayDesktopAdapter ?? createDesktopApi();
   desktopWindow.__waterayDesktopAdapter = desktopApi;
 
@@ -310,6 +435,7 @@ export async function installWaterayDesktop(): Promise<WaterayPlatformAdapter> {
 
   if (import.meta.hot) {
     import.meta.hot.dispose(() => {
+      clearWindowShutdownRequested();
       daemonTransportManager.stop();
       void destroyTray();
       desktopWindow.__waterayDesktopAdapter = undefined;

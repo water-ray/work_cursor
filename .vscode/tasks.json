@@ -41,6 +41,13 @@
         "run",
         "dev"
       ],
+      "osx": {
+        "command": "/bin/zsh",
+        "args": [
+          "-lc",
+          "export PATH=\"$HOME/.local/node-current/bin:/usr/local/opt/node@20/bin:/usr/local/bin:/opt/homebrew/bin:$PATH\"; if [ -f \"$HOME/.cargo/env\" ]; then source \"$HOME/.cargo/env\"; fi; command -v npm >/dev/null 2>&1 || { echo \"npm not found. Please install Node.js and ensure npm is in PATH.\" >&2; exit 127; }; command -v cargo >/dev/null 2>&1 || { echo \"cargo not found. Please install Rust toolchain and ensure cargo is in PATH.\" >&2; exit 127; }; exec npm run dev"
+        ]
+      },
       "linux": {
         "command": "/bin/bash",
         "args": [
@@ -79,54 +86,6 @@
         "reveal": "always",
         "panel": "dedicated",
         "focus": true
-      }
-    },
-    {
-      "label": "客户端：检查：Tauri 类型检查",
-      "type": "shell",
-      "command": "npm run typecheck",
-      "linux": {
-        "command": "node node_modules/typescript/bin/tsc --noEmit"
-      },
-      "options": {
-        "cwd": "${workspaceFolder}/TauriApp"
-      },
-      "group": "build",
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "focus": false
-      }
-    },
-    {
-      "label": "共享：检查：平台边界",
-      "type": "shell",
-      "command": "python scripts/verify/validate_platform_boundaries.py",
-      "options": {
-        "cwd": "${workspaceFolder}"
-      },
-      "group": "build",
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "focus": false
-      }
-    },
-    {
-      "label": "共享：检查：平台独立构建",
-      "type": "shell",
-      "command": "python scripts/verify/check_platform_builds.py",
-      "options": {
-        "cwd": "${workspaceFolder}"
-      },
-      "group": "build",
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "focus": false
       }
     },
     {
@@ -183,6 +142,13 @@
       "label": "客户端：开发：运行当前平台内核",
       "type": "shell",
       "command": "python scripts/dev/run_waterayd.py",
+      "osx": {
+        "command": "/bin/zsh",
+        "args": [
+          "-lc",
+          "exec sudo env PATH=\"$PATH\" /usr/bin/python3 scripts/dev/run_waterayd.py"
+        ]
+      },
       "linux": {
         "command": "/bin/bash",
         "args": [
@@ -199,13 +165,20 @@
       "presentation": {
         "reveal": "always",
         "panel": "dedicated",
-        "focus": false
+        "focus": true
       }
     },
     {
       "label": "客户端：构建：当前平台客户端",
       "type": "shell",
       "command": "python scripts/build/targets/build_current_platform_client.py",
+      "osx": {
+        "command": "/bin/zsh",
+        "args": [
+          "-lc",
+          "if [ -f \"$HOME/.cargo/env\" ]; then source \"$HOME/.cargo/env\"; fi; exec python3 scripts/build/desktop/build_macos_dmg.py"
+        ]
+      },
       "options": {
         "cwd": "${workspaceFolder}"
       },
@@ -226,28 +199,6 @@
         "args": [
           "-lc",
           "source \"$HOME/.cargo/env\" && exec python3 scripts/build/targets/build_android_release.py"
-        ]
-      },
-      "options": {
-        "cwd": "${workspaceFolder}"
-      },
-      "group": "build",
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "focus": false
-      }
-    },
-    {
-      "label": "客户端：更新到 Android 模拟器 5554",
-      "type": "shell",
-      "command": "python scripts/build/targets/deploy_android_emulator.py --serial emulator-5554",
-      "linux": {
-        "command": "/bin/bash",
-        "args": [
-          "-lc",
-          "source \"$HOME/.cargo/env\" && exec python3 scripts/build/targets/deploy_android_emulator.py --serial emulator-5554"
         ]
       },
       "options": {
@@ -420,6 +371,13 @@
       "label": "公开发布：上传当前平台产物到 GitHub",
       "type": "shell",
       "command": "python scripts/release/build_and_upload_current_platform_release.py --repo \"${input:githubPublicRepo}\" --release-root-dir \"Bin/github-staging-release\"",
+      "osx": {
+        "command": "/bin/zsh",
+        "args": [
+          "-lc",
+          "if [ -f \"$HOME/.cargo/env\" ]; then source \"$HOME/.cargo/env\"; fi; exec python3 scripts/release/build_and_upload_current_platform_release.py --repo \"${input:githubPublicRepo}\" --release-root-dir \"Bin/github-staging-release\""
+        ]
+      },
       "linux": {
         "command": "/bin/bash",
         "args": [
@@ -459,9 +417,16 @@
       }
     },
     {
-      "label": "公开发布：触发 GitHub 汇总发布（Windows/Linux/Android）",
+      "label": "公开发布：触发 GitHub 汇总发布（Windows/Linux/macOS/Android）",
       "type": "shell",
       "command": "python scripts/release/dispatch_github_release_workflow.py --public-repo \"${input:githubPublicRepo}\"",
+      "osx": {
+        "command": "/bin/zsh",
+        "args": [
+          "-lc",
+          "exec python3 scripts/release/dispatch_github_release_workflow.py --public-repo \"${input:githubPublicRepo}\""
+        ]
+      },
       "linux": {
         "command": "/bin/bash",
         "args": [

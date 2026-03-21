@@ -24,6 +24,7 @@ from scripts.release.release_framework import (
     PLATFORM_DISPLAY_NAMES,
     PLATFORM_ORDER,
     ReleaseFrameworkError,
+    format_platform_delivery_labels,
     read_version,
     resolve_release_assets_in_dir,
     resolve_release_root_dir,
@@ -42,9 +43,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--platform",
-        choices=("current", "windows", "linux", "android"),
+        choices=("current", "windows", "linux", "macos", "android"),
         default="current",
-        help="要上传的平台：current / windows / linux / android，默认 current",
+        help="要上传的平台：current / windows / linux / macos / android，默认 current",
     )
     parser.add_argument(
         "--release-root-dir",
@@ -127,12 +128,13 @@ def build_staging_notes(version: str, uploaded_platforms: list[str]) -> str:
     missing = sorted(expected - uploaded)
     uploaded_labels = [PLATFORM_DISPLAY_NAMES.get(item, item) for item in sorted(uploaded)]
     missing_labels = [PLATFORM_DISPLAY_NAMES.get(item, item) for item in missing]
-    expected_labels = " / ".join(PLATFORM_DISPLAY_NAMES.get(item, item) for item in PLATFORM_ORDER)
+    expected_labels = " / ".join(format_platform_delivery_labels(list(PLATFORM_ORDER)))
     lines = [
         f"# Wateray staging v{version}",
         "",
-        f"当前 release 仅用于汇总 {expected_labels} 构建产物，正式发布将由 GitHub Actions 统一执行。",
+        "当前 staging release 仅用于汇总各平台待发布产物，不直接作为最终对外发布说明。",
         "",
+        f"- 目标平台：{expected_labels}",
         f"- 已上传平台：{', '.join(uploaded_labels) if uploaded_labels else '无'}",
         f"- 缺少平台：{', '.join(missing_labels) if missing_labels else '无'}",
     ]
@@ -154,6 +156,7 @@ def ensure_staging_release(repo: str, tag: str, title: str, *, dry_run: bool) ->
     if dry_run:
         print(f"[dry-run] 将创建 staging release：{repo} {tag}")
         return
+    expected_labels = " / ".join(format_platform_delivery_labels(list(PLATFORM_ORDER)))
     run_command(
         [
             "gh",
@@ -165,7 +168,7 @@ def ensure_staging_release(repo: str, tag: str, title: str, *, dry_run: bool) ->
             "--title",
             title,
             "--notes",
-            "等待 Windows / Linux / Android 客户端产物上传完成后，由 GitHub Actions 统一汇总正式发布。",
+            f"等待以下平台产物上传完成后，由 GitHub Actions 统一汇总正式发布：{expected_labels}",
             "--draft",
             "--prerelease",
         ]

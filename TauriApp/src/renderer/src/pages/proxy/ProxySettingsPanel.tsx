@@ -191,6 +191,7 @@ export function ProxySettingsPanel({
   runAction,
 }: ProxySettingsPanelProps) {
   const proxyPagePlatform = getProxyPagePlatformConfig();
+  const supportsSniffOverrideDestination = proxyPagePlatform.supportsSniffOverrideDestination;
   const configActionSupported = !isMobileRuntime();
   const notice = useAppNotice();
   const draftNotice = useDraftNotice();
@@ -664,7 +665,10 @@ export function ProxySettingsPanel({
       settingsInput.sniffEnabled = sniffEnabled;
       settingsChanged = true;
     }
-    if (sniffOverrideDestination !== (snapshot.sniffOverrideDestination ?? true)) {
+    if (
+      supportsSniffOverrideDestination &&
+      sniffOverrideDestination !== (snapshot.sniffOverrideDestination ?? true)
+    ) {
       settingsInput.sniffOverrideDestination = sniffOverrideDestination;
       settingsChanged = true;
     }
@@ -776,14 +780,6 @@ export function ProxySettingsPanel({
         label={proxyPagePlatform.modeSwitchLabel}
         helpContent={proxyPagePlatform.modeSwitchHelpContent}
       />
-      {proxyPagePlatform.modeSwitchAlertDescription ? (
-        <Alert
-          showIcon
-          type="info"
-          message="Android 模式说明"
-          description={proxyPagePlatform.modeSwitchAlertDescription}
-        />
-      ) : null}
       <SwitchWithLabel
         checked={clearDNSCacheOnRestart}
         disabled={!snapshot || loading || serviceActionBusy || applyingProxyDraft}
@@ -1004,20 +1000,26 @@ export function ProxySettingsPanel({
             caution: "关闭后很多基于域名的精细规则会退化。",
           }}
         />
-        <SwitchWithLabel
-          checked={sniffOverrideDestination}
-          disabled={!sniffEnabled || applyingProxyDraft}
-          onChange={(checked) => {
-            setSniffOverrideDestination(checked);
-            setProxyDraftDirty(true);
-          }}
-          label="覆盖目标地址（sniff_override_destination）"
-          helpContent={{
-            scene: "目标地址是 IP 但实际请求有域名（SNI/Host）时。",
-            effect: "用嗅探到的域名覆盖目标地址，提升域名规则命中率。",
-            caution: "个别应用可能依赖原始目标地址，遇兼容性问题可尝试关闭。",
-          }}
-        />
+        {supportsSniffOverrideDestination ? (
+          <SwitchWithLabel
+            checked={sniffOverrideDestination}
+            disabled={!sniffEnabled || applyingProxyDraft}
+            onChange={(checked) => {
+              setSniffOverrideDestination(checked);
+              setProxyDraftDirty(true);
+            }}
+            label="覆盖目标地址（sniff_override_destination）"
+            helpContent={{
+              scene: "目标地址是 IP 但实际请求有域名（SNI/Host）时。",
+              effect: "用嗅探到的域名覆盖目标地址，提升域名规则命中率。",
+              caution: "个别应用可能依赖原始目标地址，遇兼容性问题可尝试关闭。",
+            }}
+          />
+        ) : (
+          <Typography.Text type="secondary">
+            当前桌面运行时暂不支持目标地址覆盖；桌面端仅保留嗅探与嗅探超时设置。
+          </Typography.Text>
+        )}
         <HelpLabel
           label="嗅探超时（毫秒）"
           helpContent={{

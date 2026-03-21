@@ -104,6 +104,8 @@ export class LoopbackRpcClient {
 
   private status: TransportStatus = createInitialStatus();
 
+  private inactiveReason = "连接已关闭";
+
   constructor(options: LoopbackRpcClientOptions) {
     this.options = {
       name: options.name,
@@ -125,6 +127,7 @@ export class LoopbackRpcClient {
       return;
     }
     this.shouldRun = true;
+    this.inactiveReason = "";
     this.updateStatus({
       state: "connecting",
       lastError: "",
@@ -133,6 +136,7 @@ export class LoopbackRpcClient {
   }
 
   stop(reason = "连接已关闭"): void {
+    this.inactiveReason = reason;
     this.shouldRun = false;
     this.clearReconnectTimer();
     this.disposeSocket();
@@ -142,6 +146,20 @@ export class LoopbackRpcClient {
       daemonReachable: false,
       pushConnected: false,
       lastError: reason,
+      consecutiveFailures: 0,
+    });
+  }
+
+  pauseReconnect(reason = "连接已关闭"): void {
+    this.inactiveReason = reason;
+    this.shouldRun = false;
+    this.clearReconnectTimer();
+    this.updateStatus({
+      state: "offline",
+      daemonReachable: false,
+      pushConnected: false,
+      lastError: reason,
+      consecutiveFailures: 0,
     });
   }
 
@@ -330,6 +348,17 @@ export class LoopbackRpcClient {
         if (this.socket === ws) {
           this.socket = null;
           this.helloAcked = false;
+          if (!this.shouldRun) {
+            this.rejectPendingRequests(this.inactiveReason);
+            this.updateStatus({
+              state: "offline",
+              daemonReachable: false,
+              pushConnected: false,
+              lastError: this.inactiveReason,
+              consecutiveFailures: 0,
+            });
+            return;
+          }
           this.rejectPendingRequests(`${this.options.name} WS 连接已断开`);
           this.markFailure(`${this.options.name} WS 连接已断开`);
           this.scheduleReconnect();

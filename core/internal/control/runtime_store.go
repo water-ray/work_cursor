@@ -4307,7 +4307,13 @@ func buildStartPrecheckResult(
 		appendBlocker(StartPrecheckIssueNodeNotConfigured, "当前未配置节点")
 	}
 
-	if !snapshot.RuntimeAdmin {
+	requiresRuntimeAdmin := true
+	if strings.EqualFold(strings.TrimSpace(snapshot.SystemType), "darwin") && targetMode == ProxyModeSystem {
+		// macOS system proxy mode can request admin authorization when applying proxy settings,
+		// so it should not force the whole runtime process to start as root.
+		requiresRuntimeAdmin = false
+	}
+	if requiresRuntimeAdmin && !snapshot.RuntimeAdmin {
 		appendBlocker(StartPrecheckIssueAdminRequired, "请以管理员方式启动")
 	}
 

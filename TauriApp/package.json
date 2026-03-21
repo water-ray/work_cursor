@@ -1,20 +1,20 @@
 {
   "name": "wateray-tauri-app",
-  "version": "1.5.1",
+  "version": "1.6.0",
   "private": true,
   "desktopName": "com.singbox.wateray.desktop",
   "description": "Wateray desktop frontend powered by Tauri v2 + React + Ant Design",
   "scripts": {
     "dev": "node scripts/run-tauri-dev.mjs dev",
-    "web:dev": "python ../scripts/build/common/build_renderer.py dev",
-    "build": "python ../scripts/build/common/build_renderer.py build",
-    "preview": "python ../scripts/build/common/build_renderer.py preview",
+    "web:dev": "node ../scripts/dev/run_python3_script.mjs ../scripts/build/common/build_renderer.py dev",
+    "build": "node ../scripts/dev/run_python3_script.mjs ../scripts/build/common/build_renderer.py build",
+    "preview": "node ../scripts/dev/run_python3_script.mjs ../scripts/build/common/build_renderer.py preview",
     "typecheck": "tsc --noEmit",
     "tauri": "tauri",
     "tauri:build": "tauri build",
     "android:init": "tauri android init --ci",
-    "android:dev": "python ../scripts/build/android/run_dev.py",
-    "android:build:debug": "python ../scripts/build/android/build_debug.py"
+    "android:dev": "node ../scripts/dev/run_python3_script.mjs ../scripts/build/android/run_dev.py",
+    "android:build:debug": "node ../scripts/dev/run_python3_script.mjs ../scripts/build/android/build_debug.py"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

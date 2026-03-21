@@ -8,6 +8,7 @@ import type {
 } from "@shared/daemon";
 
 import { LoopbackRpcClient } from "../platform/loopbackRpcClient";
+import { isWindowShutdownRequested } from "../platform/windowShutdownState";
 import { invokeDesktopTransportBootstrap, requestDaemon } from "./daemonClient";
 import { syncLinuxSystemProxyFromSnapshot } from "./linuxSystemProxySync";
 
@@ -16,6 +17,18 @@ type PushListener = (event: DaemonPushEvent) => void;
 const reconnectBaseDelayMs = 1000;
 const reconnectMaxDelayMs = 15000;
 const packagedRecoveryFailureThreshold = 3;
+const daemonShutdownRequestPath = "/v1/system/shutdown";
+const windowShutdownBlockedRequestMessage = "窗口退出中，已阻止新的内核请求";
+
+function normalizeRequestPath(rawPath: string): string {
+  try {
+    return new URL(rawPath, "http://127.0.0.1").pathname;
+  } catch {
+    return String(rawPath ?? "").split("?")[0] ?? "";
+  }
+}
+
+function emitDaemonTransportTrace(_stage: string, _detail?: string): void {}
 
 function normalizePushEvent(raw: unknown): DaemonPushEvent | null {
   if (!raw || typeof raw !== "object") {
@@ -57,6 +70,8 @@ class DaemonTransportManager {
   private recoveryInFlight = false;
 
   private listeners = new Set<PushListener>();
+
+  private windowShutdownPaused = false;
 
   private client = new LoopbackRpcClient({
     name: "desktop-daemon",
@@ -102,11 +117,25 @@ class DaemonTransportManager {
   }
 
   start(): void {
+    if (this.windowShutdownPaused) {
+      emitDaemonTransportTrace("daemon_transport.start_blocked", "reason=window_shutdown_pause");
+      return;
+    }
     this.client.start();
   }
 
   stop(): void {
+    this.windowShutdownPaused = false;
     this.client.stop("桌面端内核连接已关闭");
+  }
+
+  pauseReconnectForWindowShutdown(): void {
+    this.windowShutdownPaused = true;
+    this.client.pauseReconnect("桌面端窗口退出中，已暂停内核重连");
+  }
+
+  resumeAfterWindowShutdownPause(): void {
+    this.windowShutdownPaused = false;
   }
 
   subscribe(listener: PushListener): () => void {
@@ -121,9 +150,26 @@ class DaemonTransportManager {
   }
 
   async request(payload: DaemonRequestPayload): Promise<DaemonResponsePayload> {
-    this.start();
+    const normalizedPath = normalizeRequestPath(payload.path);
+    const isDaemonShutdownRequest = normalizedPath === daemonShutdownRequestPath;
+    if (!isDaemonShutdownRequest && (this.windowShutdownPaused || isWindowShutdownRequested())) {
+      emitDaemonTransportTrace(
+        "daemon_transport.request_blocked",
+        `path=${normalizedPath}; paused=${this.windowShutdownPaused}; shutdownRequested=${isWindowShutdownRequested()}`,
+      );
+      return {
+        ok: false,
+        error: windowShutdownBlockedRequestMessage,
+        transport: this.getStatus(),
+      };
+    }
+    if (!this.windowShutdownPaused) {
+      this.start();
+    }
     try {
-      const response = await this.client.call<DaemonResponsePayload>("daemon.request", payload);
+      const response = this.windowShutdownPaused
+        ? await requestDaemon(payload)
+        : await this.client.call<DaemonResponsePayload>("daemon.request", payload);
       if (response.snapshot) {
         void syncLinuxSystemProxyFromSnapshot(response.snapshot);
       }
@@ -159,7 +205,7 @@ class DaemonTransportManager {
   }
 
   private async maybeRecoverDaemon(): Promise<void> {
-    if (this.recoveryInFlight) {
+    if (this.recoveryInFlight || this.windowShutdownPaused || isWindowShutdownRequested()) {
       return;
     }
     this.recoveryInFlight = true;

@@ -37,4 +37,13 @@ export async function ensureTray(): Promise<TrayIcon> {
 
 export async function destroyTray(): Promise<void> {
   trayPromise = null;
+  const tray = await TrayIcon.getById(TRAY_ID).catch(() => null);
+  if (tray) {
+    await tray.close().catch(() => {
+      // Best effort early cleanup only.
+    });
+  }
+  await TrayIcon.removeById(TRAY_ID).catch(() => {
+    // Ignore cleanup races during shutdown / HMR.
+  });
 }

@@ -22,6 +22,9 @@ import { HelpLabel } from "../../components/form/HelpLabel";
 import { SwitchWithLabel } from "../../components/form/SwitchWithLabel";
 import { BiIcon } from "../../components/icons/BiIcon";
 import { useAppNotice } from "../../components/notify/AppNoticeProvider";
+import { useFileIcon } from "../../hooks/useFileIcon";
+import type { InstalledDesktopAppCandidate } from "../../platform/adapterTypes";
+import { getPlatformAdapter } from "../../platform/runtimeStore";
 import { daemonApi } from "../../services/daemonApi";
 import type {
   CreateRequestMonitorSessionRequestPayload,
@@ -46,6 +49,9 @@ interface RequestMonitorRecord {
   timestampMs: number;
   processName: string;
   processPath: string;
+  processDisplayName: string;
+  processDisplaySubtitle: string;
+  processIconPath: string;
   pid: number;
   domain: string;
   destinationIp: string;
@@ -81,6 +87,7 @@ interface RequestMonitorSession {
 const monitorDurationOptions = [10, 30, 60, 120];
 const monitorPageSize = 12;
 const monitorTableMaxHeightPx = 470;
+const processIconSizePx = 18;
 const filterKeyPresets = [
   "process:",
   "pid:",
@@ -129,6 +136,271 @@ function deriveProcessNameFromPath(path: string): string {
   }
   const segments = normalized.split(/[/\\]+/).filter(Boolean);
   return segments[segments.length - 1] ?? "";
+}
+
+function collectMacOSAppBundlePaths(path: string): string[] {
+  const normalized = path.trim().replace(/\\/g, "/").replace(/\/+$/, "");
+  if (normalized === "") {
+    return [];
+  }
+  const hasLeadingSlash = normalized.startsWith("/");
+  const parts = normalized
+    .split("/")
+    .filter((part, index) => !(hasLeadingSlash && index === 0 && part === ""))
+    .filter((part) => part !== "");
+  const bundles: string[] = [];
+  const currentParts: string[] = [];
+  for (const part of parts) {
+    currentParts.push(part);
+    if (/\.app$/i.test(part)) {
+      bundles.push(`${hasLeadingSlash ? "/" : ""}${currentParts.join("/")}`);
+    }
+  }
+  return bundles;
+}
+
+function normalizeAppCandidateMatchText(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+function tokenizeAppCandidateMatchText(value: string): string[] {
+  return normalizeAppCandidateMatchText(value)
+    .split(/[^a-z0-9]+/g)
+    .filter((token) => token.length >= 3);
+}
+
+function scoreInstalledAppCandidateMatch(
+  candidate: InstalledDesktopAppCandidate,
+  processName: string,
+  processPath: string,
+): number {
+  const normalizedProcessName = normalizeAppCandidateMatchText(processName);
+  const normalizedProcessPath = normalizeAppCandidateMatchText(processPath).replace(/\\/g, "/");
+  const candidateName = normalizeAppCandidateMatchText(candidate.name);
+  const candidatePath = normalizeAppCandidateMatchText(candidate.path).replace(/\\/g, "/");
+  const executableName = normalizeAppCandidateMatchText(candidate.executableName);
+  const bundleId = normalizeAppCandidateMatchText(candidate.bundleId);
+  if (candidatePath === "") {
+    return 0;
+  }
+  let score = 0;
+  if (candidateName !== "" && normalizedProcessPath.includes(`/stagedframeworks/${candidateName}/`)) {
+    score += 260;
+  }
+  if (
+    candidateName === "safari" &&
+    normalizedProcessName === "com.apple.webkit.networking" &&
+    normalizedProcessPath.includes("/webkit.framework/")
+  ) {
+    score += 260;
+  }
+  if (candidateName !== "" && normalizedProcessName.startsWith(`${candidateName} helper`)) {
+    score += 140;
+  }
+  if (executableName !== "" && normalizedProcessName.startsWith(`${executableName} helper`)) {
+    score += 140;
+  }
+  if (bundleId !== "" && normalizedProcessName === bundleId) {
+    score += 180;
+  }
+  if (candidateName !== "" && normalizedProcessPath.includes(`/${candidateName}/`)) {
+    score += 120;
+  }
+  if (executableName !== "" && normalizedProcessPath.includes(`/${executableName}/`)) {
+    score += 120;
+  }
+  if (candidateName !== "" && normalizedProcessName === candidateName) {
+    score += 80;
+  }
+  if (executableName !== "" && normalizedProcessName === executableName) {
+    score += 80;
+  }
+  const tokens = new Set([
+    ...tokenizeAppCandidateMatchText(candidate.name),
+    ...tokenizeAppCandidateMatchText(candidate.executableName),
+    ...tokenizeAppCandidateMatchText(candidate.bundleId)
+      .filter((token) => !["com", "app", "apple"].includes(token))
+      .slice(-3),
+  ]);
+  for (const token of tokens) {
+    if (normalizedProcessPath.includes(`/${token}/`)) {
+      score += 28;
+    }
+    if (normalizedProcessName.includes(token)) {
+      score += 18;
+    }
+  }
+  return score;
+}
+
+function matchInstalledAppCandidate(
+  processName: string,
+  processPath: string,
+  candidates: InstalledDesktopAppCandidate[],
+): InstalledDesktopAppCandidate | null {
+  let best: InstalledDesktopAppCandidate | null = null;
+  let bestScore = 0;
+  let runnerUpScore = 0;
+  for (const candidate of candidates) {
+    const score = scoreInstalledAppCandidateMatch(candidate, processName, processPath);
+    if (score <= 0) {
+      continue;
+    }
+    if (score > bestScore) {
+      runnerUpScore = bestScore;
+      bestScore = score;
+      best = candidate;
+      continue;
+    }
+    if (score > runnerUpScore) {
+      runnerUpScore = score;
+    }
+  }
+  if (best == null || bestScore < 90 || bestScore - runnerUpScore < 24) {
+    return null;
+  }
+  return best;
+}
+
+function resolveKnownMacOSProcessOwner(processName: string, processPath: string): {
+  displayName: string;
+  iconPath: string;
+} | null {
+  const normalizedName = processName.trim();
+  const normalizedPath = processPath.trim().replace(/\\/g, "/");
+  const normalizedLowerPath = normalizedPath.toLowerCase();
+  if (normalizedLowerPath.includes("/library/apple/system/library/stagedframeworks/safari/")) {
+    return {
+      displayName: "Safari",
+      iconPath: "/Applications/Safari.app",
+    };
+  }
+  if (normalizedName === "com.apple.WebKit.Networking" && normalizedLowerPath.includes("/webkit.framework/")) {
+    return {
+      displayName: "Safari",
+      iconPath: "/Applications/Safari.app",
+    };
+  }
+  return null;
+}
+
+function deriveProcessPresentation(
+  processName: string,
+  processPath: string,
+  installedApps: InstalledDesktopAppCandidate[] = [],
+): {
+  displayName: string;
+  displaySubtitle: string;
+  iconPath: string;
+} {
+  const normalizedName = processName.trim();
+  const normalizedPath = processPath.trim();
+  const bundlePath = collectMacOSAppBundlePaths(normalizedPath)[0] ?? "";
+  const bundleName = bundlePath
+    .split("/")
+    .filter(Boolean)
+    .at(-1)
+    ?.replace(/\.app$/i, "")
+    .trim();
+  if (bundleName) {
+    return {
+      displayName: bundleName,
+      displaySubtitle:
+        normalizedName !== "" &&
+        bundleName.trim().toLowerCase() !== normalizedName.toLowerCase()
+          ? normalizedName
+          : "",
+      iconPath: bundlePath,
+    };
+  }
+  const matchedInstalledApp = matchInstalledAppCandidate(normalizedName, normalizedPath, installedApps);
+  if (matchedInstalledApp) {
+    return {
+      displayName: matchedInstalledApp.name.trim() || normalizedName || deriveProcessNameFromPath(normalizedPath),
+      displaySubtitle:
+        normalizedName !== "" &&
+        matchedInstalledApp.name.trim().toLowerCase() !== normalizedName.toLowerCase()
+          ? normalizedName
+          : "",
+      iconPath: matchedInstalledApp.path.trim(),
+    };
+  }
+  const knownOwner = resolveKnownMacOSProcessOwner(normalizedName, normalizedPath);
+  if (knownOwner) {
+    return {
+      displayName: knownOwner.displayName,
+      displaySubtitle:
+        normalizedName !== "" &&
+        knownOwner.displayName.trim().toLowerCase() !== normalizedName.toLowerCase()
+          ? normalizedName
+          : "",
+      iconPath: knownOwner.iconPath,
+    };
+  }
+  const displayName = bundleName || normalizedName || deriveProcessNameFromPath(normalizedPath);
+  const displaySubtitle =
+    bundleName &&
+    normalizedName !== "" &&
+    bundleName.trim().toLowerCase() !== normalizedName.toLowerCase()
+      ? normalizedName
+      : "";
+  return {
+    displayName,
+    displaySubtitle,
+    iconPath: bundlePath || normalizedPath,
+  };
+}
+
+function MonitorProcessCell({ record }: { record: RequestMonitorRecord }) {
+  const processPath = record.processPath.trim();
+  const processIconPath = record.processIconPath.trim();
+  const displayName = record.processDisplayName || record.processName || "未知进程";
+  const icon = useFileIcon(processIconPath, processIconSizePx * 2);
+  return (
+    <div style={{ display: "flex", minWidth: 0, alignItems: "center", gap: 8 }}>
+      <div
+        style={{
+          width: processIconSizePx,
+          height: processIconSizePx,
+          borderRadius: 4,
+          overflow: "hidden",
+          background: "rgba(148, 163, 184, 0.16)",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          flex: "0 0 auto",
+          fontSize: 12,
+          color: "rgba(71, 85, 105, 0.9)",
+        }}
+      >
+        {icon.url ? (
+          <img
+            src={icon.url}
+            alt=""
+            aria-hidden="true"
+            style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }}
+          />
+        ) : (
+          <BiIcon name="grid" />
+        )}
+      </div>
+      <div style={{ display: "flex", minWidth: 0, flex: 1, flexDirection: "column" }}>
+        <Tooltip
+          title={
+            <div>
+              <div>{displayName}</div>
+              {record.processDisplaySubtitle ? <div>{record.processDisplaySubtitle}</div> : null}
+              {processPath ? <div>{processPath}</div> : null}
+            </div>
+          }
+        >
+          <Typography.Text strong ellipsis style={{ minWidth: 0 }}>
+            {displayName}
+          </Typography.Text>
+        </Tooltip>
+      </div>
+    </div>
+  );
 }
 
 function formatRecordScopeLabel(scope: RequestMonitorScope): string {
@@ -235,6 +507,8 @@ function buildDomainRegexRule(domain: string): string {
 function buildRecordSearchText(record: RequestMonitorRecord): string {
   return [
     record.processName,
+    record.processDisplayName,
+    record.processDisplaySubtitle,
     record.processPath,
     String(record.pid),
     record.domain,
@@ -339,7 +613,9 @@ function matchesPositiveFilterToken(record: RequestMonitorRecord, token: string)
   }
   switch (key) {
     case "process":
-      return `${record.processName} ${record.processPath}`.toLowerCase().includes(value);
+      return `${record.processName} ${record.processDisplayName} ${record.processDisplaySubtitle} ${record.processPath}`
+        .toLowerCase()
+        .includes(value);
     case "pid":
       return String(record.pid).includes(value);
     case "domain":
@@ -410,6 +686,11 @@ function buildFilterTokenOptions(records: RequestMonitorRecord[]): Array<{ label
   }
   for (const record of records) {
     appendFilterTokenOption(seen, options, record.processName ? `process:${record.processName}` : "");
+    appendFilterTokenOption(
+      seen,
+      options,
+      record.processDisplayName ? `process:${record.processDisplayName}` : "",
+    );
     appendFilterTokenOption(seen, options, record.pid > 0 ? `pid:${record.pid}` : "");
     appendFilterTokenOption(seen, options, record.domain ? `domain:${record.domain}` : "");
     appendFilterTokenOption(seen, options, record.destinationIp ? `ip:${record.destinationIp}` : "");
@@ -436,6 +717,7 @@ function buildFilterTokenOptions(records: RequestMonitorRecord[]): Array<{ label
 function mapApiRecordToPageRecord(
   record: ApiRequestMonitorRecord,
   fallbackId: string,
+  installedApps: InstalledDesktopAppCandidate[] = [],
 ): RequestMonitorRecord {
   const process = record.process ?? {};
   const request = record.request ?? {};
@@ -443,11 +725,15 @@ function mapApiRecordToPageRecord(
   const normalizedID = String(record.id ?? "").trim() || fallbackId;
   const processPath = String(process.path ?? "").trim();
   const processName = String(process.name ?? "").trim() || deriveProcessNameFromPath(processPath);
+  const processPresentation = deriveProcessPresentation(processName, processPath, installedApps);
   return {
     id: normalizedID,
     timestampMs: Math.max(0, normalizeInt(record.timestampMs, Date.now())),
     processName,
     processPath,
+    processDisplayName: processPresentation.displayName,
+    processDisplaySubtitle: processPresentation.displaySubtitle,
+    processIconPath: processPresentation.iconPath,
     pid: Math.max(0, normalizeInt(process.pid)),
     domain: String(request.domain ?? "").trim(),
     destinationIp: String(request.destinationIp ?? "").trim(),
@@ -467,6 +753,38 @@ function mapApiRecordToPageRecord(
       ? record.tags.map((item) => String(item).trim()).filter((item) => item !== "")
       : [],
   };
+}
+
+function remapSessionProcessPresentations(
+  sessions: RequestMonitorSession[],
+  installedApps: InstalledDesktopAppCandidate[],
+): RequestMonitorSession[] {
+  if (installedApps.length === 0) {
+    return sessions;
+  }
+  return sessions.map((session) => ({
+    ...session,
+    records: session.records.map((record) => {
+      const nextPresentation = deriveProcessPresentation(
+        record.processName,
+        record.processPath,
+        installedApps,
+      );
+      if (
+        nextPresentation.displayName === record.processDisplayName &&
+        nextPresentation.displaySubtitle === record.processDisplaySubtitle &&
+        nextPresentation.iconPath === record.processIconPath
+      ) {
+        return record;
+      }
+      return {
+        ...record,
+        processDisplayName: nextPresentation.displayName,
+        processDisplaySubtitle: nextPresentation.displaySubtitle,
+        processIconPath: nextPresentation.iconPath,
+      };
+    }),
+  }));
 }
 
 function mapSessionSummaryToPageSession(
@@ -536,8 +854,10 @@ function buildRulePreviewHelpContent(kind: RulePreviewKind) {
 
 export function MonitorPage({ loading, runAction, snapshot }: DaemonPageProps) {
   const notice = useAppNotice();
+  const platformAdapter = useMemo(() => getPlatformAdapter(), []);
   const previousRunningSessionIdsRef = useRef<string[]>([]);
   const countdownSyncSessionIdRef = useRef("");
+  const installedAppCandidatesRef = useRef<InstalledDesktopAppCandidate[]>([]);
 
   const [sessions, setSessions] = useState<RequestMonitorSession[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState<string>("");
@@ -571,6 +891,7 @@ export function MonitorPage({ loading, runAction, snapshot }: DaemonPageProps) {
     useState<DomainRuleContentMode>("suffix");
   const [ipRuleContentMode, setIpRuleContentMode] = useState<IpRuleContentMode>("ip");
   const [rulePreviewContent, setRulePreviewContent] = useState("");
+  const [installedAppCandidates, setInstalledAppCandidates] = useState<InstalledDesktopAppCandidate[]>([]);
 
   const syncSessions = useCallback(async (options: RequestMonitorRefreshOptions = {}) => {
     if (!options.silent) {
@@ -613,7 +934,11 @@ export function MonitorPage({ loading, runAction, snapshot }: DaemonPageProps) {
       try {
         const content = await daemonApi.getRequestMonitorSessionContent(normalizedSessionID);
         const records = (content.records ?? []).map((item, index) =>
-          mapApiRecordToPageRecord(item, `${normalizedSessionID}-${index + 1}`),
+          mapApiRecordToPageRecord(
+            item,
+            `${normalizedSessionID}-${index + 1}`,
+            installedAppCandidatesRef.current,
+          ),
         );
         setSessions((current) =>
           current.map((session) =>
@@ -638,6 +963,36 @@ export function MonitorPage({ loading, runAction, snapshot }: DaemonPageProps) {
     },
     [notice],
   );
+
+  useEffect(() => {
+    let active = true;
+    void platformAdapter.system
+      .listInstalledAppCandidates()
+      .then((candidates) => {
+        if (!active) {
+          return;
+        }
+        installedAppCandidatesRef.current = candidates;
+        setInstalledAppCandidates(candidates);
+      })
+      .catch(() => {
+        if (!active) {
+          return;
+        }
+        installedAppCandidatesRef.current = [];
+        setInstalledAppCandidates([]);
+      });
+    return () => {
+      active = false;
+    };
+  }, [platformAdapter]);
+
+  useEffect(() => {
+    if (installedAppCandidates.length === 0) {
+      return;
+    }
+    setSessions((current) => remapSessionProcessPresentations(current, installedAppCandidates));
+  }, [installedAppCandidates]);
 
   const selectedSession = useMemo(
     () => sessions.find((session) => session.id === selectedSessionId) ?? null,
@@ -996,13 +1351,9 @@ export function MonitorPage({ loading, runAction, snapshot }: DaemonPageProps) {
       {
         title: "进程",
         key: "process",
-        width: 180,
+        width: 220,
         ellipsis: true,
-        render: (_unused, record) => (
-          <Typography.Text strong ellipsis={{ tooltip: record.processPath || record.processName || "未知进程" }}>
-            {record.processName || "未知进程"}
-          </Typography.Text>
-        ),
+        render: (_unused, record) => <MonitorProcessCell record={record} />,
       },
       {
         title: "域名",

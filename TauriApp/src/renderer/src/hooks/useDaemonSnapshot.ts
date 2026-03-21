@@ -8,6 +8,7 @@ import {
 import { applyProbeResultPatchToSnapshot } from "../services/probeResultPatch";
 import { daemonTransportStore } from "../services/daemonTransportStore";
 import { getPlatformAdapter } from "../platform/runtimeStore";
+import { isWindowShutdownRequested } from "../platform/windowShutdownState";
 import { useDaemonTransport } from "./useDaemonTransport";
 
 type SnapshotAction = () => Promise<DaemonSnapshot>;
@@ -53,6 +54,10 @@ export function useDaemonSnapshot(options: UseDaemonSnapshotOptions = {}) {
   const sessionDisconnectedRef = useRef(false);
 
   const refresh = useCallback(async () => {
+    if (isWindowShutdownRequested()) {
+      setLoading(false);
+      return;
+    }
     try {
       const next = await daemonApi.getState(includeLogs);
       if (
@@ -323,14 +328,22 @@ export function useDaemonSnapshot(options: UseDaemonSnapshotOptions = {}) {
   }, [includeLogs]);
 
   useEffect(() => {
-    void refresh();
+    if (!isWindowShutdownRequested()) {
+      void refresh();
+    }
     const unsubscribe = getPlatformAdapter().daemon.onPushEvent((event) => {
       applyPushEvent(event);
     });
     const onRefreshRequest = () => {
+      if (isWindowShutdownRequested()) {
+        return;
+      }
       void refresh();
     };
     const timer = window.setInterval(() => {
+      if (isWindowShutdownRequested()) {
+        return;
+      }
       void refresh();
     }, fallbackRefreshIntervalMs);
     window.addEventListener(
@@ -348,6 +361,9 @@ export function useDaemonSnapshot(options: UseDaemonSnapshotOptions = {}) {
   }, [applyPushEvent, refresh]);
 
   useEffect(() => {
+    if (isWindowShutdownRequested()) {
+      return;
+    }
     if (!transport.daemonReachable) {
       return;
     }
@@ -372,11 +388,14 @@ export function useDaemonSnapshot(options: UseDaemonSnapshotOptions = {}) {
   ]);
 
   useEffect(() => {
+    if (isWindowShutdownRequested()) {
+      return;
+    }
     void daemonApi.setLogStreamEnabled(includeLogs).catch(() => {
       // Best effort: avoid breaking page rendering when daemon is temporarily unavailable.
     });
     return () => {
-      if (!includeLogs) {
+      if (!includeLogs || isWindowShutdownRequested()) {
         return;
       }
       void daemonApi.setLogStreamEnabled(false).catch(() => {
@@ -387,7 +406,7 @@ export function useDaemonSnapshot(options: UseDaemonSnapshotOptions = {}) {
 
   useEffect(() => {
     const touchSession = () => {
-      if (sessionDisconnectedRef.current) {
+      if (sessionDisconnectedRef.current || isWindowShutdownRequested()) {
         return;
       }
       const touchedAtMs = Date.now();
@@ -414,6 +433,9 @@ export function useDaemonSnapshot(options: UseDaemonSnapshotOptions = {}) {
         return;
       }
       sessionDisconnectedRef.current = true;
+      if (isWindowShutdownRequested()) {
+        return;
+      }
       void daemonApi.disconnectClientSession(sessionIDRef.current).catch(() => {
         // Best effort disconnect.
       });

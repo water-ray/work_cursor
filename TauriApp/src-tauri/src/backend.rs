@@ -1,13 +1,13 @@
+use base64::Engine as _;
+use sha2::{Digest, Sha256};
 use std::fs;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
-
-#[cfg(target_os = "linux")]
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(not(target_os = "linux"))]
 use std::process::Stdio;
@@ -48,10 +48,15 @@ const DAEMON_PROBE_TIMEOUT_MS: u64 = 1200;
 const DAEMON_READY_TIMEOUT_MS: u64 = 12_000;
 const DAEMON_READY_POLL_INTERVAL_MS: u64 = 300;
 const DAEMON_SHUTDOWN_TIMEOUT_MS: u64 = 1200;
+const FRONTEND_EXIT_DISPATCH_DELAY_MS: u64 = 50;
 const FRONTEND_READY_TIMEOUT_MOBILE_MS: u64 = 60_000;
 const FRONTEND_READY_TIMEOUT_DEV_MS: u64 = 20_000;
 const FRONTEND_READY_TIMEOUT_RELEASE_MS: u64 = 12_000;
 const MAX_TEXT_FILE_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_FILE_ICON_SIZE_PX: u32 = 20;
+const MIN_FILE_ICON_SIZE_PX: u32 = 16;
+const MAX_FILE_ICON_SIZE_PX: u32 = 128;
+const FILE_ICON_CACHE_MISS_SENTINEL: &str = "__WATERAY_ICON_MISS__";
 #[cfg(target_os = "windows")]
 const STARTUP_ERROR_WEBVIEW2_MISSING: &str = "WEBVIEW2_RUNTIME_MISSING";
 const STARTUP_ERROR_FRONTEND_TIMEOUT: &str = "FRONTEND_READY_TIMEOUT";
@@ -160,6 +165,15 @@ pub struct LoopbackTransportBootstrap {
     pub internal_ports: Option<LoopbackInternalPortBundle>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstalledDesktopAppCandidate {
+    pub name: String,
+    pub path: String,
+    pub executable_name: String,
+    pub bundle_id: String,
+}
+
 #[cfg(target_os = "linux")]
 struct LinuxSystemdUnitState {
     installed: bool,
@@ -235,6 +249,37 @@ impl FrontendStartupState {
     }
 }
 
+#[derive(Default)]
+pub struct DaemonBaseUrlState {
+    base_url: Mutex<Option<String>>,
+}
+
+#[derive(Default)]
+struct InstalledDesktopAppCandidatesCache {
+    refreshed_this_launch: bool,
+    candidates: Vec<InstalledDesktopAppCandidate>,
+}
+
+#[derive(Default)]
+pub struct InstalledDesktopAppCandidatesState {
+    cache: Mutex<InstalledDesktopAppCandidatesCache>,
+}
+
+impl DaemonBaseUrlState {
+    fn remember(&self, raw_base_url: &str) {
+        let Some(normalized_base_url) = normalize_daemon_base_url(raw_base_url) else {
+            return;
+        };
+        if let Ok(mut guard) = self.base_url.lock() {
+            *guard = Some(normalized_base_url);
+        }
+    }
+
+    fn get(&self) -> Option<String> {
+        self.base_url.lock().ok().and_then(|guard| guard.clone())
+    }
+}
+
 #[cfg(target_os = "android")]
 fn runtime_platform_kind() -> &'static str {
     "android"
@@ -257,15 +302,26 @@ fn is_mobile_platform() -> bool {
 #[tauri::command]
 pub fn runtime_platform_info() -> RuntimePlatformInfo {
     let contract = platform_contracts::resolve_runtime_platform_contract(runtime_platform_kind());
+    let supports_packaged_daemon = if cfg!(target_os = "macos") {
+        false
+    } else {
+        contract.supports_packaged_daemon
+    };
+    let supports_system_proxy_mode = contract.supports_system_proxy_mode;
+    let supports_in_app_updates = if cfg!(target_os = "macos") {
+        false
+    } else {
+        contract.supports_in_app_updates
+    };
     RuntimePlatformInfo {
         kind: contract.kind.to_string(),
         is_mobile: contract.is_mobile,
         supports_window_controls: contract.supports_window_controls,
         supports_tray: contract.supports_tray,
-        supports_packaged_daemon: contract.supports_packaged_daemon,
-        supports_system_proxy_mode: contract.supports_system_proxy_mode,
+        supports_packaged_daemon,
+        supports_system_proxy_mode,
         supports_local_file_access: contract.supports_local_file_access,
-        supports_in_app_updates: contract.supports_in_app_updates,
+        supports_in_app_updates,
         supports_mobile_vpn_host: contract.supports_mobile_vpn_host,
         requires_sandbox_data_root: contract.requires_sandbox_data_root,
     }
@@ -294,6 +350,18 @@ fn restore_main_window(app: &AppHandle) {
     let _ = window.set_focus();
 }
 
+fn trace_window_flow(_stage: &str, _detail: &str) {}
+
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn hide_tray_icon(app: &AppHandle) {
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        let _ = tray.set_visible(false);
+    }
+}
+
+#[cfg(any(target_os = "android", target_os = "ios"))]
+fn hide_tray_icon(_app: &AppHandle) {}
+
 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 fn should_restore_main_window_from_tray_event(event: &TrayIconEvent) -> bool {
     matches!(
@@ -310,25 +378,69 @@ fn should_restore_main_window_from_tray_event(event: &TrayIconEvent) -> bool {
     )
 }
 
-fn close_panel_keep_core(app: AppHandle) {
-    tauri::async_runtime::spawn(async move {
+#[cfg(target_os = "macos")]
+fn schedule_frontend_exit(_app: AppHandle) {
+    trace_window_flow("schedule_frontend_exit", "");
+    std::thread::spawn(move || {
+        // Let async command responses flush before touching the webview/window lifecycle.
+        std::thread::sleep(Duration::from_millis(FRONTEND_EXIT_DISPATCH_DELAY_MS));
+        trace_window_flow("frontend_exit_task.begin", "mode=macos");
+        trace_window_flow("frontend_exit_task.process_exit", "mode=macos");
+        std::process::exit(0);
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn schedule_frontend_exit(app: AppHandle) {
+    trace_window_flow("schedule_frontend_exit", "");
+    std::thread::spawn(move || {
+        // Let async command responses flush before touching the webview/window lifecycle.
+        std::thread::sleep(Duration::from_millis(FRONTEND_EXIT_DISPATCH_DELAY_MS));
+        trace_window_flow("frontend_exit_task.begin", "");
         hide_main_window(&app);
-        sleep(Duration::from_millis(10)).await;
+        hide_tray_icon(&app);
+        std::thread::sleep(Duration::from_millis(10));
+        trace_window_flow("frontend_exit_task.app_exit", "");
         app.exit(0);
     });
 }
 
-fn quit_all(app: AppHandle) {
-    tauri::async_runtime::spawn(async move {
-        hide_main_window(&app);
-        #[cfg(target_os = "linux")]
-        if let Err(error) = clear_linux_system_proxy() {
-            eprintln!("failed to clear linux system proxy before quit: {error}");
-        }
-        shutdown_daemon_best_effort().await;
-        sleep(Duration::from_millis(10)).await;
-        app.exit(0);
-    });
+fn close_panel_keep_core_now(app: AppHandle) {
+    trace_window_flow("close_panel_keep_core.begin", "");
+    schedule_frontend_exit(app);
+}
+
+async fn close_panel_keep_core(app: AppHandle) {
+    close_panel_keep_core_now(app);
+}
+
+fn quit_all_after_daemon_shutdown(app: AppHandle) {
+    trace_window_flow("quit_all.begin", "");
+    trace_window_flow("quit_all.daemon_shutdown_already_handled", "");
+    trace_window_flow("quit_all.after_daemon_shutdown", "");
+    schedule_frontend_exit(app);
+}
+
+async fn quit_all(
+    app: AppHandle,
+    explicit_daemon_base_url: Option<String>,
+    daemon_shutdown_handled: bool,
+) {
+    trace_window_flow("quit_all.begin", "");
+    #[cfg(target_os = "linux")]
+    if let Err(error) = clear_linux_system_proxy() {
+        eprintln!("failed to clear linux system proxy before quit: {error}");
+    }
+    if daemon_shutdown_handled {
+        trace_window_flow("quit_all.daemon_shutdown_already_handled", "");
+    } else {
+        let remembered_daemon_base_url = app
+            .try_state::<DaemonBaseUrlState>()
+            .and_then(|state| state.get());
+        shutdown_daemon_best_effort(explicit_daemon_base_url, remembered_daemon_base_url).await;
+    }
+    trace_window_flow("quit_all.after_daemon_shutdown", "");
+    schedule_frontend_exit(app);
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -344,6 +456,20 @@ pub fn apply_main_window_icon(app: &AppHandle) {
 
 #[cfg(any(target_os = "android", target_os = "ios"))]
 pub fn apply_main_window_icon(_app: &AppHandle) {}
+
+#[cfg(target_os = "macos")]
+pub fn apply_platform_window_chrome(app: &AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    trace_window_flow("platform_window_chrome.apply_native_macos", "");
+    if let Err(error) = window.set_decorations(true) {
+        trace_window_flow("platform_window_chrome.error", &error.to_string());
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn apply_platform_window_chrome(_app: &AppHandle) {}
 
 #[cfg(target_os = "linux")]
 pub fn cleanup_stale_linux_dev_desktop_override() {
@@ -436,8 +562,18 @@ pub fn ensure_system_tray(app: &AppHandle) -> Result<(), String> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
             TRAY_MENU_OPEN_MAIN_WINDOW => restore_main_window(app),
-            TRAY_MENU_QUIT_PANEL_ONLY => close_panel_keep_core(app.clone()),
-            TRAY_MENU_QUIT_ALL => quit_all(app.clone()),
+            TRAY_MENU_QUIT_PANEL_ONLY => {
+                let app_handle = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    close_panel_keep_core(app_handle).await;
+                });
+            }
+            TRAY_MENU_QUIT_ALL => {
+                let app_handle = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    quit_all(app_handle, None, false).await;
+                });
+            }
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
@@ -487,6 +623,864 @@ fn ensure_text_file(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn normalize_file_icon_size(size_px: Option<u32>) -> u32 {
+    size_px
+        .unwrap_or(DEFAULT_FILE_ICON_SIZE_PX)
+        .clamp(MIN_FILE_ICON_SIZE_PX, MAX_FILE_ICON_SIZE_PX)
+}
+
+fn image_mime_from_path(path: &Path) -> Option<&'static str> {
+    let extension = path.extension()?.to_str()?.trim();
+    if extension.is_empty() {
+        return None;
+    }
+    match extension.to_ascii_lowercase().as_str() {
+        "png" => Some("image/png"),
+        "svg" => Some("image/svg+xml"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "ico" => Some("image/x-icon"),
+        _ => None,
+    }
+}
+
+fn encode_image_data_url(mime: &str, bytes: &[u8]) -> String {
+    format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    )
+}
+
+fn read_image_file_data_url(path: &Path) -> Option<String> {
+    let mime = image_mime_from_path(path)?;
+    let bytes = fs::read(path).ok()?;
+    Some(encode_image_data_url(mime, &bytes))
+}
+
+fn create_temp_icon_output_dir(prefix: &str) -> Option<PathBuf> {
+    let unique_suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    let output_dir = std::env::temp_dir()
+        .join("wateray")
+        .join("icons")
+        .join(format!("{prefix}-{}-{unique_suffix}", std::process::id()));
+    fs::create_dir_all(&output_dir).ok()?;
+    Some(output_dir)
+}
+
+fn cleanup_temp_icon_output_dir(path: &Path) {
+    let _ = fs::remove_dir_all(path);
+}
+
+fn build_file_icon_cache_key(target_path: &Path, size_px: u32) -> String {
+    let normalized_path = fs::canonicalize(target_path).unwrap_or_else(|_| target_path.to_path_buf());
+    let metadata = fs::metadata(&normalized_path).ok();
+    let modified_ms = metadata
+        .as_ref()
+        .and_then(|item| item.modified().ok())
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|value| value.as_millis())
+        .unwrap_or(0);
+    let file_len = metadata.as_ref().map(|item| item.len()).unwrap_or(0);
+    let mut hasher = Sha256::new();
+    hasher.update(normalized_path.to_string_lossy().as_bytes());
+    hasher.update(b"\n");
+    hasher.update(size_px.to_string().as_bytes());
+    hasher.update(b"\n");
+    hasher.update(modified_ms.to_string().as_bytes());
+    hasher.update(b"\n");
+    hasher.update(file_len.to_string().as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn resolve_file_icon_cache_dir(app: &AppHandle) -> Option<PathBuf> {
+    app.path()
+        .app_data_dir()
+        .ok()
+        .map(|path| path.join("cache").join("appicons"))
+}
+
+fn resolve_installed_app_candidates_cache_path(app: &AppHandle) -> Option<PathBuf> {
+    Some(resolve_file_icon_cache_dir(app)?.join("macos-installed-apps.json"))
+}
+
+#[cfg(target_os = "macos")]
+fn read_cached_macos_installed_app_candidates(app: &AppHandle) -> Option<Vec<InstalledDesktopAppCandidate>> {
+    let cache_path = resolve_installed_app_candidates_cache_path(app)?;
+    let cached = fs::read_to_string(cache_path).ok()?;
+    serde_json::from_str::<Vec<InstalledDesktopAppCandidate>>(&cached).ok()
+}
+
+#[cfg(target_os = "macos")]
+fn write_cached_macos_installed_app_candidates(
+    app: &AppHandle,
+    candidates: &[InstalledDesktopAppCandidate],
+) {
+    let Some(cache_dir) = resolve_file_icon_cache_dir(app) else {
+        return;
+    };
+    if fs::create_dir_all(&cache_dir).is_err() {
+        return;
+    }
+    let Some(cache_path) = resolve_installed_app_candidates_cache_path(app) else {
+        return;
+    };
+    let Ok(payload) = serde_json::to_string_pretty(candidates) else {
+        return;
+    };
+    let _ = fs::write(cache_path, payload.as_bytes());
+}
+
+#[cfg(target_os = "macos")]
+fn collect_macos_installed_app_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(home_dir) = std::env::var_os("HOME").map(PathBuf::from) {
+        roots.push(home_dir.join("Applications"));
+    }
+    roots.push(PathBuf::from("/Applications"));
+    roots.push(PathBuf::from("/System/Applications"));
+    roots.push(PathBuf::from("/System/Cryptexes/App/System/Applications"));
+    roots.push(PathBuf::from("/System/Library/CoreServices/Applications"));
+    roots
+}
+
+#[cfg(target_os = "macos")]
+fn build_macos_installed_app_candidate(app_path: &Path) -> Option<InstalledDesktopAppCandidate> {
+    if !app_path.is_dir() {
+        return None;
+    }
+    let info_plist_path = app_path.join("Contents/Info.plist");
+    if !info_plist_path.is_file() {
+        return None;
+    }
+    let fallback_name = app_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("");
+    let name = read_macos_plist_string(&info_plist_path, "CFBundleDisplayName")
+        .or_else(|| read_macos_plist_string(&info_plist_path, "CFBundleName"))
+        .unwrap_or_else(|| fallback_name.to_string());
+    let executable_name = read_macos_plist_string(&info_plist_path, "CFBundleExecutable")
+        .unwrap_or_default();
+    let bundle_id = read_macos_plist_string(&info_plist_path, "CFBundleIdentifier")
+        .unwrap_or_default();
+    let normalized_name = name.trim().to_string();
+    if normalized_name.is_empty() {
+        return None;
+    }
+    Some(InstalledDesktopAppCandidate {
+        name: normalized_name,
+        path: app_path.to_string_lossy().to_string(),
+        executable_name,
+        bundle_id,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn scan_macos_installed_app_candidates() -> Vec<InstalledDesktopAppCandidate> {
+    let mut app_paths = Vec::new();
+    let mut stack = collect_macos_installed_app_roots()
+        .into_iter()
+        .map(|path| (path, 0usize))
+        .collect::<Vec<_>>();
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            if path
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(|value| value.eq_ignore_ascii_case("app"))
+                .unwrap_or(false)
+            {
+                if !app_paths.iter().any(|existing| existing == &path) {
+                    app_paths.push(path);
+                }
+                continue;
+            }
+            if depth < 4 {
+                stack.push((path, depth + 1));
+            }
+        }
+    }
+    let mut candidates = app_paths
+        .into_iter()
+        .filter_map(|path| build_macos_installed_app_candidate(&path))
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        left.name
+            .to_ascii_lowercase()
+            .cmp(&right.name.to_ascii_lowercase())
+            .then_with(|| left.path.to_ascii_lowercase().cmp(&right.path.to_ascii_lowercase()))
+    });
+    candidates
+}
+
+#[cfg(target_os = "macos")]
+fn list_installed_app_candidates_impl(
+    app: &AppHandle,
+    state: &InstalledDesktopAppCandidatesState,
+) -> Vec<InstalledDesktopAppCandidate> {
+    if let Ok(mut guard) = state.cache.lock() {
+        if guard.refreshed_this_launch {
+            return guard.candidates.clone();
+        }
+        let scanned = scan_macos_installed_app_candidates();
+        let resolved = if scanned.is_empty() {
+            read_cached_macos_installed_app_candidates(app).unwrap_or_default()
+        } else {
+            scanned
+        };
+        if !resolved.is_empty() {
+            write_cached_macos_installed_app_candidates(app, &resolved);
+        }
+        guard.refreshed_this_launch = true;
+        guard.candidates = resolved.clone();
+        return resolved;
+    }
+    let scanned = scan_macos_installed_app_candidates();
+    if !scanned.is_empty() {
+        write_cached_macos_installed_app_candidates(app, &scanned);
+        return scanned;
+    }
+    read_cached_macos_installed_app_candidates(app).unwrap_or_default()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn list_installed_app_candidates_impl(
+    _app: &AppHandle,
+    _state: &InstalledDesktopAppCandidatesState,
+) -> Vec<InstalledDesktopAppCandidate> {
+    Vec::new()
+}
+
+fn resolve_file_icon_cache_path(app: &AppHandle, target_path: &Path, size_px: u32) -> Option<PathBuf> {
+    Some(resolve_file_icon_cache_dir(app)?.join(format!(
+        "{}.txt",
+        build_file_icon_cache_key(target_path, size_px)
+    )))
+}
+
+fn read_cached_file_icon_data_url(
+    app: &AppHandle,
+    target_path: &Path,
+    size_px: u32,
+) -> Option<Option<String>> {
+    let cache_path = resolve_file_icon_cache_path(app, target_path, size_px)?;
+    let cached = fs::read_to_string(cache_path).ok()?;
+    let normalized = cached.trim();
+    if normalized.is_empty() || normalized == FILE_ICON_CACHE_MISS_SENTINEL {
+        let _ = fs::remove_file(resolve_file_icon_cache_path(app, target_path, size_px)?);
+        return None;
+    }
+    Some(Some(normalized.to_string()))
+}
+
+fn write_cached_file_icon_data_url(
+    app: &AppHandle,
+    target_path: &Path,
+    size_px: u32,
+    data_url: Option<&str>,
+) {
+    let Some(cache_path) = resolve_file_icon_cache_path(app, target_path, size_px) else {
+        return;
+    };    
+    let Some(payload) = data_url else {
+        let _ = fs::remove_file(cache_path);
+        return;
+    };
+    let Some(cache_dir) = resolve_file_icon_cache_dir(app) else {
+        return;
+    };
+    if fs::create_dir_all(&cache_dir).is_err() {
+        return;
+    }
+    let _ = fs::write(cache_path, payload.as_bytes());
+}
+
+fn resolve_file_icon_data_url_uncached(target_path: &Path, size_px: u32) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        return resolve_macos_file_icon_data_url(target_path, size_px);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return resolve_windows_file_icon_data_url(target_path, size_px);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return resolve_linux_file_icon_data_url(target_path, size_px);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        let _ = (target_path, size_px);
+        None
+    }
+}
+
+fn resolve_file_icon_data_url(app: &AppHandle, target_path: &Path, size_px: u32) -> Option<String> {
+    if let Some(cached) = read_cached_file_icon_data_url(app, target_path, size_px) {
+        return cached;
+    }
+    let data_url = resolve_file_icon_data_url_uncached(target_path, size_px);
+    write_cached_file_icon_data_url(app, target_path, size_px, data_url.as_deref());
+    data_url
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_known_macos_owner_bundle_roots(target_path: &Path) -> Vec<PathBuf> {
+    let normalized_path = fs::canonicalize(target_path).unwrap_or_else(|_| target_path.to_path_buf());
+    let normalized_text = normalized_path.to_string_lossy().to_ascii_lowercase();
+    let mut bundles = Vec::new();
+    if normalized_text.contains("/library/apple/system/library/stagedframeworks/safari/")
+        || (normalized_text.contains("/webkit.framework/") && normalized_text.contains("com.apple.webkit.networking"))
+    {
+        let safari_app = PathBuf::from("/Applications/Safari.app");
+        if safari_app.is_dir() {
+            bundles.push(safari_app);
+        }
+    }
+    bundles
+}
+
+#[cfg(target_os = "macos")]
+fn collect_macos_bundle_roots(target_path: &Path) -> Vec<PathBuf> {
+    let mut bundles = Vec::new();
+    if target_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.eq_ignore_ascii_case("app"))
+        .unwrap_or(false)
+    {
+        bundles.push(target_path.to_path_buf());
+    }
+    for ancestor in target_path.ancestors() {
+        if ancestor
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| value.eq_ignore_ascii_case("app"))
+            .unwrap_or(false)
+        {
+            if !bundles.iter().any(|path| path == ancestor) {
+                bundles.push(ancestor.to_path_buf());
+            }
+        }
+    }
+    bundles
+}
+
+#[cfg(target_os = "macos")]
+fn read_macos_plist_string(info_plist_path: &Path, key_path: &str) -> Option<String> {
+    let output = Command::new("/usr/bin/plutil")
+        .args(["-extract", key_path, "raw", "-o", "-"])
+        .arg(info_plist_path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() {
+        return None;
+    }
+    Some(value)
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_macos_bundle_icon_path(bundle_root: &Path) -> Option<PathBuf> {
+    let info_plist_path = bundle_root.join("Contents/Info.plist");
+    if !info_plist_path.is_file() {
+        return None;
+    }
+    let resources_dir = bundle_root.join("Contents/Resources");
+    let mut candidates = Vec::new();
+    if let Some(icon_value) = read_macos_plist_string(&info_plist_path, "CFBundleIconFile") {
+        let direct_candidate = resources_dir.join(&icon_value);
+        candidates.push(direct_candidate.clone());
+        if Path::new(&icon_value).extension().is_none() {
+            candidates.push(resources_dir.join(format!("{icon_value}.icns")));
+        }
+    }
+    if let Some(executable_name) = read_macos_plist_string(&info_plist_path, "CFBundleExecutable") {
+        candidates.push(resources_dir.join(format!("{executable_name}.icns")));
+    }
+    if let Some(existing) = candidates.into_iter().find(|path| path.is_file()) {
+        return Some(existing);
+    }
+    fs::read_dir(&resources_dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .map(|value| value.eq_ignore_ascii_case("icns"))
+                    .unwrap_or(false)
+        })
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_macos_file_icon_data_url(target_path: &Path, size_px: u32) -> Option<String> {
+    let icon_path = resolve_known_macos_owner_bundle_roots(target_path)
+        .into_iter()
+        .chain(collect_macos_bundle_roots(target_path))
+        .into_iter()
+        .find_map(|bundle_root| resolve_macos_bundle_icon_path(&bundle_root))?;
+    let output_dir = create_temp_icon_output_dir("macos")?;
+    let output_path = output_dir.join("icon.png");
+    let output = Command::new("/usr/bin/sips")
+        .args(["-s", "format", "png"])
+        .arg(&icon_path)
+        .arg("--resampleHeightWidthMax")
+        .arg(size_px.to_string())
+        .arg("--out")
+        .arg(&output_path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        cleanup_temp_icon_output_dir(&output_dir);
+        return None;
+    }
+    let data_url = read_image_file_data_url(&output_path);
+    cleanup_temp_icon_output_dir(&output_dir);
+    data_url
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_windows_file_icon_data_url(target_path: &Path, _size_px: u32) -> Option<String> {
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Drawing
+$path = $env:WATERAY_ICON_TARGET
+if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path -LiteralPath $path)) {
+  exit 0
+}
+$icon = [System.Drawing.Icon]::ExtractAssociatedIcon($path)
+if ($null -eq $icon) {
+  exit 0
+}
+$bitmap = $icon.ToBitmap()
+$stream = New-Object System.IO.MemoryStream
+try {
+  $bitmap.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
+  [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+  Write-Output ([Convert]::ToBase64String($stream.ToArray()))
+} finally {
+  if ($stream) { $stream.Dispose() }
+  if ($bitmap) { $bitmap.Dispose() }
+  if ($icon) { $icon.Dispose() }
+}
+"#;
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ])
+        .env("WATERAY_ICON_TARGET", target_path.as_os_str())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let encoded = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if encoded.is_empty() {
+        return None;
+    }
+    Some(format!("data:image/png;base64,{encoded}"))
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_linux_file_icon_data_url(target_path: &Path, size_px: u32) -> Option<String> {
+    let normalized_target = fs::canonicalize(target_path).unwrap_or_else(|_| target_path.to_path_buf());
+    let icon_path = resolve_linux_desktop_entry_icon_path(&normalized_target, size_px)
+        .or_else(|| resolve_linux_gio_icon_path(&normalized_target, size_px))?;
+    read_image_file_data_url(&icon_path)
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_linux_desktop_entry_icon_path(target_path: &Path, size_px: u32) -> Option<PathBuf> {
+    for entry_path in collect_linux_desktop_entry_paths() {
+        let Some((exec_value, icon_value)) = parse_linux_desktop_entry(&entry_path) else {
+            continue;
+        };
+        if !linux_desktop_entry_matches_target(&exec_value, target_path) {
+            continue;
+        }
+        if let Some(icon_path) = resolve_linux_icon_value_path(&icon_value, size_px) {
+            return Some(icon_path);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn collect_linux_desktop_entry_paths() -> Vec<PathBuf> {
+    let mut result = Vec::new();
+    let mut stack = collect_linux_desktop_entry_roots()
+        .into_iter()
+        .map(|path| (path, 0usize))
+        .collect::<Vec<_>>();
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if depth < 4 {
+                    stack.push((path, depth + 1));
+                }
+                continue;
+            }
+            if path
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(|value| value.eq_ignore_ascii_case("desktop"))
+                .unwrap_or(false)
+            {
+                result.push(path);
+            }
+        }
+    }
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn collect_linux_desktop_entry_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
+        roots.push(PathBuf::from(data_home).join("applications"));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let home_dir = PathBuf::from(home);
+        roots.push(home_dir.join(".local/share/applications"));
+    }
+    roots.push(PathBuf::from("/usr/local/share/applications"));
+    roots.push(PathBuf::from("/usr/share/applications"));
+    roots
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_desktop_entry(entry_path: &Path) -> Option<(String, String)> {
+    let content = fs::read_to_string(entry_path).ok()?;
+    let mut in_desktop_entry = false;
+    let mut exec_value: Option<String> = None;
+    let mut icon_value: Option<String> = None;
+    let mut desktop_type = String::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_desktop_entry = trimmed == "[Desktop Entry]";
+            continue;
+        }
+        if !in_desktop_entry {
+            continue;
+        }
+        if let Some(value) = trimmed.strip_prefix("Exec=") {
+            exec_value = Some(value.trim().to_string());
+            continue;
+        }
+        if trimmed.starts_with("Icon[") {
+            continue;
+        }
+        if let Some(value) = trimmed.strip_prefix("Icon=") {
+            icon_value = Some(value.trim().to_string());
+            continue;
+        }
+        if let Some(value) = trimmed.strip_prefix("Type=") {
+            desktop_type = value.trim().to_string();
+        }
+    }
+    if !desktop_type.is_empty() && !desktop_type.eq_ignore_ascii_case("Application") {
+        return None;
+    }
+    Some((exec_value?, icon_value?))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_desktop_entry_matches_target(exec_value: &str, target_path: &Path) -> bool {
+    let Some(program) = resolve_linux_exec_program(exec_value) else {
+        return false;
+    };
+    let normalized_target = fs::canonicalize(target_path).unwrap_or_else(|_| target_path.to_path_buf());
+    let target_name = normalized_target
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    let target_stem = normalized_target
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    let program_path = PathBuf::from(&program);
+    if program_path.is_absolute() && linux_paths_equal(&program_path, &normalized_target) {
+        return true;
+    }
+    let program_name = program_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    !program_name.is_empty() && (program_name == target_name || program_name == target_stem)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_paths_equal(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(lhs), Ok(rhs)) => lhs == rhs,
+        _ => false,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_linux_exec_program(exec_value: &str) -> Option<String> {
+    let tokens = tokenize_linux_exec_command(exec_value);
+    if tokens.is_empty() {
+        return None;
+    }
+    let mut index = 0usize;
+    if tokens
+        .get(index)
+        .map(|value| value.eq_ignore_ascii_case("env"))
+        .unwrap_or(false)
+    {
+        index += 1;
+        while index < tokens.len() && tokens[index].contains('=') {
+            index += 1;
+        }
+    }
+    while index < tokens.len() {
+        let token = tokens[index].trim();
+        if token.is_empty() || token.starts_with('%') {
+            index += 1;
+            continue;
+        }
+        return Some(token.to_string());
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn tokenize_linux_exec_command(raw: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for ch in raw.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if quote != Some('\'') => {
+                escaped = true;
+            }
+            '"' | '\'' if quote.is_none() => {
+                quote = Some(ch);
+            }
+            '"' | '\'' if quote == Some(ch) => {
+                quote = None;
+            }
+            _ if ch.is_whitespace() && quote.is_none() => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_linux_gio_icon_path(target_path: &Path, size_px: u32) -> Option<PathBuf> {
+    let args = vec![
+        "info".to_string(),
+        "-a".to_string(),
+        "standard::icon".to_string(),
+        target_path.to_string_lossy().to_string(),
+    ];
+    let output = run_command_capture("gio", &args, None).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    for icon_name in parse_linux_gio_icon_names(&text) {
+        if let Some(icon_path) = resolve_linux_icon_value_path(&icon_name, size_px) {
+            return Some(icon_path);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_gio_icon_names(text: &str) -> Vec<String> {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("standard::icon:") {
+            continue;
+        }
+        let Some((_, raw_values)) = trimmed.split_once(':') else {
+            continue;
+        };
+        return raw_values
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .collect();
+    }
+    Vec::new()
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_linux_icon_value_path(icon_value: &str, size_px: u32) -> Option<PathBuf> {
+    let trimmed = icon_value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let icon_path = PathBuf::from(trimmed);
+    if icon_path.is_absolute() && icon_path.is_file() {
+        return image_mime_from_path(&icon_path).map(|_| icon_path);
+    }
+    let icon_name = Path::new(trimmed)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(trimmed);
+    search_linux_icon_path(icon_name, size_px)
+}
+
+#[cfg(target_os = "linux")]
+fn search_linux_icon_path(icon_name: &str, size_px: u32) -> Option<PathBuf> {
+    let normalized_icon_name = icon_name.trim();
+    if normalized_icon_name.is_empty() {
+        return None;
+    }
+    let mut best_match: Option<(i32, PathBuf)> = None;
+    for root in collect_linux_icon_roots() {
+        let mut stack = vec![(root, 0usize)];
+        while let Some((dir, depth)) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if depth < 8 {
+                        stack.push((path, depth + 1));
+                    }
+                    continue;
+                }
+                let stem = path
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .map(str::trim)
+                    .unwrap_or("");
+                if stem != normalized_icon_name || image_mime_from_path(&path).is_none() {
+                    continue;
+                }
+                let score = score_linux_icon_path(&path, size_px);
+                match &best_match {
+                    Some((best_score, _)) if *best_score >= score => {}
+                    _ => best_match = Some((score, path)),
+                }
+            }
+        }
+    }
+    best_match.map(|(_, path)| path)
+}
+
+#[cfg(target_os = "linux")]
+fn collect_linux_icon_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        let home_dir = PathBuf::from(home);
+        roots.push(home_dir.join(".local/share/icons"));
+        roots.push(home_dir.join(".icons"));
+    }
+    roots.push(PathBuf::from("/usr/local/share/icons"));
+    roots.push(PathBuf::from("/usr/share/icons"));
+    roots.push(PathBuf::from("/usr/share/pixmaps"));
+    roots
+}
+
+#[cfg(target_os = "linux")]
+fn score_linux_icon_path(path: &Path, size_px: u32) -> i32 {
+    let mut score = match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => 40,
+        Some("svg") => 36,
+        Some("jpg") | Some("jpeg") => 24,
+        Some("gif") => 16,
+        Some("webp") => 20,
+        Some("ico") => 18,
+        _ => 0,
+    };
+    if let Some(icon_size) = parse_linux_icon_directory_size(path) {
+        let diff = (icon_size - size_px as i32).abs().min(96);
+        score += 128 - diff;
+    } else if path.to_string_lossy().contains("/scalable/") {
+        score += 96;
+    }
+    if path.to_string_lossy().contains("/apps/") {
+        score += 12;
+    }
+    score
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_icon_directory_size(path: &Path) -> Option<i32> {
+    for ancestor in path.ancestors() {
+        let name = ancestor.file_name()?.to_str()?.trim();
+        let Some((width, height)) = name.split_once('x') else {
+            continue;
+        };
+        let Some(parsed_width) = width.parse::<i32>().ok() else {
+            continue;
+        };
+        let Some(parsed_height) = height.parse::<i32>().ok() else {
+            continue;
+        };
+        if parsed_width > 0 && parsed_width == parsed_height {
+            return Some(parsed_width);
+        }
+    }
+    None
+}
+
 fn resolve_daemon_candidate_base_urls() -> Vec<String> {
     if let Ok(raw_url) = std::env::var("WATERAY_DAEMON_URL") {
         let normalized = raw_url.trim().trim_end_matches('/').to_string();
@@ -498,6 +1492,41 @@ fn resolve_daemon_candidate_base_urls() -> Vec<String> {
         .iter()
         .map(|port| format!("http://127.0.0.1:{port}"))
         .collect()
+}
+
+fn normalize_daemon_base_url(raw_base_url: &str) -> Option<String> {
+    let normalized = raw_base_url.trim().trim_end_matches('/').to_string();
+    if normalized.is_empty() {
+        return None;
+    }
+    Some(normalized)
+}
+
+fn build_daemon_base_url_candidates(
+    explicit_base_url: Option<String>,
+    remembered_base_url: Option<String>,
+) -> Vec<String> {
+    let mut candidates = Vec::new();
+    for raw_candidate in explicit_base_url
+        .into_iter()
+        .chain(remembered_base_url.into_iter())
+    {
+        let Some(normalized_candidate) = normalize_daemon_base_url(&raw_candidate) else {
+            continue;
+        };
+        if !candidates
+            .iter()
+            .any(|current| current == &normalized_candidate)
+        {
+            candidates.push(normalized_candidate);
+        }
+    }
+    for candidate in resolve_daemon_candidate_base_urls() {
+        if !candidates.iter().any(|current| current == &candidate) {
+            candidates.push(candidate);
+        }
+    }
+    candidates
 }
 
 async fn build_local_reqwest_client(timeout_ms: u64) -> Option<reqwest::Client> {
@@ -1053,21 +2082,55 @@ async fn wait_daemon_ready() -> bool {
     false
 }
 
-async fn shutdown_daemon_best_effort() {
-    let Some(base_url) = find_reachable_daemon_base_url().await else {
-        return;
-    };
-    let Some(client) = build_local_reqwest_client(DAEMON_SHUTDOWN_TIMEOUT_MS).await else {
-        return;
-    };
-    let url = format!("{}/v1/system/shutdown", base_url);
-    let _ = client
+async fn post_daemon_shutdown(
+    client: &reqwest::Client,
+    base_url: &str,
+) -> Result<reqwest::StatusCode, String> {
+    let url = format!("{}/v1/system/shutdown", base_url.trim_end_matches('/'));
+    let response = client
         .post(url)
         .header("Accept", "application/json")
         .header("Content-Type", "application/json; charset=utf-8")
         .body("{}")
         .send()
-        .await;
+        .await
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("HTTP {}", response.status()));
+    }
+    Ok(response.status())
+}
+
+async fn shutdown_daemon_best_effort(
+    explicit_daemon_base_url: Option<String>,
+    remembered_daemon_base_url: Option<String>,
+) {
+    trace_window_flow("shutdown_daemon_best_effort.begin", "");
+    let Some(client) = build_local_reqwest_client(DAEMON_SHUTDOWN_TIMEOUT_MS).await else {
+        trace_window_flow("shutdown_daemon_best_effort.skip", "client_build_failed");
+        return;
+    };
+    let candidates =
+        build_daemon_base_url_candidates(explicit_daemon_base_url, remembered_daemon_base_url);
+    for base_url in candidates {
+        trace_window_flow("shutdown_daemon_best_effort.try", &format!("base_url={base_url}"));
+        match post_daemon_shutdown(&client, &base_url).await {
+            Ok(status) => {
+                trace_window_flow(
+                    "shutdown_daemon_best_effort.done",
+                    &format!("base_url={base_url}; status={status}"),
+                );
+                return;
+            }
+            Err(error) => {
+                trace_window_flow(
+                    "shutdown_daemon_best_effort.try_failed",
+                    &format!("base_url={base_url}; error={error}"),
+                );
+            }
+        }
+    }
+    trace_window_flow("shutdown_daemon_best_effort.skip", "daemon_unreachable");
 }
 
 pub async fn ensure_packaged_daemon_running_impl() -> Result<(), String> {
@@ -1132,12 +2195,32 @@ pub async fn ensure_packaged_daemon_running() -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn daemon_transport_bootstrap() -> Result<LoopbackTransportBootstrap, String> {
-    ensure_packaged_daemon_running_impl().await?;
-    let base_url = find_reachable_daemon_base_url()
-        .await
-        .ok_or_else(|| "桌面端 loopback 控制面未就绪".to_string())?;
-    read_daemon_transport_bootstrap(&base_url).await
+pub async fn daemon_transport_bootstrap(
+    daemon_base_url_state: State<'_, DaemonBaseUrlState>,
+) -> Result<LoopbackTransportBootstrap, String> {
+    trace_window_flow("command.daemon_transport_bootstrap.begin", "");
+    if let Err(error) = ensure_packaged_daemon_running_impl().await {
+        trace_window_flow("command.daemon_transport_bootstrap.error", &error);
+        return Err(error);
+    }
+    let Some(base_url) = find_reachable_daemon_base_url().await else {
+        let error = "桌面端 loopback 控制面未就绪".to_string();
+        trace_window_flow("command.daemon_transport_bootstrap.error", &error);
+        return Err(error);
+    };
+    let bootstrap = match read_daemon_transport_bootstrap(&base_url).await {
+        Ok(value) => value,
+        Err(error) => {
+            trace_window_flow("command.daemon_transport_bootstrap.error", &error);
+            return Err(error);
+        }
+    };
+    daemon_base_url_state.remember(&base_url);
+    trace_window_flow(
+        "command.daemon_transport_bootstrap.ok",
+        &format!("base_url={base_url}"),
+    );
+    Ok(bootstrap)
 }
 
 #[cfg(target_os = "linux")]
@@ -1161,18 +2244,78 @@ pub fn linux_sync_system_proxy(enabled: bool, port: Option<u16>) -> Result<(), S
 
 #[tauri::command]
 pub fn window_close_panel_keep_core(app: AppHandle) -> Result<(), String> {
-    close_panel_keep_core(app);
-    Ok(())
+    trace_window_flow("command.window_close_panel_keep_core", "");
+    #[cfg(target_os = "macos")]
+    {
+        trace_window_flow("command.window_close_panel_keep_core.sync_path", "");
+        close_panel_keep_core_now(app);
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        tauri::async_runtime::spawn(async move {
+            trace_window_flow("command.window_close_panel_keep_core.task_begin", "");
+            close_panel_keep_core(app).await;
+        });
+        Ok(())
+    }
 }
 
 #[tauri::command]
 pub fn window_quit_app(app: AppHandle) -> Result<(), String> {
-    window_close_panel_keep_core(app)
+    trace_window_flow("command.window_quit_app", "");
+    #[cfg(target_os = "macos")]
+    {
+        trace_window_flow("command.window_quit_app.sync_path", "");
+        close_panel_keep_core_now(app);
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        tauri::async_runtime::spawn(async move {
+            trace_window_flow("command.window_quit_app.task_begin", "");
+            close_panel_keep_core(app).await;
+        });
+        Ok(())
+    }
 }
 
 #[tauri::command]
-pub fn window_quit_all(app: AppHandle) -> Result<(), String> {
-    quit_all(app);
+pub fn window_quit_all(
+    app: AppHandle,
+    daemon_base_url: Option<String>,
+    daemon_shutdown_handled: Option<bool>,
+) -> Result<(), String> {
+    trace_window_flow(
+        "command.window_quit_all",
+        daemon_base_url.as_deref().unwrap_or(""),
+    );
+    let handled = daemon_shutdown_handled.unwrap_or(false);
+    #[cfg(target_os = "macos")]
+    if handled {
+        trace_window_flow(
+            "command.window_quit_all.sync_path",
+            daemon_base_url.as_deref().unwrap_or(""),
+        );
+        quit_all_after_daemon_shutdown(app);
+        return Ok(());
+    }
+    #[cfg(not(target_os = "macos"))]
+    tauri::async_runtime::spawn(async move {
+        trace_window_flow(
+            "command.window_quit_all.task_begin",
+            daemon_base_url.as_deref().unwrap_or(""),
+        );
+        quit_all(app, daemon_base_url, handled).await;
+    });
+    #[cfg(target_os = "macos")]
+    tauri::async_runtime::spawn(async move {
+        trace_window_flow(
+            "command.window_quit_all.task_begin",
+            daemon_base_url.as_deref().unwrap_or(""),
+        );
+        quit_all(app, daemon_base_url, handled).await;
+    });
     Ok(())
 }
 
@@ -1241,6 +2384,35 @@ pub fn system_write_temp_text_file(file_name: String, content: String) -> Result
     fs::write(&file_path, content.as_bytes())
         .map_err(|error| format!("写入临时文件失败：{} ({error})", file_path.display()))?;
     Ok(file_path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub fn system_get_file_icon_data_url(
+    app: AppHandle,
+    path: String,
+    size_px: Option<u32>,
+) -> Result<Option<String>, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let target_path = PathBuf::from(trimmed);
+    if !target_path.exists() {
+        return Ok(None);
+    }
+    Ok(resolve_file_icon_data_url(
+        &app,
+        &target_path,
+        normalize_file_icon_size(size_px),
+    ))
+}
+
+#[tauri::command]
+pub fn system_list_installed_app_candidates(
+    app: AppHandle,
+    state: State<'_, InstalledDesktopAppCandidatesState>,
+) -> Result<Vec<InstalledDesktopAppCandidate>, String> {
+    Ok(list_installed_app_candidates_impl(&app, state.inner()))
 }
 
 #[tauri::command]

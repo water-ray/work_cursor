@@ -1590,7 +1590,7 @@ func buildRuntimeConfigWithControllerOptions(
 		}
 	}
 	dnsConfig := buildDNSConfig(snapshot)
-	routeRules := make([]any, 0, len(snapshot.RuleConfigV2.Rules)+4)
+	routeRules := make([]any, 0, len(snapshot.RuleConfigV2.Rules)+5)
 	if internalProxyPort > 0 {
 		routeRules = append(routeRules, map[string]any{
 			"inbound":  []string{"internal-helper-in"},
@@ -1611,6 +1611,9 @@ func buildRuntimeConfigWithControllerOptions(
 		},
 	)
 	routeRules = append(routeRules, buildTransportGuardRouteRules(snapshot)...)
+	if fakeipRouteRule := buildFakeIPRouteRule(snapshot); fakeipRouteRule != nil {
+		routeRules = append(routeRules, fakeipRouteRule)
+	}
 	routeRules = append(routeRules,
 		map[string]any{
 			"ip_is_private": true,
@@ -1734,10 +1737,10 @@ func buildTunInboundConfig(goos string, snapshot StateSnapshot) map[string]any {
 	if !isValidProxyTunStack(stack) {
 		stack = ProxyTunStackSystem
 	}
+	normalizedGOOS := strings.ToLower(strings.TrimSpace(goos))
 	inbound := map[string]any{
-		"type":           "tun",
-		"tag":            "tun-in",
-		"interface_name": defaultTunInterfaceName,
+		"type": "tun",
+		"tag":  "tun-in",
 		"address": []string{
 			"172.19.0.1/30",
 			"fdfe:dcba:9876::1/126",
@@ -1747,7 +1750,10 @@ func buildTunInboundConfig(goos string, snapshot StateSnapshot) map[string]any {
 		"mtu":          normalizeProxyTunMTU(snapshot.TunMTU),
 		"stack":        string(stack),
 	}
-	if strings.EqualFold(strings.TrimSpace(goos), "linux") {
+	if normalizedGOOS != "darwin" {
+		inbound["interface_name"] = defaultTunInterfaceName
+	}
+	if normalizedGOOS == "linux" {
 		// Linux 平台下官方推荐启用 auto_redirect 以提升透明代理性能与兼容性。
 		inbound["auto_redirect"] = true
 	}
@@ -1788,6 +1794,35 @@ func buildTransportGuardRouteRules(snapshot StateSnapshot) []any {
 		},
 	)
 	return rules
+}
+
+func buildFakeIPRouteRule(snapshot StateSnapshot) map[string]any {
+	if !snapshot.DNS.FakeIP.Enabled {
+		return nil
+	}
+	ipCIDR := make([]string, 0, 2)
+	ipv4Range := strings.TrimSpace(snapshot.DNS.FakeIP.IPv4Range)
+	if ipv4Range == "" {
+		ipv4Range = defaultDNSFakeIPV4Range
+	}
+	if ipv4Range != "" {
+		ipCIDR = append(ipCIDR, ipv4Range)
+	}
+	ipv6Range := strings.TrimSpace(snapshot.DNS.FakeIP.IPv6Range)
+	if ipv6Range == "" {
+		ipv6Range = defaultDNSFakeIPV6Range
+	}
+	if ipv6Range != "" {
+		ipCIDR = append(ipCIDR, ipv6Range)
+	}
+	if len(ipCIDR) == 0 {
+		return nil
+	}
+	return map[string]any{
+		"ip_cidr":  ipCIDR,
+		"action":   "route",
+		"outbound": proxySelectorTag,
+	}
 }
 
 func buildTrafficRuleRuntime(

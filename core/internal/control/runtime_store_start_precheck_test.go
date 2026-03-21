@@ -42,13 +42,28 @@ func TestCheckStartPreconditionsBlocksWhenNodeNotConfigured(t *testing.T) {
 func TestCheckStartPreconditionsBlocksWhenNotAdmin(t *testing.T) {
 	store := newStartPrecheckTestStore(t)
 	store.state.RuntimeAdmin = false
-	targetMode := normalizeConfiguredProxyMode(store.state.ConfiguredProxyMode)
+	store.state.SystemType = "linux"
+	targetMode := ProxyModeTun
 	result := buildStartPrecheckResult(store.state, targetMode, store.runtime)
 	if result.CanStart {
 		t.Fatalf("expected canStart=false when not admin")
 	}
 	if !containsIssueCode(result.Blockers, StartPrecheckIssueAdminRequired) {
 		t.Fatalf("expected blocker code %s", StartPrecheckIssueAdminRequired)
+	}
+}
+
+func TestCheckStartPreconditionsAllowsMacOSSystemModeWithoutAdmin(t *testing.T) {
+	store := newStartPrecheckTestStore(t)
+	store.state.RuntimeAdmin = false
+	store.state.SystemType = "darwin"
+	targetMode := ProxyModeSystem
+	result := buildStartPrecheckResult(store.state, targetMode, store.runtime)
+	if !result.CanStart {
+		t.Fatalf("expected macOS system mode to continue without admin blocker, got blockers=%v", result.Blockers)
+	}
+	if containsIssueCode(result.Blockers, StartPrecheckIssueAdminRequired) {
+		t.Fatalf("did not expect blocker code %s", StartPrecheckIssueAdminRequired)
 	}
 }
 

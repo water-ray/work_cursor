@@ -39,6 +39,7 @@ import type {
   UpdateManualNodeRequestPayload,
 } from "../../../shared/daemon";
 import { daemonTransportStore } from "./daemonTransportStore";
+import { isWindowShutdownRequested } from "../platform/windowShutdownState";
 import { isMobileRuntime } from "../platform/runtimeStore";
 
 type ProbeNodesRequestInput = ProbeNodesRequestPayload & {
@@ -58,7 +59,7 @@ function shouldSkipUILog(path: string): boolean {
 }
 
 async function appendUILog(level: LogLevel, message: string): Promise<void> {
-  if (isMobileRuntime()) {
+  if (isMobileRuntime() || isWindowShutdownRequested()) {
     return;
   }
   try {

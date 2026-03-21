@@ -3,10 +3,18 @@ import {
   describeLinuxSystemProxySyncError,
   syncLinuxSystemProxyFromSnapshot,
 } from "../../../desktop/linuxSystemProxySync";
+import { getRuntimePlatformInfo } from "../../../platform/runtimeStore";
 import type { ServicePlatformExecutor } from "../../../shared/application/servicePlatformExecutor";
 
 export const desktopServiceExecutor: ServicePlatformExecutor = {
   resolveStartupTargetMode(snapshot: DaemonSnapshot) {
+    try {
+      if (!getRuntimePlatformInfo().supportsSystemProxyMode) {
+        return "tun";
+      }
+    } catch {
+      // Fall back to the previous desktop behavior until runtime platform info is ready.
+    }
     return snapshot.configuredProxyMode === "tun" ? "tun" : "system";
   },
   async ensureStartReady() {

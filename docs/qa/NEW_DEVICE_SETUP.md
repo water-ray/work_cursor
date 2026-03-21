@@ -21,7 +21,7 @@
 - `node`（建议 `20+`）
 - `npm`
 - `cargo` / `rustc`
-- `Python 3`
+- `Python 3.8+`（建议 `3.10+`）
 - 可选：`GitHub CLI (gh)`
 
 可直接执行：
@@ -34,6 +34,8 @@ npm --version
 python --version
 gh --version
 ```
+
+请确认 `python` 或 `python3` 至少有一个指向 `3.8+`；macOS / Linux 建议额外执行 `python3 --version`，并优先使用 `3.10+`。
 
 如果只是开发和推送代码，`gh` 不是必须；如果要方便处理 GitHub Release，建议安装。
 
@@ -122,8 +124,9 @@ npm run dev
 
 常用任务入口：
 
-- `客户端：开发：运行 VPN 内核`
-- `客户端：开发：运行 Tauri 前端`
+- `客户端：开发：运行当前平台整套`
+- `客户端：开发：运行当前平台内核`
+- `客户端：开发：运行当前平台前端`
 - `广告端：开发：运行服务端`
 - `广告端：开发：运行前端`
 - `客户端：检查：Tauri 类型检查`
@@ -144,7 +147,7 @@ python scripts/build/targets/desktop.py --platform windows
 
 VS Code 任务：
 
-- `广告端：发布：前后端整套`
+- `广告端：本地发布：前后端整套到 Bin/adsroot`
 
 发布结果默认在：
 

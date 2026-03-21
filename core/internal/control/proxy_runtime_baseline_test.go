@@ -20,10 +20,21 @@ func TestBuildTunInboundConfigLinuxEnablesAutoRedirect(t *testing.T) {
 	if strictRoute, ok := linuxInbound["strict_route"].(bool); !ok || !strictRoute {
 		t.Fatalf("expected default strict_route enabled, got %v", linuxInbound["strict_route"])
 	}
+	if linuxInbound["interface_name"] != defaultTunInterfaceName {
+		t.Fatalf("expected linux tun inbound to keep interface_name, got %v", linuxInbound["interface_name"])
+	}
 
 	windowsInbound := buildTunInboundConfig("windows", snapshot)
 	if _, ok := windowsInbound["auto_redirect"]; ok {
 		t.Fatalf("unexpected auto_redirect for non-linux tun inbound")
+	}
+	if windowsInbound["interface_name"] != defaultTunInterfaceName {
+		t.Fatalf("expected windows tun inbound to keep interface_name, got %v", windowsInbound["interface_name"])
+	}
+
+	darwinInbound := buildTunInboundConfig("darwin", snapshot)
+	if _, ok := darwinInbound["interface_name"]; ok {
+		t.Fatalf("expected darwin tun inbound to omit interface_name, got %v", darwinInbound["interface_name"])
 	}
 }
 
@@ -654,6 +665,85 @@ func TestBuildRuntimeConfigWithMinimalProbeSnapshotUsesOnlyHelperInbound(t *test
 	}
 	if findOutboundByTag(outbounds, runtimeNodeTag("node-1")) == nil {
 		t.Fatalf("expected node outbound preserved in minimal runtime")
+	}
+}
+
+func TestBuildRuntimeConfigRoutesFakeIPBeforePrivateDirect(t *testing.T) {
+	snapshot := defaultSnapshot("test-runtime", "test-core")
+	snapshot.ProxyMode = ProxyModeSystem
+	snapshot.DNS.FakeIP.Enabled = true
+	snapshot.Groups = []NodeGroup{
+		{
+			ID:   "group-1",
+			Name: "group-1",
+			Nodes: []Node{
+				{
+					ID:       "node-1",
+					Name:     "node-1",
+					Protocol: NodeProtocol("socks5"),
+					Address:  "1.1.1.1",
+					Port:     1080,
+				},
+			},
+		},
+	}
+	snapshot.ActiveGroupID = "group-1"
+	snapshot.SelectedNodeID = "node-1"
+
+	rawConfig, err := buildRuntimeConfig(snapshot)
+	if err != nil {
+		t.Fatalf("build runtime config failed: %v", err)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(rawConfig), &payload); err != nil {
+		t.Fatalf("unmarshal runtime config failed: %v", err)
+	}
+	routeConfig, ok := payload["route"].(map[string]any)
+	if !ok {
+		t.Fatalf("runtime route config should be map[string]any")
+	}
+	rules, ok := routeConfig["rules"].([]any)
+	if !ok {
+		t.Fatalf("runtime route rules should be []any")
+	}
+	fakeipRuleIndex := -1
+	privateDirectRuleIndex := -1
+	for index, rawRule := range rules {
+		rule, ok := rawRule.(map[string]any)
+		if !ok {
+			continue
+		}
+		if privateDirectRuleIndex == -1 {
+			if private, _ := rule["ip_is_private"].(bool); private {
+				if outbound, _ := rule["outbound"].(string); outbound == "direct" {
+					privateDirectRuleIndex = index
+				}
+			}
+		}
+		if fakeipRuleIndex == -1 {
+			if outbound, _ := rule["outbound"].(string); outbound == proxySelectorTag {
+				ipCIDR := toStringSlice(rule["ip_cidr"])
+				if len(ipCIDR) == 2 &&
+					ipCIDR[0] == defaultDNSFakeIPV4Range &&
+					ipCIDR[1] == defaultDNSFakeIPV6Range {
+					fakeipRuleIndex = index
+				}
+			}
+		}
+	}
+	if fakeipRuleIndex < 0 {
+		t.Fatalf("expected fakeip route rule in runtime route config")
+	}
+	if privateDirectRuleIndex < 0 {
+		t.Fatalf("expected private direct route rule in runtime route config")
+	}
+	if fakeipRuleIndex >= privateDirectRuleIndex {
+		t.Fatalf(
+			"expected fakeip route rule before private direct rule, got fakeip=%d private=%d",
+			fakeipRuleIndex,
+			privateDirectRuleIndex,
+		)
 	}
 }
 

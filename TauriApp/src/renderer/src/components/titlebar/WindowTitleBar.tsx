@@ -1,5 +1,4 @@
 import { Button, Checkbox, Modal, Radio, Space, Typography } from "antd";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useEffect, useMemo, useState } from "react";
 import type { DaemonSnapshot, ProxyMode, VpnConnectionStage } from "../../../../shared/daemon";
 import { CountryFlag } from "../flag/CountryFlag";
@@ -24,6 +23,7 @@ import {
   useSharedServiceActionState,
 } from "../../services/sharedServiceAction";
 import { getPlatformAdapter } from "../../platform/runtimeStore";
+import { getServicePlatformExecutor } from "../../platform/servicePlatformExecutor";
 
 interface WindowTitleBarProps {
   title: string;
@@ -35,6 +35,7 @@ interface WindowTitleBarProps {
   taskCenterOpen: boolean;
   taskCenterHasUnread: boolean;
   onTaskCenterToggle: () => void;
+  layout?: "titlebar" | "toolbar";
 }
 
 function formatRateToKM(value: number | undefined): string {
@@ -54,21 +55,28 @@ function formatNoticeTime(value: number): string {
   }
 }
 
-function shouldStartDragging(target: EventTarget | null): boolean {
-  if (!(target instanceof HTMLElement)) {
-    return true;
-  }
-  return !target.closest(
-    "button, a, input, textarea, select, option, label, summary, [role='button'], .ant-btn, .ant-modal, .ant-checkbox, .ant-radio, .ant-select, .ant-switch",
-  );
-}
-
 function formatWindowActionError(error: unknown, fallback: string): string {
   if (error instanceof Error && error.message.trim() !== "") {
     return error.message;
   }
   const normalized = String(error ?? "").trim();
   return normalized === "" ? fallback : normalized;
+}
+
+function describeWindowEventTarget(target: EventTarget | null): string {
+  if (!(target instanceof HTMLElement)) {
+    return "unknown";
+  }
+  const tagName = target.tagName.toLowerCase();
+  const classTokens =
+    typeof target.className === "string"
+      ? target.className
+          .split(/\s+/)
+          .map((item) => item.trim())
+          .filter(Boolean)
+          .slice(0, 4)
+      : [];
+  return classTokens.length > 0 ? `${tagName}.${classTokens.join(".")}` : tagName;
 }
 
 function WindowMaximizeIcon({ maximized }: { maximized: boolean }) {
@@ -134,6 +142,7 @@ export function WindowTitleBar({
   taskCenterOpen,
   taskCenterHasUnread,
   onTaskCenterToggle,
+  layout = "titlebar",
 }: WindowTitleBarProps) {
   const platformAdapter = getPlatformAdapter();
   const notice = useAppNotice();
@@ -155,9 +164,9 @@ export function WindowTitleBar({
     useState<CloseBehavior>("minimize_to_tray");
   const [rememberCloseBehavior, setRememberCloseBehavior] = useState(false);
   const isWindows = (systemType ?? "").toLowerCase() === "windows";
+  const isToolbarLayout = layout === "toolbar";
   const runtimeStatusLabel = runtimeAdmin ? "管理员权限运行" : "普通权限运行";
   const snapshotProxyMode = snapshot?.proxyMode ?? "off";
-  const configuredProxyMode = snapshot?.configuredProxyMode ?? "system";
   const snapshotConnectionStage = snapshot?.connectionStage ?? "idle";
   const shouldPreferSnapshotState =
     optimisticConnectionStage === null ||
@@ -213,6 +222,7 @@ export function WindowTitleBar({
   const realtimeNodeDownloadText = formatRateToKM(snapshot?.nodeDownloadRateBps);
   const realtimeNodeUploadText = formatRateToKM(snapshot?.nodeUploadRateBps);
   const realtimeNodeSpeedTitle = `总节点实时速度：下行 ${realtimeNodeDownloadText} / 上行 ${realtimeNodeUploadText}`;
+  const traceWindowEvent = (_stage: string, _detail?: string) => {};
   const startStopActionLabel =
     proxyMode === "off"
       ? connectionStage === "connecting" || sharedServiceAction.kind === "start"
@@ -299,6 +309,10 @@ export function WindowTitleBar({
   }, [noticeCenterOpen, noticeHistory]);
 
   const executeCloseBehavior = async (behavior: CloseBehavior) => {
+    traceWindowEvent(
+      "titlebar.execute_close_behavior.start",
+      `behavior=${behavior}; closingApp=${closingApp}; quittingAll=${quittingAll}`,
+    );
     if (closingApp || quittingAll) {
       return;
     }
@@ -318,6 +332,7 @@ export function WindowTitleBar({
           await platformAdapter.window.closePanelKeepCore();
           break;
       }
+      traceWindowEvent("titlebar.execute_close_behavior.resolved", `behavior=${behavior}`);
     } finally {
       setClosingApp(false);
     }
@@ -338,7 +353,7 @@ export function WindowTitleBar({
     try {
       if (proxyMode === "off") {
         const startupSmartOptimize = readProxyStartupSmartOptimizePreference();
-        const targetMode: ProxyMode = configuredProxyMode === "tun" ? "tun" : "system";
+        const targetMode: ProxyMode = getServicePlatformExecutor().resolveStartupTargetMode(snapshot);
         setOptimisticProxyMode(targetMode);
         setOptimisticConnectionStage("connecting");
         const startResult = await startServiceWithSmartOptimize({
@@ -398,13 +413,22 @@ export function WindowTitleBar({
   };
 
   const quitAllNow = async () => {
+    traceWindowEvent(
+      "titlebar.quit_all.click",
+      `canQuitAll=${canQuitAll}; closingApp=${closingApp}; quittingAll=${quittingAll}`,
+    );
     if (!canQuitAll) {
       return;
     }
     setQuittingAll(true);
     try {
       await platformAdapter.window.quitAll();
+      traceWindowEvent("titlebar.quit_all.resolved");
     } catch (error) {
+      traceWindowEvent(
+        "titlebar.quit_all.rejected",
+        formatWindowActionError(error, "完全退出失败"),
+      );
       notice.error(error instanceof Error ? error.message : "完全退出失败");
     } finally {
       setQuittingAll(false);
@@ -412,6 +436,10 @@ export function WindowTitleBar({
   };
 
   const quitPanelOnlyNow = async () => {
+    traceWindowEvent(
+      "titlebar.quit_panel_only.click",
+      `canQuitAll=${canQuitAll}; closingApp=${closingApp}; quittingAll=${quittingAll}`,
+    );
     if (!canQuitAll) {
       return;
     }
@@ -419,6 +447,10 @@ export function WindowTitleBar({
   };
 
   const handleCloseButtonClick = () => {
+    traceWindowEvent(
+      "titlebar.close_button.click",
+      `closingApp=${closingApp}; closeBehavior=${readCloseBehavior()}`,
+    );
     if (closingApp) {
       return;
     }
@@ -435,6 +467,10 @@ export function WindowTitleBar({
   };
 
   const applyCloseBehaviorChoice = () => {
+    traceWindowEvent(
+      "titlebar.close_behavior.confirm",
+      `choice=${closeBehaviorChoice}; remember=${rememberCloseBehavior}`,
+    );
     writeCloseBehavior(rememberCloseBehavior ? closeBehaviorChoice : "ask_every_time");
     setCloseDialogOpen(false);
     void executeCloseBehavior(closeBehaviorChoice).catch((error) => {
@@ -444,6 +480,19 @@ export function WindowTitleBar({
 
   const stopActionAreaMouseDown = (event: React.MouseEvent<HTMLElement>) => {
     event.stopPropagation();
+  };
+
+  const handleDragRegionMouseDownCapture = (
+    region: "brand" | "title",
+    event: React.MouseEvent<HTMLElement>,
+  ) => {
+    if (event.button !== 0) {
+      return;
+    }
+    traceWindowEvent(
+      "titlebar.drag_region.mousedown",
+      `region=${region}; detail=${event.detail}; target=${describeWindowEventTarget(event.target)}`,
+    );
   };
 
   const handleMinimizeClick = () => {
@@ -463,125 +512,107 @@ export function WindowTitleBar({
       });
   };
 
-  const handleTitleBarMouseDown = (
-    event: React.MouseEvent<HTMLDivElement>,
-  ) => {
-    if (event.button !== 0 || !shouldStartDragging(event.target)) {
-      return;
-    }
-    void getCurrentWindow().startDragging();
-  };
+  const brandTools = (
+    <div className="window-brand-tools" onMouseDown={stopActionAreaMouseDown}>
+      <Button
+        size="small"
+        type="text"
+        className={`window-task-center-btn${taskCenterHasUnread ? " is-unread" : ""}${taskCenterOpen ? " is-open" : ""}`}
+        title="后台任务"
+        icon={<BiIcon name="list-task" />}
+        onClick={onTaskCenterToggle}
+      />
+      <Button
+        size="small"
+        type="text"
+        className={`window-task-center-btn window-notice-center-btn${noticeHistory.unreadCount > 0 ? " is-unread" : ""}${noticeCenterOpen ? " is-open" : ""}`}
+        title="近期通知"
+        icon={<BiIcon name="bell" />}
+        onClick={() => {
+          setNoticeCenterOpen(true);
+        }}
+      />
+    </div>
+  );
 
-  return (
-    <>
-      <div className="window-titlebar" onMouseDown={handleTitleBarMouseDown}>
-        <div className="window-brand">
-          {appIconUrl ? (
-            <img className="window-app-icon-image" src={appIconUrl} alt="Wateray" />
-          ) : (
-            <span className="window-app-icon">W</span>
-          )}
-          <Typography.Text className="window-app-name">Wateray</Typography.Text>
-          {isWindows ? (
-            <span
-              className={`window-runtime-status-dot${runtimeAdmin ? " admin" : " user"}`}
-              title={runtimeStatusLabel}
-            />
-          ) : null}
-          <Button
-            size="small"
-            type="text"
-            className={`window-task-center-btn${taskCenterHasUnread ? " is-unread" : ""}${taskCenterOpen ? " is-open" : ""}`}
-            title="后台任务"
-            icon={<BiIcon name="list-task" />}
-            onClick={onTaskCenterToggle}
+  const actionButtons = (
+    <Space
+      className={isToolbarLayout ? "window-toolbar-actions" : "window-titlebar-actions"}
+      onMouseDown={stopActionAreaMouseDown}
+    >
+      {shouldShowRealtimeNodeSpeed ? (
+        <span className="window-realtime-node-speed" title={realtimeNodeSpeedTitle}>
+          <BiIcon name="arrow-down" className="window-realtime-node-speed-icon" />
+          <span>{realtimeNodeDownloadText}</span>
+          <span className="window-realtime-node-speed-separator">/</span>
+          <BiIcon name="arrow-up" className="window-realtime-node-speed-icon" />
+          <span>{realtimeNodeUploadText}</span>
+        </span>
+      ) : null}
+      {activeNodeSummary ? (
+        <span
+          className="window-active-node-flag"
+          title={`${activeNodeSummary.metadata.chineseName} · ${activeNodeSummary.metadata.code} · 评分(${Math.max(0, Math.round(activeNodeSummary.probeScore))}分) · 真连延迟(${Math.max(0, Math.round(activeNodeSummary.probeRealConnectMs))}ms)`}
+          aria-label={activeNodeSummary.metadata.chineseName}
+        >
+          <CountryFlag
+            code={activeNodeSummary.metadata.code}
+            ariaLabel={activeNodeSummary.metadata.chineseName}
           />
-          <Button
-            size="small"
-            type="text"
-            className={`window-task-center-btn window-notice-center-btn${noticeHistory.unreadCount > 0 ? " is-unread" : ""}${noticeCenterOpen ? " is-open" : ""}`}
-            title="近期通知"
-            icon={<BiIcon name="bell" />}
-            onClick={() => {
-              setNoticeCenterOpen(true);
-            }}
-          />
-        </div>
-        <div className="window-title-wrap">
-          <Typography.Text className="window-title">{title}</Typography.Text>
-        </div>
-        <Space className="window-titlebar-actions" onMouseDown={stopActionAreaMouseDown}>
-          {shouldShowRealtimeNodeSpeed ? (
-            <span className="window-realtime-node-speed" title={realtimeNodeSpeedTitle}>
-              <BiIcon name="arrow-down" className="window-realtime-node-speed-icon" />
-              <span>{realtimeNodeDownloadText}</span>
-              <span className="window-realtime-node-speed-separator">/</span>
-              <BiIcon name="arrow-up" className="window-realtime-node-speed-icon" />
-              <span>{realtimeNodeUploadText}</span>
-            </span>
-          ) : null}
-          {activeNodeSummary ? (
-            <span
-              className="window-active-node-flag"
-              title={`${activeNodeSummary.metadata.chineseName} · ${activeNodeSummary.metadata.code} · 评分(${Math.max(0, Math.round(activeNodeSummary.probeScore))}分) · 真连延迟(${Math.max(0, Math.round(activeNodeSummary.probeRealConnectMs))}ms)`}
-              aria-label={activeNodeSummary.metadata.chineseName}
-            >
-              <CountryFlag
-                code={activeNodeSummary.metadata.code}
-                ariaLabel={activeNodeSummary.metadata.chineseName}
-              />
-            </span>
-          ) : null}
-          <Button
-            size="small"
-            type="text"
-            className={`window-quick-action-btn window-quick-action-btn-large window-quick-action-btn-start-stop ${
-              proxyMode === "off" ? "is-start-mode" : "is-stop-mode"
-            }`}
-            title={startStopActionLabel}
-            loading={togglingService || (isServiceTransitioning && !restartingService)}
-            disabled={!canOperateService || restartingService}
-            icon={startStopIcon}
-            onClick={() => {
-              void toggleServiceState();
-            }}
-          />
-          <Button
-            size="small"
-            type="text"
-            className="window-quick-action-btn window-quick-action-btn-large window-quick-action-btn-restart"
-            title="重启服务"
-            loading={restartingService || sharedServiceAction.kind === "restart"}
-            disabled={!canOperateService || togglingService}
-            icon={<BiIcon name="arrow-clockwise" />}
-            onClick={() => {
-              void restartService();
-            }}
-          />
-          <Button
-            size="small"
-            type="text"
-            className="window-quick-action-btn window-quick-action-btn-large window-quick-action-btn-quit-all"
-            title="完全退出（含内核）"
-            loading={quittingAll}
-            disabled={!canQuitAll}
-            icon={<BiIcon name="power" />}
-            onClick={() => {
-              void quitAllNow();
-            }}
-          />
-          <Button
-            size="small"
-            type="text"
-            className="window-quick-action-btn window-quick-action-btn-large window-quick-action-btn-close-panel"
-            title="后台运行（关面板）"
-            loading={closingApp}
-            disabled={!canQuitAll}
-            icon={<BiIcon name="box-arrow-right" />}
-            onClick={() => {
-              void quitPanelOnlyNow();
-            }}
-          />
+        </span>
+      ) : null}
+      <Button
+        size="small"
+        type="text"
+        className={`window-quick-action-btn window-quick-action-btn-large window-quick-action-btn-start-stop ${
+          proxyMode === "off" ? "is-start-mode" : "is-stop-mode"
+        }`}
+        title={startStopActionLabel}
+        loading={togglingService || (isServiceTransitioning && !restartingService)}
+        disabled={!canOperateService || restartingService}
+        icon={startStopIcon}
+        onClick={() => {
+          void toggleServiceState();
+        }}
+      />
+      <Button
+        size="small"
+        type="text"
+        className="window-quick-action-btn window-quick-action-btn-large window-quick-action-btn-restart"
+        title="重启服务"
+        loading={restartingService || sharedServiceAction.kind === "restart"}
+        disabled={!canOperateService || togglingService}
+        icon={<BiIcon name="arrow-clockwise" />}
+        onClick={() => {
+          void restartService();
+        }}
+      />
+      <Button
+        size="small"
+        type="text"
+        className="window-quick-action-btn window-quick-action-btn-large window-quick-action-btn-quit-all"
+        title="完全退出（含内核）"
+        loading={quittingAll}
+        disabled={!canQuitAll}
+        icon={<BiIcon name="power" />}
+        onClick={() => {
+          void quitAllNow();
+        }}
+      />
+      <Button
+        size="small"
+        type="text"
+        className="window-quick-action-btn window-quick-action-btn-large window-quick-action-btn-close-panel"
+        title="后台运行（关面板）"
+        loading={closingApp}
+        disabled={!canQuitAll}
+        icon={<BiIcon name="box-arrow-right" />}
+        onClick={() => {
+          void quitPanelOnlyNow();
+        }}
+      />
+      {isToolbarLayout ? null : (
+        <>
           <Button
             size="small"
             type="text"
@@ -607,8 +638,71 @@ export function WindowTitleBar({
             icon={<BiIcon name="x-lg" />}
             onClick={handleCloseButtonClick}
           />
-        </Space>
-      </div>
+        </>
+      )}
+    </Space>
+  );
+
+  return (
+    <>
+      {isToolbarLayout ? (
+        <div className="window-toolbar">
+          <div className="window-toolbar-main">
+            <div className="window-brand-main">
+              {appIconUrl ? (
+                <img className="window-app-icon-image" src={appIconUrl} alt="Wateray" />
+              ) : (
+                <span className="window-app-icon">W</span>
+              )}
+              <Typography.Text className="window-toolbar-title">{title}</Typography.Text>
+              {isWindows ? (
+                <span
+                  className={`window-runtime-status-dot${runtimeAdmin ? " admin" : " user"}`}
+                  title={runtimeStatusLabel}
+                />
+              ) : null}
+            </div>
+            {brandTools}
+          </div>
+          {actionButtons}
+        </div>
+      ) : (
+        <div className="window-titlebar">
+          <div className="window-brand">
+            <div
+              className="window-brand-main"
+              data-tauri-drag-region=""
+              onMouseDownCapture={(event) => {
+                handleDragRegionMouseDownCapture("brand", event);
+              }}
+            >
+              {appIconUrl ? (
+                <img className="window-app-icon-image" src={appIconUrl} alt="Wateray" />
+              ) : (
+                <span className="window-app-icon">W</span>
+              )}
+              <Typography.Text className="window-app-name">Wateray</Typography.Text>
+              {isWindows ? (
+                <span
+                  className={`window-runtime-status-dot${runtimeAdmin ? " admin" : " user"}`}
+                  title={runtimeStatusLabel}
+                />
+              ) : null}
+            </div>
+            {brandTools}
+          </div>
+          <div
+            className="window-title-wrap"
+            data-tauri-drag-region=""
+            onMouseDownCapture={(event) => {
+              handleDragRegionMouseDownCapture("title", event);
+            }}
+          >
+            <Typography.Text className="window-title">{title}</Typography.Text>
+          </div>
+          {actionButtons}
+        </div>
+      )}
       <Modal
         title={`近期通知${noticeHistory.recentItems.length > 0 ? `（最近 ${noticeHistory.recentItems.length} 条）` : ""}`}
         open={noticeCenterOpen}

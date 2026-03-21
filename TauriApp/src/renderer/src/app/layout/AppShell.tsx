@@ -17,6 +17,22 @@ import { MobileProxyControlBar } from "./MobileProxyControlBar";
 import { MobileRulesQuickBar } from "./MobileRulesQuickBar";
 import { MobileSubscriptionsQuickBar } from "./MobileSubscriptionsQuickBar";
 
+function shouldUseNativeMacWindowChrome(systemType: string | undefined): boolean {
+  const normalizedSystemType = String(systemType ?? "").trim().toLowerCase();
+  if (normalizedSystemType === "macos") {
+    return true;
+  }
+  if (typeof navigator === "undefined") {
+    return false;
+  }
+  const platformText = String(navigator.platform ?? "").trim().toLowerCase();
+  if (platformText.includes("mac")) {
+    return true;
+  }
+  const userAgentText = String(navigator.userAgent ?? "").trim().toLowerCase();
+  return userAgentText.includes("mac os") || userAgentText.includes("macintosh");
+}
+
 function runtimeApplyOperationLabel(operation: string | undefined): string {
   switch (operation) {
     case "set_settings":
@@ -67,6 +83,8 @@ export function AppShell({
   });
   const defaultRoutePath = navRoutes[0]?.path ?? "/subscriptions";
   const airportRouteActive = location.pathname.startsWith("/airport");
+  const useNativeMacWindowChrome =
+    isDesktopShell && shouldUseNativeMacWindowChrome(daemonState.snapshot?.systemType);
   const mobileSubscriptionsRouteActive =
     !isDesktopShell && location.pathname.startsWith("/subscriptions");
   const mobileRulesRouteActive =
@@ -270,6 +288,7 @@ export function AppShell({
           taskCenterOpen={taskCenter.open}
           taskCenterHasUnread={taskCenter.hasUnread}
           onTaskCenterToggle={taskCenter.toggleOpen}
+          layout={useNativeMacWindowChrome ? "toolbar" : "titlebar"}
         />
       ) : null}
       {isDesktopShell ? (

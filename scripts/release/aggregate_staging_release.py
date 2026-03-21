@@ -23,6 +23,7 @@ from scripts.release.release_framework import (
     ReleaseAsset,
     ReleaseFrameworkError,
     copy_release_assets_to_dir,
+    format_platform_delivery_labels,
     load_platform_build_manifest,
     manifest_to_release_assets,
     read_version,
@@ -149,11 +150,13 @@ def write_status_file(
     missing = sorted(expected - available_platforms)
     uploaded_labels = [PLATFORM_DISPLAY_NAMES.get(item, item) for item in sorted(available_platforms)]
     missing_labels = [PLATFORM_DISPLAY_NAMES.get(item, item) for item in missing]
+    expected_labels = " / ".join(format_platform_delivery_labels(list(PLATFORM_ORDER)))
     lines = [
         f"# Wateray v{version} 汇总状态",
         "",
-        "正式 Release 尚未发布，当前仍在等待 staging 产物齐备。",
+        "正式 Release 尚未发布，当前仍在等待 staging 产物齐备并完成最终汇总。",
         "",
+        f"- 目标平台：{expected_labels}",
         f"- 已收到平台：{', '.join(uploaded_labels) if uploaded_labels else '无'}",
         f"- 缺少平台：{', '.join(missing_labels) if missing_labels else '无'}",
     ]

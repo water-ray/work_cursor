@@ -51,6 +51,8 @@ export function createMobilePlatformAdapter(platform: WaterayPlatformApi): Water
       readTextFile: () => rejectUnsupported("读取本地文件"),
       writeTextFile: () => rejectUnsupported("写入本地文件"),
       writeTempTextFile: () => rejectUnsupported("写入临时文件"),
+      getFileIconDataUrl: async () => null,
+      listInstalledAppCandidates: async () => [],
       readClipboardText: () => rejectUnsupported("读取剪贴板文本"),
       writeClipboardText: () => rejectUnsupported("写入剪贴板文本"),
       readClipboardFilePaths: () => rejectUnsupported("读取剪贴板文件"),

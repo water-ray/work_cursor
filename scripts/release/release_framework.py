@@ -21,15 +21,23 @@ BIN_DIR = ROOT_DIR / "Bin"
 RELEASE_ROOT_DIR = BIN_DIR / "github-release"
 DEFAULT_PUBLIC_REPO = "water-ray/wateray-release"
 OFFICIAL_SITE_URL = "https://wateray.net/"
-PLATFORM_ORDER = ("windows", "linux", "android")
+PLATFORM_ORDER = ("windows", "linux", "macos", "android")
 PLATFORM_DISPLAY_NAMES = {
     "windows": "Windows",
     "linux": "Linux",
+    "macos": "macOS",
     "android": "Android",
+}
+PLATFORM_DELIVERY_NAMES = {
+    "windows": "ZIP 整包",
+    "linux": "ZIP / DEB / AppImage",
+    "macos": "DMG 安装镜像",
+    "android": "APK",
 }
 PLATFORM_DIRECTORY_NAMES = {
     "windows": "Wateray-windows",
     "linux": "Wateray-linux",
+    "macos": "Wateray-macos",
     "android": "Wateray-Android",
 }
 LINUX_PACKAGE_OUTPUT_DIR = BIN_DIR / "Wateray-linux-packages"
@@ -37,7 +45,8 @@ ASSET_KIND_ORDER = {
     "portable-zip": 0,
     "deb": 1,
     "appimage": 2,
-    "apk": 3,
+    "dmg": 3,
+    "apk": 4,
 }
 
 
@@ -320,14 +329,23 @@ def distinct_platforms(assets: list[ReleaseAsset]) -> list[str]:
     return ordered
 
 
+def format_platform_delivery_label(platform_id: str) -> str:
+    display_name = PLATFORM_DISPLAY_NAMES.get(platform_id, platform_id)
+    delivery_name = PLATFORM_DELIVERY_NAMES.get(platform_id, "")
+    if delivery_name:
+        return f"{display_name}（{delivery_name}）"
+    return display_name
+
+
+def format_platform_delivery_labels(platform_ids: list[str]) -> list[str]:
+    return [format_platform_delivery_label(platform_id) for platform_id in platform_ids]
+
+
 def build_compatibility_summary(assets: list[ReleaseAsset]) -> str:
-    platforms = [PLATFORM_DISPLAY_NAMES.get(item, item) for item in distinct_platforms(assets)]
-    normalized = [item.lower() for item in distinct_platforms(assets)]
-    if normalized == ["windows"]:
-        return "当前公开发布包仅包含 Windows 客户端；Linux 客户端将在后续补齐后一起发布。"
-    if normalized == ["android"]:
-        return "当前公开发布包仅包含 Android 客户端；桌面客户端将在后续补齐后一起发布。"
-    return f"当前公开发布包包含：{', '.join(platforms)}。请按对应平台下载使用。"
+    platform_labels = format_platform_delivery_labels(distinct_platforms(assets))
+    if len(platform_labels) == 1:
+        return f"当前公开发布包仅包含：{platform_labels[0]}。"
+    return f"当前公开发布包包含：{', '.join(platform_labels)}。请按对应平台下载使用。"
 
 
 def build_release_summary(version: str, assets: list[ReleaseAsset]) -> dict[str, str]:
@@ -348,18 +366,22 @@ def build_release_summary(version: str, assets: list[ReleaseAsset]) -> dict[str,
 def resolve_expected_release_assets(version: str, platform_id: str) -> tuple[ExpectedReleaseAsset, ...]:
     if platform_id == "windows":
         return (
-            ExpectedReleaseAsset("windows", "Windows 客户端整包", f"Wateray-windows-v{version}.zip", "portable-zip", True),
+            ExpectedReleaseAsset("windows", "Windows ZIP 便携整包", f"Wateray-windows-v{version}.zip", "portable-zip", True),
         )
     if platform_id == "linux":
         return (
-            ExpectedReleaseAsset("linux", "Linux 客户端整包", f"Wateray-linux-v{version}.zip", "portable-zip", True),
+            ExpectedReleaseAsset("linux", "Linux ZIP 便携整包", f"Wateray-linux-v{version}.zip", "portable-zip", True),
             ExpectedReleaseAsset("linux", "Linux Debian/Ubuntu 安装包", f"wateray_{version}_amd64.deb", "deb"),
             ExpectedReleaseAsset("linux", "Linux AppImage 便携包", f"Wateray-linux-v{version}-x86_64.AppImage", "appimage"),
         )
     if platform_id == "android":
         return (
-            ExpectedReleaseAsset("android", "Android arm64 release APK", f"Wateray-Android-v{version}-arm64-release.apk", "apk", True),
-            ExpectedReleaseAsset("android", "Android x86_64 release APK", f"Wateray-Android-v{version}-x86_64-release.apk", "apk"),
+            ExpectedReleaseAsset("android", "Android arm64 APK 安装包", f"Wateray-Android-v{version}-arm64-release.apk", "apk", True),
+            ExpectedReleaseAsset("android", "Android x86_64 APK 安装包", f"Wateray-Android-v{version}-x86_64-release.apk", "apk"),
+        )
+    if platform_id == "macos":
+        return (
+            ExpectedReleaseAsset("macos", "macOS 客户端 DMG 安装镜像", f"Wateray-macos-v{version}.dmg", "dmg", True),
         )
     raise ReleaseFrameworkError(f"不支持的平台：{platform_id}")
 
@@ -369,6 +391,8 @@ def resolve_local_asset_source(expected: ExpectedReleaseAsset) -> tuple[str, Pat
         return ("directory", BIN_DIR / PLATFORM_DIRECTORY_NAMES[expected.platform_id])
     if expected.platform_id == "linux":
         return ("file", LINUX_PACKAGE_OUTPUT_DIR / expected.asset_name)
+    if expected.platform_id == "macos":
+        return ("file", BIN_DIR / f"{PLATFORM_DIRECTORY_NAMES['macos']}.dmg")
     if expected.platform_id == "android":
         return ("file", BIN_DIR / PLATFORM_DIRECTORY_NAMES["android"] / expected.asset_name)
     raise ReleaseFrameworkError(f"无法解析本地发布资产来源：{expected.asset_name}")
@@ -559,12 +583,13 @@ def write_release_notes(version: str, public_repo: str, release_dir: Path, asset
     release_tag = f"v{version}"
     ordered_assets = sort_release_assets(assets)
     summary = build_release_summary(version, ordered_assets)
+    platform_labels = format_platform_delivery_labels(distinct_platforms(ordered_assets))
     lines = [
         f"# Wateray {release_tag}",
         "",
         "## 版本简介",
         "- 发布渠道：稳定版",
-        f"- 适用平台：{', '.join(PLATFORM_DISPLAY_NAMES.get(item, item) for item in distinct_platforms(ordered_assets))}",
+        f"- 适用平台：{', '.join(platform_labels) if platform_labels else '暂无公开发布平台'}",
         f"- GitHub 仓库：`{public_repo.strip() or DEFAULT_PUBLIC_REPO}`",
         "",
         "## 更新摘要",
@@ -576,7 +601,7 @@ def write_release_notes(version: str, public_repo: str, release_dir: Path, asset
         "## 发布文件",
     ]
     for platform_id in distinct_platforms(ordered_assets):
-        lines.append(f"### {PLATFORM_DISPLAY_NAMES.get(platform_id, platform_id)}")
+        lines.append(f"### {format_platform_delivery_label(platform_id)}")
         for asset in ordered_assets:
             if asset.platform_id != platform_id:
                 continue
@@ -601,7 +626,7 @@ def build_public_release_readme(version: str, public_repo: str, assets: list[Rel
     ordered_assets = sort_release_assets(assets)
     summary = build_release_summary(version, ordered_assets)
     platform_ids = distinct_platforms(ordered_assets)
-    platform_labels = [PLATFORM_DISPLAY_NAMES.get(item, item) for item in platform_ids]
+    platform_labels = format_platform_delivery_labels(platform_ids)
     lines = [
         "# Wateray Release",
         "",
@@ -628,7 +653,7 @@ def build_public_release_readme(version: str, public_repo: str, assets: list[Rel
         "",
     ]
     for platform_id in platform_ids:
-        lines.append(f"### {PLATFORM_DISPLAY_NAMES.get(platform_id, platform_id)}")
+        lines.append(f"### {format_platform_delivery_label(platform_id)}")
         lines.append("")
         for asset in ordered_assets:
             if asset.platform_id != platform_id:

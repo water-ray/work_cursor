@@ -11,6 +11,6 @@ TARGET = DesktopBuildTarget(
     go_arch="arm64",
     output_dir_name="Wateray-macos",
     daemon_binary_name="waterayd",
-    frontend_entry_name="WaterayApp.app",
+    frontend_entry_name="Wateray.app",
     tauri_binary_name="wateray_tauri",
 )

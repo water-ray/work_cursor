@@ -2,13 +2,13 @@ import type { HelpContent } from "../../../components/form/HelpLabel";
 
 export const desktopProxyPagePlatform = {
   fixedTunMode: false,
+  supportsSniffOverrideDestination: false,
   modeSwitchLabel: "网卡模式",
   modeSwitchHelpContent: {
     effect: "控制默认启动模式：开启为虚拟网卡模式，关闭为系统代理模式。",
     recommendation:
       "需全局接管流量时优先开启；仅浏览器等显式代理场景可关闭。若当前代理正在运行，切换后会自动刷新服务。",
   } satisfies HelpContent,
-  modeSwitchAlertDescription: "",
   smartOptimizeHelpContent: {
     scene:
       "启动前希望自动挑选更稳或更符合地区偏好的节点，例如固定优先某个国家，或日常直接选当前激活订阅分组里的最佳节点。",

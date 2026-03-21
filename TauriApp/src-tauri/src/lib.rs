@@ -10,6 +10,8 @@ pub fn run() {
 
     let app = tauri::Builder::default()
         .manage(desktop_host::runtime::FrontendStartupState::default())
+        .manage(desktop_host::runtime::DaemonBaseUrlState::default())
+        .manage(desktop_host::runtime::InstalledDesktopAppCandidatesState::default())
         .manage(desktop_host::updates::AppUpdateManager::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_http::init())
@@ -25,6 +27,7 @@ pub fn run() {
             }
             desktop_host::runtime::cleanup_stale_linux_dev_desktop_override();
             desktop_host::runtime::apply_main_window_icon(app.handle());
+            desktop_host::runtime::apply_platform_window_chrome(app.handle());
             if desktop_host::runtime::runtime_platform_info().supports_tray {
                 if let Err(error) = desktop_host::runtime::ensure_system_tray(app.handle()) {
                     log::error!("failed to initialize system tray: {error}");
@@ -52,6 +55,8 @@ pub fn run() {
             desktop_host::runtime::system_read_text_file,
             desktop_host::runtime::system_write_text_file,
             desktop_host::runtime::system_write_temp_text_file,
+            desktop_host::runtime::system_get_file_icon_data_url,
+            desktop_host::runtime::system_list_installed_app_candidates,
             desktop_host::runtime::system_read_clipboard_file_paths,
             desktop_host::runtime::system_write_clipboard_file,
             mobile_host::mobile_host_get_status,

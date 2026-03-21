@@ -575,6 +575,8 @@ export function DnsPage({ snapshot, loading, runAction }: DaemonPageProps) {
   const conflictHints = useMemo(() => buildConflictHints(sanitizeConfig(dnsConfig)), [dnsConfig]);
   const canSubmitDNSDraft = dnsDirty && validationIssues.length === 0 && !applyingDNS;
   const canRevertDNSDraft = dnsDirty && !applyingDNS;
+  const shouldApplyDNSRuntime =
+    isMobileView || (snapshot?.connectionStage === "connected" && snapshot.proxyMode !== "off");
 
   const updateEndpoint = (role: DNSResolverRole, patch: Partial<DNSResolverEndpoint>) => {
     setDnsConfig((current) => ({
@@ -617,7 +619,7 @@ export function DnsPage({ snapshot, loading, runAction }: DaemonPageProps) {
     try {
       const nextSnapshot = await runAction(() =>
         daemonApi.setSettings({
-          applyRuntime: isMobileView,
+          applyRuntime: shouldApplyDNSRuntime,
           dns: nextConfig,
         }),
       );

@@ -23,6 +23,8 @@ alwaysApply: false
   - Reuse shared `HelpLabel` / `SwitchWithLabel.helpContent`; do not build page-local `Popover + question-circle` helpers.
   - Help copy follows structured sections: default `使用场景 / 作用 / 注意` and optional `推荐`; when label meaning is already explicit, allow concise `作用 / 推荐`.
   - Use component-managed line breaks (`\n` or structured sections), and keep help icon on the label's right side.
+- Static explanatory copy must not use persistent page-level `Alert`/banner blocks when the content is only mode explanation, usage notes, or other non-actionable help text that inflates layout height.
+- Prefer attaching that guidance to the relevant label/control via `HelpLabel`, `SwitchWithLabel.helpContent`, or concise nearby helper text. Reserve `Alert` for runtime status, risk warnings, or actionable guidance that truly needs strong visual emphasis.
 - Renderer icon source is `bootstrap-icons` via shared `BiIcon`; do not import `@ant-design/icons`.
 - Keep style values tokenized/centralized; avoid repeated hard-coded spacing/radius/colors in JSX/CSS.
 - Keep window chrome behavior (title bar/minimize/maximize/close) in dedicated components + host bridge utilities.
@@ -32,4 +34,7 @@ alwaysApply: false
 ```text
 BAD: page imports `antd/message` and builds local draft toast branches.
 GOOD: page uses `useAppNotice` / `useDraftNotice` and shared draft hooks.
+
+BAD: page shows a full-width `Alert` just to explain a mode or setting.
+GOOD: page moves the explanation into `HelpLabel` / `SwitchWithLabel.helpContent` beside the related control.
 ```

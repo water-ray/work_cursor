@@ -33,7 +33,9 @@ LINUX_DEV_MANIFEST_PATH = LINUX_DEV_INSTALL_DIR / DESKTOP_BUILD_MANIFEST_NAME
 LINUX_DEV_SERVICE_NAME = "waterayd-dev"
 LINUX_DEV_READY_URL = "http://127.0.0.1:39080/v1/state?withLogs=0"
 LINUX_DEV_READY_TIMEOUT_SEC = 20.0
-DEV_CRASH_LOG_DIR = ROOT_DIR / "temp" / "crash" / "waterayd"
+DEV_CRASH_LOG_ROOT_DIR = ROOT_DIR / "temp" / "crash"
+MACOS_DEV_DATA_ROOT = ROOT_DIR / "temp" / "macos" / "waterayd-dev-data"
+MACOS_DEV_ROOT_DATA_ROOT = ROOT_DIR / "temp" / "macos" / "waterayd-dev-data-root"
 
 
 def run_command(command: list[str], cwd: Path, env: dict[str, str] | None = None) -> int:
@@ -47,12 +49,25 @@ def write_stream_targets(targets: list[TextIO], text: str) -> None:
         target.flush()
 
 
+def is_effective_root() -> bool:
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is None:
+        return False
+    return geteuid() == 0
+
+
+def resolve_foreground_core_log_dir() -> Path:
+    # Keep root-run dev logs separate so regular tasks do not inherit root-owned files.
+    return DEV_CRASH_LOG_ROOT_DIR / ("waterayd-root" if is_effective_root() else "waterayd")
+
+
 def build_foreground_core_log_paths() -> tuple[Path, Path]:
-    DEV_CRASH_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_dir = resolve_foreground_core_log_dir()
+    log_dir.mkdir(parents=True, exist_ok=True)
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     return (
-        DEV_CRASH_LOG_DIR / f"waterayd-{timestamp}.log",
-        DEV_CRASH_LOG_DIR / "latest.log",
+        log_dir / f"waterayd-{timestamp}.log",
+        log_dir / "latest.log",
     )
 
 
@@ -64,53 +79,51 @@ def stream_command_with_combined_logging(
     log_path, latest_path = build_foreground_core_log_paths()
     command_text = " ".join(command)
     started_at = time.strftime("%Y-%m-%d %H:%M:%S")
-    with (
-        log_path.open("w", encoding="utf-8", newline="") as log_file,
-        latest_path.open("w", encoding="utf-8", newline="") as latest_file,
-    ):
-        log_targets = [log_file, latest_file]
-        write_stream_targets(
-            log_targets,
-            (
-                f"[waterayd-dev]\n"
-                f"started_at={started_at}\n"
-                f"cwd={cwd}\n"
-                f"command={command_text}\n\n"
-            ),
-        )
-        print(f"[waterayd-dev] logging to {log_path}", flush=True)
-        try:
-            process = subprocess.Popen(
-                command,
-                cwd=str(cwd),
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
+    with log_path.open("w", encoding="utf-8", newline="") as log_file:
+        with latest_path.open("w", encoding="utf-8", newline="") as latest_file:
+            log_targets = [log_file, latest_file]
+            write_stream_targets(
+                log_targets,
+                (
+                    f"[waterayd-dev]\n"
+                    f"started_at={started_at}\n"
+                    f"cwd={cwd}\n"
+                    f"command={command_text}\n\n"
+                ),
             )
-        except OSError as error:
-            message = f"[waterayd-dev] launch failed: {error}\n"
-            sys.stderr.write(message)
-            sys.stderr.flush()
-            write_stream_targets(log_targets, message)
-            return 1
+            print(f"[waterayd-dev] logging to {log_path}", flush=True)
+            try:
+                process = subprocess.Popen(
+                    command,
+                    cwd=str(cwd),
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                )
+            except OSError as error:
+                message = f"[waterayd-dev] launch failed: {error}\n"
+                sys.stderr.write(message)
+                sys.stderr.flush()
+                write_stream_targets(log_targets, message)
+                return 1
 
-        stdout = process.stdout
-        if stdout is not None:
-            for line in stdout:
-                sys.stdout.write(line)
-                sys.stdout.flush()
-                write_stream_targets(log_targets, line)
+            stdout = process.stdout
+            if stdout is not None:
+                for line in stdout:
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+                    write_stream_targets(log_targets, line)
 
-        return_code = process.wait()
-        finished_at = time.strftime("%Y-%m-%d %H:%M:%S")
-        write_stream_targets(
-            log_targets,
-            f"\n[waterayd-dev] finished_at={finished_at}\n[waterayd-dev] exit_code={return_code}\n",
-        )
+            return_code = process.wait()
+            finished_at = time.strftime("%Y-%m-%d %H:%M:%S")
+            write_stream_targets(
+                log_targets,
+                f"\n[waterayd-dev] finished_at={finished_at}\n[waterayd-dev] exit_code={return_code}\n",
+            )
 
     if return_code != 0:
         print(
@@ -336,10 +349,28 @@ def ensure_linux_dev_service() -> int:
     return 0
 
 
+def resolve_macos_dev_data_root() -> Path:
+    explicit_path = os.environ.get("WATERAY_DATA_ROOT", "").strip()
+    if explicit_path:
+        return Path(explicit_path).expanduser()
+    if is_effective_root():
+        # Avoid leaving the regular dev data directory root-owned after TUN sessions.
+        return MACOS_DEV_ROOT_DATA_ROOT
+    return MACOS_DEV_DATA_ROOT
+
+
 def run_foreground_core() -> int:
+    env = None
+    if sys.platform == "darwin":
+        data_root = resolve_macos_dev_data_root()
+        data_root.mkdir(parents=True, exist_ok=True)
+        env = os.environ.copy()
+        env["WATERAY_DATA_ROOT"] = str(data_root)
+        print(f"[waterayd-dev] using data root {data_root}", flush=True)
     return stream_command_with_combined_logging(
         ["go", "run", "-tags", "with_clash_api,with_gvisor,with_quic", "./cmd/waterayd"],
         cwd=CORE_DIR,
+        env=env,
     )
 
 

@@ -5146,6 +5146,7 @@ dependencies = [
 name = "wateray_tauri"
 version = "1.5.1"
 dependencies = [
+ "base64 0.22.1",
  "log",
  "serde",
  "serde_json",
