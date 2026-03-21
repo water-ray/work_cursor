@@ -15,6 +15,7 @@ interface FileIconCacheEntry extends FileIconSnapshot {}
 
 const listeners = new Set<Listener>();
 const entries = new Map<string, FileIconCacheEntry>();
+const placeholderEntries = new Map<string, FileIconCacheEntry>();
 
 function emit(): void {
   for (const listener of listeners) {
@@ -44,14 +45,21 @@ function buildSnapshot(path: string, sizePx?: number, entry?: FileIconCacheEntry
   if (entry) {
     return entry;
   }
-  return {
-    key: buildFileIconKey(normalizedPath, normalizedSize),
+  const key = buildFileIconKey(normalizedPath, normalizedSize);
+  const placeholder = placeholderEntries.get(key);
+  if (placeholder) {
+    return placeholder;
+  }
+  const created: FileIconCacheEntry = {
+    key,
     path: normalizedPath,
     sizePx: normalizedSize,
     url: null,
     loading: false,
     resolved: false,
   };
+  placeholderEntries.set(key, created);
+  return created;
 }
 
 async function loadFileIcon(path: string, sizePx?: number): Promise<void> {
@@ -65,6 +73,7 @@ async function loadFileIcon(path: string, sizePx?: number): Promise<void> {
   if (current?.loading || current?.resolved) {
     return;
   }
+  placeholderEntries.delete(key);
   entries.set(key, {
     key,
     path: normalizedPath,
@@ -77,6 +86,7 @@ async function loadFileIcon(path: string, sizePx?: number): Promise<void> {
   try {
     const resolved = await getPlatformAdapter().system.getFileIconDataUrl(normalizedPath, normalizedSize);
     const normalizedUrl = String(resolved ?? "").trim();
+    placeholderEntries.delete(key);
     entries.set(key, {
       key,
       path: normalizedPath,
@@ -87,6 +97,7 @@ async function loadFileIcon(path: string, sizePx?: number): Promise<void> {
     });
     emit();
   } catch {
+    placeholderEntries.delete(key);
     entries.set(key, {
       key,
       path: normalizedPath,

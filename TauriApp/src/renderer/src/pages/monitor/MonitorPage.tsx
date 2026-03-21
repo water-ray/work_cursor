@@ -163,6 +163,10 @@ function normalizeAppCandidateMatchText(value: string): string {
   return value.trim().toLowerCase();
 }
 
+function normalizeProcessMatchPath(value: string): string {
+  return value.trim().replace(/\s+\(deleted\)$/i, "");
+}
+
 function tokenizeAppCandidateMatchText(value: string): string[] {
   return normalizeAppCandidateMatchText(value)
     .split(/[^a-z0-9]+/g)
@@ -175,7 +179,10 @@ function scoreInstalledAppCandidateMatch(
   processPath: string,
 ): number {
   const normalizedProcessName = normalizeAppCandidateMatchText(processName);
-  const normalizedProcessPath = normalizeAppCandidateMatchText(processPath).replace(/\\/g, "/");
+  const normalizedProcessPath = normalizeAppCandidateMatchText(normalizeProcessMatchPath(processPath)).replace(/\\/g, "/");
+  const normalizedProcessExecutableName = normalizeAppCandidateMatchText(
+    deriveProcessNameFromPath(normalizeProcessMatchPath(processPath)),
+  );
   const candidateName = normalizeAppCandidateMatchText(candidate.name);
   const candidatePath = normalizeAppCandidateMatchText(candidate.path).replace(/\\/g, "/");
   const executableName = normalizeAppCandidateMatchText(candidate.executableName);
@@ -203,6 +210,15 @@ function scoreInstalledAppCandidateMatch(
   if (bundleId !== "" && normalizedProcessName === bundleId) {
     score += 180;
   }
+  if (executableName !== "" && normalizedProcessExecutableName === executableName) {
+    score += 180;
+  }
+  if (candidateName !== "" && normalizedProcessExecutableName === candidateName) {
+    score += 120;
+  }
+  if (bundleId !== "" && normalizedProcessExecutableName === bundleId) {
+    score += 120;
+  }
   if (candidateName !== "" && normalizedProcessPath.includes(`/${candidateName}/`)) {
     score += 120;
   }
@@ -222,12 +238,19 @@ function scoreInstalledAppCandidateMatch(
       .filter((token) => !["com", "app", "apple"].includes(token))
       .slice(-3),
   ]);
+  const processTokens = new Set([
+    ...tokenizeAppCandidateMatchText(normalizedProcessName),
+    ...tokenizeAppCandidateMatchText(normalizedProcessExecutableName),
+  ]);
   for (const token of tokens) {
     if (normalizedProcessPath.includes(`/${token}/`)) {
       score += 28;
     }
     if (normalizedProcessName.includes(token)) {
       score += 18;
+    }
+    if (processTokens.has(token)) {
+      score += 42;
     }
   }
   return score;
@@ -294,7 +317,7 @@ function deriveProcessPresentation(
   iconPath: string;
 } {
   const normalizedName = processName.trim();
-  const normalizedPath = processPath.trim();
+  const normalizedPath = normalizeProcessMatchPath(processPath);
   const bundlePath = collectMacOSAppBundlePaths(normalizedPath)[0] ?? "";
   const bundleName = bundlePath
     .split("/")
@@ -762,9 +785,10 @@ function remapSessionProcessPresentations(
   if (installedApps.length === 0) {
     return sessions;
   }
-  return sessions.map((session) => ({
-    ...session,
-    records: session.records.map((record) => {
+  let hasSessionChanges = false;
+  const nextSessions = sessions.map((session) => {
+    let sessionChanged = false;
+    const nextRecords = session.records.map((record) => {
       const nextPresentation = deriveProcessPresentation(
         record.processName,
         record.processPath,
@@ -777,14 +801,24 @@ function remapSessionProcessPresentations(
       ) {
         return record;
       }
+      sessionChanged = true;
       return {
         ...record,
         processDisplayName: nextPresentation.displayName,
         processDisplaySubtitle: nextPresentation.displaySubtitle,
         processIconPath: nextPresentation.iconPath,
       };
-    }),
-  }));
+    });
+    if (!sessionChanged) {
+      return session;
+    }
+    hasSessionChanges = true;
+    return {
+      ...session,
+      records: nextRecords,
+    };
+  });
+  return hasSessionChanges ? nextSessions : sessions;
 }
 
 function mapSessionSummaryToPageSession(

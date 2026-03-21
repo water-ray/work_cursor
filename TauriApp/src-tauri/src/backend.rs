@@ -207,6 +207,14 @@ struct EmbeddedLinuxAsset {
 }
 
 #[cfg(target_os = "linux")]
+struct LinuxDesktopEntryInfo {
+    name: String,
+    exec_value: String,
+    icon_value: String,
+    desktop_id: String,
+}
+
+#[cfg(target_os = "linux")]
 static EMBEDDED_LINUX_RELEASE_ASSETS: &[EmbeddedLinuxAsset] = &[
     EmbeddedLinuxAsset {
         file_name: LINUX_EMBEDDED_INSTALL_SCRIPT_NAME,
@@ -877,7 +885,66 @@ fn list_installed_app_candidates_impl(
     read_cached_macos_installed_app_candidates(app).unwrap_or_default()
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn scan_linux_installed_app_candidates() -> Vec<InstalledDesktopAppCandidate> {
+    let mut candidates = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for entry_path in collect_linux_desktop_entry_paths() {
+        let Some(info) = parse_linux_desktop_entry_info(&entry_path) else {
+            continue;
+        };
+        let executable_name = resolve_linux_exec_program(&info.exec_value)
+            .and_then(|value| {
+                Path::new(value.trim())
+                    .file_stem()
+                    .or_else(|| Path::new(value.trim()).file_name())
+                    .and_then(|item| item.to_str())
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        let candidate_path = entry_path.to_string_lossy().trim().to_string();
+        if candidate_path.is_empty() {
+            continue;
+        }
+        let dedupe_key = format!(
+            "{}::{}",
+            info.desktop_id.to_ascii_lowercase(),
+            candidate_path.to_ascii_lowercase()
+        );
+        if !seen.insert(dedupe_key) {
+            continue;
+        }
+        candidates.push(InstalledDesktopAppCandidate {
+            name: info.name,
+            path: candidate_path,
+            executable_name,
+            bundle_id: info.desktop_id,
+        });
+    }
+    candidates.sort_by(|left, right| {
+        left.name
+            .to_ascii_lowercase()
+            .cmp(&right.name.to_ascii_lowercase())
+            .then_with(|| {
+                left.path
+                    .to_ascii_lowercase()
+                    .cmp(&right.path.to_ascii_lowercase())
+            })
+    });
+    candidates
+}
+
+#[cfg(target_os = "linux")]
+fn list_installed_app_candidates_impl(
+    _app: &AppHandle,
+    _state: &InstalledDesktopAppCandidatesState,
+) -> Vec<InstalledDesktopAppCandidate> {
+    scan_linux_installed_app_candidates()
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
 fn list_installed_app_candidates_impl(
     _app: &AppHandle,
     _state: &InstalledDesktopAppCandidatesState,
@@ -1236,11 +1303,42 @@ fn resolve_windows_file_icon_data_url(target_path: &Path, size_px: u32) -> Optio
 
 #[cfg(target_os = "linux")]
 fn resolve_linux_file_icon_data_url(target_path: &Path, size_px: u32) -> Option<String> {
-    let normalized_target =
-        fs::canonicalize(target_path).unwrap_or_else(|_| target_path.to_path_buf());
+    let normalized_target = normalize_linux_icon_target_path(target_path);
+    if normalized_target
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.eq_ignore_ascii_case("desktop"))
+        .unwrap_or(false)
+    {
+        let icon_path = parse_linux_desktop_entry_info(&normalized_target)
+            .and_then(|info| resolve_linux_icon_value_path(&info.icon_value, size_px))?;
+        return read_image_file_data_url(&icon_path);
+    }
     let icon_path = resolve_linux_desktop_entry_icon_path(&normalized_target, size_px)
+        .or_else(|| resolve_linux_nearby_desktop_entry_icon_path(&normalized_target, size_px))
+        .or_else(|| resolve_linux_nearby_image_icon_path(&normalized_target, size_px))
         .or_else(|| resolve_linux_executable_icon_path(&normalized_target, size_px))?;
     read_image_file_data_url(&icon_path)
+}
+
+#[cfg(target_os = "linux")]
+fn strip_linux_deleted_suffix_text(value: &str) -> &str {
+    let trimmed = value.trim();
+    trimmed.strip_suffix(" (deleted)").unwrap_or(trimmed)
+}
+
+#[cfg(target_os = "linux")]
+fn normalize_linux_icon_target_path(target_path: &Path) -> PathBuf {
+    if let Ok(canonicalized) = fs::canonicalize(target_path) {
+        return canonicalized;
+    }
+    let raw_text = target_path.to_string_lossy();
+    let normalized_text = strip_linux_deleted_suffix_text(&raw_text);
+    if normalized_text != raw_text {
+        let normalized_path = PathBuf::from(normalized_text);
+        return fs::canonicalize(&normalized_path).unwrap_or(normalized_path);
+    }
+    target_path.to_path_buf()
 }
 
 #[cfg(target_os = "linux")]
@@ -1262,6 +1360,59 @@ fn resolve_linux_desktop_entry_icon_path(target_path: &Path, size_px: u32) -> Op
         }
     }
     best_match.map(|(_, path)| path)
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_linux_nearby_desktop_entry_icon_path(target_path: &Path, size_px: u32) -> Option<PathBuf> {
+    let mut best_match: Option<(i32, PathBuf)> = None;
+    for dir in collect_linux_nearby_search_dirs(target_path) {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(|value| value.eq_ignore_ascii_case("desktop"))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let Some((exec_value, icon_value)) = parse_linux_desktop_entry(&path) else {
+                continue;
+            };
+            let score = score_linux_desktop_entry_match(&exec_value, target_path);
+            if score <= 0 {
+                continue;
+            }
+            let Some(icon_path) = resolve_linux_icon_value_path(&icon_value, size_px) else {
+                continue;
+            };
+            let score = score + 40;
+            match &best_match {
+                Some((best_score, _)) if *best_score >= score => {}
+                _ => best_match = Some((score, icon_path)),
+            }
+        }
+    }
+    best_match.map(|(_, path)| path)
+}
+
+#[cfg(target_os = "linux")]
+fn collect_linux_nearby_search_dirs(target_path: &Path) -> Vec<PathBuf> {
+    let mut result = Vec::new();
+    let mut current = target_path.parent().map(Path::to_path_buf);
+    for _ in 0..2 {
+        let Some(dir) = current.take() else {
+            break;
+        };
+        if !result.iter().any(|existing| existing == &dir) {
+            result.push(dir.clone());
+        }
+        current = dir.parent().map(Path::to_path_buf);
+    }
+    result
 }
 
 #[cfg(target_os = "linux")]
@@ -1313,11 +1464,28 @@ fn collect_linux_desktop_entry_roots() -> Vec<PathBuf> {
 
 #[cfg(target_os = "linux")]
 fn parse_linux_desktop_entry(entry_path: &Path) -> Option<(String, String)> {
+    let info = parse_linux_desktop_entry_info(entry_path)?;
+    Some((info.exec_value, info.icon_value))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_desktop_entry_boolean(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "true" | "1" | "yes" | "on"
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_desktop_entry_info(entry_path: &Path) -> Option<LinuxDesktopEntryInfo> {
     let content = fs::read_to_string(entry_path).ok()?;
     let mut in_desktop_entry = false;
+    let mut name_value: Option<String> = None;
     let mut exec_value: Option<String> = None;
     let mut icon_value: Option<String> = None;
     let mut desktop_type = String::new();
+    let mut hidden = false;
+    let mut no_display = false;
     for line in content.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -1328,6 +1496,16 @@ fn parse_linux_desktop_entry(entry_path: &Path) -> Option<(String, String)> {
             continue;
         }
         if !in_desktop_entry {
+            continue;
+        }
+        if trimmed.starts_with("Name[") {
+            continue;
+        }
+        if let Some(value) = trimmed.strip_prefix("Name=") {
+            let normalized = value.trim();
+            if !normalized.is_empty() {
+                name_value = Some(normalized.to_string());
+            }
             continue;
         }
         if let Some(value) = trimmed.strip_prefix("Exec=") {
@@ -1343,12 +1521,34 @@ fn parse_linux_desktop_entry(entry_path: &Path) -> Option<(String, String)> {
         }
         if let Some(value) = trimmed.strip_prefix("Type=") {
             desktop_type = value.trim().to_string();
+            continue;
+        }
+        if let Some(value) = trimmed.strip_prefix("NoDisplay=") {
+            no_display = parse_linux_desktop_entry_boolean(value);
+            continue;
+        }
+        if let Some(value) = trimmed.strip_prefix("Hidden=") {
+            hidden = parse_linux_desktop_entry_boolean(value);
         }
     }
     if !desktop_type.is_empty() && !desktop_type.eq_ignore_ascii_case("Application") {
         return None;
     }
-    Some((exec_value?, icon_value?))
+    if hidden || no_display {
+        return None;
+    }
+    let desktop_id = entry_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)?;
+    Some(LinuxDesktopEntryInfo {
+        name: name_value.unwrap_or_else(|| desktop_id.clone()),
+        exec_value: exec_value?,
+        icon_value: icon_value?,
+        desktop_id,
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -1356,18 +1556,17 @@ fn score_linux_desktop_entry_match(exec_value: &str, target_path: &Path) -> i32 
     let Some(program) = resolve_linux_exec_program(exec_value) else {
         return 0;
     };
-    let normalized_target =
-        fs::canonicalize(target_path).unwrap_or_else(|_| target_path.to_path_buf());
+    let normalized_target = normalize_linux_icon_target_path(target_path);
     let normalized_target_text = normalized_target.to_string_lossy().to_ascii_lowercase();
     let target_name = normalized_target
         .file_name()
         .and_then(|value| value.to_str())
-        .map(|value| value.trim().to_ascii_lowercase())
+        .map(|value| strip_linux_deleted_suffix_text(value).to_ascii_lowercase())
         .unwrap_or_default();
     let target_stem = normalized_target
         .file_stem()
         .and_then(|value| value.to_str())
-        .map(|value| value.trim().to_ascii_lowercase())
+        .map(|value| strip_linux_deleted_suffix_text(value).to_ascii_lowercase())
         .unwrap_or_default();
     let program_path = PathBuf::from(&program);
     if program_path.is_absolute() && linux_paths_equal(&program_path, &normalized_target) {
@@ -1401,6 +1600,19 @@ fn score_linux_desktop_entry_match(exec_value: &str, target_path: &Path) -> i32 
     }
     if !program_stem.is_empty() && target_stem.contains(&program_stem) {
         score += 24;
+    }
+    let target_tokens = tokenize_linux_match_text(&format!("{target_name} {target_stem}"));
+    let program_tokens =
+        tokenize_linux_match_text(&format!("{program_name} {program_stem} {program}"));
+    let shared_tokens = target_tokens
+        .iter()
+        .filter(|token| program_tokens.iter().any(|candidate| candidate == *token))
+        .count() as i32;
+    if shared_tokens > 0 {
+        score += shared_tokens * 56;
+        if target_tokens.len() == 1 {
+            score += 40;
+        }
     }
     score
 }
@@ -1481,10 +1693,24 @@ fn tokenize_linux_exec_command(raw: &str) -> Vec<String> {
 }
 
 #[cfg(target_os = "linux")]
+fn tokenize_linux_match_text(raw: &str) -> Vec<String> {
+    raw.to_ascii_lowercase()
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .map(str::trim)
+        .filter(|token| token.len() >= 3)
+        .fold(Vec::<String>::new(), |mut values, token| {
+            if !values.iter().any(|existing| existing == token) {
+                values.push(token.to_string());
+            }
+            values
+        })
+}
+
+#[cfg(target_os = "linux")]
 fn collect_linux_executable_icon_names(target_path: &Path) -> Vec<String> {
     let mut result = Vec::new();
     let push_unique = |items: &mut Vec<String>, value: &str| {
-        let trimmed = value.trim();
+        let trimmed = strip_linux_deleted_suffix_text(value);
         if trimmed.is_empty() {
             return;
         }
@@ -1517,6 +1743,44 @@ fn collect_linux_executable_icon_names(target_path: &Path) -> Vec<String> {
 }
 
 #[cfg(target_os = "linux")]
+fn resolve_linux_nearby_image_icon_path(target_path: &Path, size_px: u32) -> Option<PathBuf> {
+    let icon_names = collect_linux_executable_icon_names(target_path);
+    if icon_names.is_empty() {
+        return None;
+    }
+    let mut best_match: Option<(i32, PathBuf)> = None;
+    for (dir_index, dir) in collect_linux_nearby_search_dirs(target_path).into_iter().enumerate() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if image_mime_from_path(&path).is_none() {
+                continue;
+            }
+            let stem = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .map(strip_linux_deleted_suffix_text)
+                .unwrap_or("");
+            if !icon_names
+                .iter()
+                .any(|icon_name| stem.eq_ignore_ascii_case(strip_linux_deleted_suffix_text(icon_name)))
+            {
+                continue;
+            }
+            let proximity_bonus = if dir_index == 0 { 48 } else { 24 };
+            let score = score_linux_icon_path(&path, size_px) + proximity_bonus;
+            match &best_match {
+                Some((best_score, _)) if *best_score >= score => {}
+                _ => best_match = Some((score, path)),
+            }
+        }
+    }
+    best_match.map(|(_, path)| path)
+}
+
+#[cfg(target_os = "linux")]
 fn resolve_linux_executable_icon_path(target_path: &Path, size_px: u32) -> Option<PathBuf> {
     for icon_name in collect_linux_executable_icon_names(target_path) {
         if let Some(icon_path) = resolve_linux_icon_value_path(&icon_name, size_px) {
@@ -1536,12 +1800,19 @@ fn resolve_linux_icon_value_path(icon_value: &str, size_px: u32) -> Option<PathB
     if icon_path.is_absolute() && icon_path.is_file() {
         return image_mime_from_path(&icon_path).map(|_| icon_path);
     }
-    let icon_name = Path::new(trimmed)
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(trimmed);
+    let icon_name = if trimmed.contains('/') || trimmed.contains('\\') {
+        Path::new(trimmed)
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(trimmed)
+    } else {
+        // Linux desktop Icon= commonly uses icon theme names like
+        // "org.telegram.desktop". Dots are part of the icon name, not a file
+        // extension, so keep the raw value for theme lookup.
+        trimmed
+    };
     search_linux_icon_path(icon_name, size_px)
 }
 
@@ -1571,7 +1842,7 @@ fn search_linux_icon_path(icon_name: &str, size_px: u32) -> Option<PathBuf> {
                     .and_then(|value| value.to_str())
                     .map(str::trim)
                     .unwrap_or("");
-                if !stem.eq_ignore_ascii_case(normalized_icon_name)
+                if !linux_icon_stem_matches(normalized_icon_name, stem)
                     || image_mime_from_path(&path).is_none()
                 {
                     continue;
@@ -1585,6 +1856,37 @@ fn search_linux_icon_path(icon_name: &str, size_px: u32) -> Option<PathBuf> {
         }
     }
     best_match.map(|(_, path)| path)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_icon_stem_matches(expected_icon_name: &str, candidate_stem: &str) -> bool {
+    normalize_linux_icon_stem(expected_icon_name).eq_ignore_ascii_case(&normalize_linux_icon_stem(candidate_stem))
+}
+
+#[cfg(target_os = "linux")]
+fn normalize_linux_icon_stem(value: &str) -> String {
+    let mut normalized = value.trim().to_ascii_lowercase();
+    for suffix in [
+        "-symbolic-ltr",
+        "-symbolic-rtl",
+        "_symbolic_ltr",
+        "_symbolic_rtl",
+        ".symbolic-ltr",
+        ".symbolic-rtl",
+        "-symbolic",
+        "_symbolic",
+        ".symbolic",
+        "-ltr",
+        "-rtl",
+        "_ltr",
+        "_rtl",
+    ] {
+        if normalized.ends_with(suffix) {
+            normalized.truncate(normalized.len() - suffix.len());
+            break;
+        }
+    }
+    normalized
 }
 
 #[cfg(target_os = "linux")]
@@ -2004,7 +2306,7 @@ fn resolve_current_install_dir() -> Result<PathBuf, String> {
 
 #[cfg(target_os = "linux")]
 fn extract_embedded_linux_packaged_assets() -> Result<PathBuf, String> {
-    let unique_suffix = SystemTime::now()
+    let unique_suffix = std::time::SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| format!("获取 Linux 临时资源时间戳失败：{error}"))?
         .as_millis();
