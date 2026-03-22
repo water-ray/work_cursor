@@ -44,7 +44,7 @@
     },
     // 3. 在左侧资源管理器中隐藏这些目录（可选，界面更清爽）
     "files.exclude": {
-      "**/Bin/**": true,
+      "**/Bin/**": false,
       "**/core/bin/**": true,
       "**/core/dist/**": true,
       "**/core/prebuilt/**": true,

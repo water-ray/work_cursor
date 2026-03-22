@@ -55,6 +55,9 @@ class DesktopBuildTarget:
     daemon_binary_name: str
     frontend_entry_name: str
     tauri_binary_name: str
+    go_arches: tuple[str, ...] = ()
+    rust_targets: tuple[str, ...] = ()
+    tauri_target: str = ""
     icon_path: str | None = None
     needs_windows_manifest: bool = False
     desktop_bundle_supported: bool = False
@@ -69,6 +72,8 @@ class DesktopBuildTarget:
 
     @property
     def tauri_binary_path(self) -> Path:
+        if self.tauri_target:
+            return TAURI_BINARY_TARGET_DIR.parent / self.tauri_target / "release" / self.tauri_binary_name
         return TAURI_BINARY_TARGET_DIR / self.tauri_binary_name
 
 
@@ -248,44 +253,110 @@ def build_windows_manifest() -> None:
         raise BuildError(20, "backend_manifest", f"未生成资源文件：{TEMP_SYSO_PATH}")
 
 
+def ensure_rust_targets_installed(targets: tuple[str, ...]) -> None:
+    if not targets:
+        return
+    result = subprocess.run(
+        ["rustup", "target", "list", "--installed"],
+        cwd=str(ROOT_DIR),
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        raise BuildError(14, "prepare", "无法读取已安装的 Rust targets，请确认 rustup 可用")
+    installed_targets = {line.strip() for line in result.stdout.splitlines() if line.strip()}
+    missing_targets = [target for target in targets if target not in installed_targets]
+    if not missing_targets:
+        return
+    print_step(f"安装 Rust 构建目标: {', '.join(missing_targets)}")
+    run_command(["rustup", "target", "add", *missing_targets], cwd=ROOT_DIR, stage="prepare", code=14)
+
+
+def resolve_target_go_arches(target: DesktopBuildTarget) -> tuple[str, ...]:
+    return target.go_arches or (target.go_arch,)
+
+
+def build_backend_release_binary(
+    target: DesktopBuildTarget,
+    release_version: str,
+    go_arch: str,
+    output_path: Path,
+) -> None:
+    env = os.environ.copy()
+    env["GOOS"] = target.go_os
+    env["GOARCH"] = go_arch
+    ldflags_parts = [
+        "-s",
+        "-w",
+        f"-X main.appVersion={release_version}",
+        "-X wateray/core/internal/control.bundledReleaseAssetsEnabled=1",
+    ]
+    if target.go_os == "windows":
+        # 发布态由桌面宿主托管，不需要额外的控制台窗口。
+        ldflags_parts.append("-H=windowsgui")
+    ldflags_value = " ".join(ldflags_parts)
+    run_command(
+        [
+            "go",
+            "build",
+            "-tags",
+            "with_clash_api,with_gvisor,with_quic",
+            "-trimpath",
+            "-ldflags",
+            ldflags_value,
+            "-o",
+            str(output_path),
+            "./cmd/waterayd",
+        ],
+        cwd=CORE_DIR,
+        stage="backend_build",
+        code=21,
+        env=env,
+    )
+
+
 def build_backend_release(target: DesktopBuildTarget, release_version: str) -> None:
     print_step(f"编译后端 {target.daemon_binary_name}")
     embedded_assets_backup: Path | None = None
+    go_arches = resolve_target_go_arches(target)
     try:
         embedded_assets_backup = prepare_core_embedded_release_assets()
         if target.needs_windows_manifest:
             build_windows_manifest()
-        env = os.environ.copy()
-        env["GOOS"] = target.go_os
-        env["GOARCH"] = target.go_arch
-        ldflags_parts = [
-            "-s",
-            "-w",
-            f"-X main.appVersion={release_version}",
-            "-X wateray/core/internal/control.bundledReleaseAssetsEnabled=1",
-        ]
-        if target.go_os == "windows":
-            # 发布态由桌面宿主托管，不需要额外的控制台窗口。
-            ldflags_parts.append("-H=windowsgui")
-        ldflags_value = " ".join(ldflags_parts)
-        run_command(
-            [
-                "go",
-                "build",
-                "-tags",
-                "with_clash_api,with_gvisor,with_quic",
-                "-trimpath",
-                "-ldflags",
-                ldflags_value,
-                "-o",
-                str(target.bin_core_dir / target.daemon_binary_name),
-                "./cmd/waterayd",
-            ],
-            cwd=CORE_DIR,
-            stage="backend_build",
-            code=21,
-            env=env,
-        )
+        daemon_path = target.bin_core_dir / target.daemon_binary_name
+        if len(go_arches) == 1:
+            build_backend_release_binary(target, release_version, go_arches[0], daemon_path)
+        else:
+            if target.go_os != "darwin":
+                joined_arches = ", ".join(go_arches)
+                raise BuildError(21, "backend_build", f"{target.platform_id} 暂不支持多架构后端构建：{joined_arches}")
+            stage_dir = ROOT_DIR / "temp" / target.platform_id / "backend-universal"
+            if stage_dir.exists():
+                shutil.rmtree(stage_dir)
+            stage_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                per_arch_paths: list[Path] = []
+                for go_arch in go_arches:
+                    per_arch_path = stage_dir / f"{target.daemon_binary_name}-{go_arch}"
+                    build_backend_release_binary(target, release_version, go_arch, per_arch_path)
+                    per_arch_paths.append(per_arch_path)
+                run_command(
+                    [
+                        "lipo",
+                        "-create",
+                        *[str(path) for path in per_arch_paths],
+                        "-output",
+                        str(daemon_path),
+                    ],
+                    cwd=ROOT_DIR,
+                    stage="backend_lipo",
+                    code=21,
+                )
+            finally:
+                shutil.rmtree(stage_dir, ignore_errors=True)
     finally:
         restore_core_embedded_release_assets(embedded_assets_backup)
         if TEMP_SYSO_PATH.exists():
@@ -313,19 +384,19 @@ def build_frontend_bundle() -> None:
 
 def build_tauri_shell(target: DesktopBuildTarget) -> None:
     print_step("编译 Tauri 桌面宿主")
+    ensure_rust_targets_installed(target.rust_targets)
     env = os.environ.copy()
     env["WATERAY_APP_TARGET"] = "desktop"
     env["VITE_WATERAY_APP_TARGET"] = "desktop"
     if target.platform_id == "linux" and env.get("CI", "").strip() == "1":
         # Tauri CLI expects a boolean string for CI, while some IDEs export `1`.
         env["CI"] = "true"
+    command = ["npx", "tauri", "build"]
+    if target.tauri_target:
+        command.extend(["--target", target.tauri_target])
+    command.append("--no-bundle")
     run_command(
-        [
-            "npx",
-            "tauri",
-            "build",
-            "--no-bundle",
-        ],
+        command,
         cwd=TAURI_DIR,
         stage="frontend_shell_build",
         code=32,

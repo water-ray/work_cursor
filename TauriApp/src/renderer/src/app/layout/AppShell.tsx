@@ -19,7 +19,7 @@ import { MobileSubscriptionsQuickBar } from "./MobileSubscriptionsQuickBar";
 
 function shouldUseNativeMacWindowChrome(systemType: string | undefined): boolean {
   const normalizedSystemType = String(systemType ?? "").trim().toLowerCase();
-  if (normalizedSystemType === "macos") {
+  if (normalizedSystemType === "macos" || normalizedSystemType === "darwin") {
     return true;
   }
   if (typeof navigator === "undefined") {
@@ -276,7 +276,10 @@ export function AppShell({
   }, []);
 
   return (
-    <Layout className="app-shell" style={mobileShellStyle}>
+    <Layout
+      className={`app-shell${useNativeMacWindowChrome ? " app-shell-native-mac-chrome" : ""}`}
+      style={mobileShellStyle}
+    >
       {isDesktopShell ? (
         <WindowTitleBar
           title={resolveTitle(location.pathname)}

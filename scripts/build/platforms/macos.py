@@ -9,10 +9,13 @@ TARGET = DesktopBuildTarget(
     host_platforms=("darwin",),
     go_os="darwin",
     go_arch="arm64",
+    go_arches=("arm64", "amd64"),
     output_dir_name="Wateray-macos",
     daemon_binary_name="waterayd",
     frontend_entry_name="Wateray.app",
     tauri_binary_name="wateray_tauri",
+    rust_targets=("aarch64-apple-darwin", "x86_64-apple-darwin"),
+    tauri_target="universal-apple-darwin",
 )
 
 APP_OUTPUT_DIR_NAME = f"{TARGET.output_dir_name}-app"

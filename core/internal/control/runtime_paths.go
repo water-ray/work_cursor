@@ -19,6 +19,10 @@ func resolveWaterayDataRoot() string {
 	return filepath.Join(configDir, "wateray")
 }
 
+func ResolveWaterayDataRoot() string {
+	return resolveWaterayDataRoot()
+}
+
 func resolveStateFile() string {
 	return filepath.Join(resolveWaterayDataRoot(), "waterayd_state.json")
 }

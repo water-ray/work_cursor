@@ -353,7 +353,7 @@ const startupProgressStages: Array<{
   title: string;
 }> = [
   { key: "precheck", title: "检查启动参数与环境" },
-  { key: "authorize", title: "请求 Android VPN 授权" },
+  { key: "authorize", title: "请求系统授权" },
   { key: "probe", title: "执行节点评分" },
   { key: "select", title: "筛选并切换优选节点" },
   { key: "apply_mode", title: "写入本次启动模式" },

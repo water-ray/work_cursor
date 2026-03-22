@@ -2,6 +2,7 @@
   --app-titlebar-height: 48px;
   --app-bottom-nav-height: 78px;
   --app-bottom-safe-area: env(safe-area-inset-bottom, 0px);
+  --macos-native-toolbar-leading-inset: 86px;
 }
 
 html,
@@ -102,19 +103,37 @@ body {
 }
 
 .window-toolbar {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
   align-items: center;
-  justify-content: space-between;
   gap: 12px;
   padding: 0 12px 0 14px;
 }
 
-.window-toolbar-main {
+.app-shell-native-mac-chrome .window-toolbar {
+  padding-left: var(--macos-native-toolbar-leading-inset);
+}
+
+.window-toolbar-leading {
   min-width: 0;
-  flex: 1 1 auto;
   display: inline-flex;
   align-items: center;
   gap: 12px;
+  justify-self: start;
+}
+
+.window-toolbar-brand {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.window-toolbar-center {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-self: center;
 }
 
 .app-notice-layer {
@@ -858,7 +877,7 @@ body {
 
 .window-toolbar-title {
   display: inline-block;
-  max-width: min(240px, 28vw);
+  max-width: min(320px, 30vw);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -905,6 +924,8 @@ body {
 
 .window-toolbar-actions {
   flex: 0 0 auto;
+  justify-self: end;
+  min-width: 0;
 }
 
 .window-titlebar-actions.ant-space,

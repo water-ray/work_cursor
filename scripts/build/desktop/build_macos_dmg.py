@@ -25,6 +25,7 @@ from scripts.build.common.desktop_builder import (  # noqa: E402
     clean_outputs,
     ensure_frontend_deps,
     ensure_host_supported,
+    ensure_rust_targets_installed,
     ensure_required_files,
     format_size,
     load_release_version,
@@ -34,7 +35,11 @@ from scripts.build.common.desktop_builder import (  # noqa: E402
 from scripts.build.platforms.macos import APP_OUTPUT_DIR_NAME, DMG_FILE_NAME, TARGET  # noqa: E402
 
 
-TAURI_MACOS_BUNDLE_DIR = TAURI_DIR / "src-tauri" / "target" / "release" / "bundle" / "macos"
+TAURI_MACOS_BUNDLE_DIR = (
+    TAURI_DIR / "src-tauri" / "target" / TARGET.tauri_target / "release" / "bundle" / "macos"
+    if TARGET.tauri_target
+    else TAURI_DIR / "src-tauri" / "target" / "release" / "bundle" / "macos"
+)
 MACOS_TEMP_DIR = ROOT_DIR / "temp" / "macos"
 DMG_STAGE_DIR = MACOS_TEMP_DIR / "dmg-stage"
 APP_OUTPUT_DIR = TARGET.bin_dir / APP_OUTPUT_DIR_NAME
@@ -53,15 +58,20 @@ def remove_path(path: Path) -> None:
 
 
 def build_tauri_macos_app() -> Path:
-    print_step("编译 Tauri macOS .app")
+    print_step("编译 Tauri macOS 通用架构 .app")
     remove_path(TAURI_MACOS_BUNDLE_DIR)
+    ensure_rust_targets_installed(TARGET.rust_targets)
     env = os.environ.copy()
     env["WATERAY_APP_TARGET"] = "desktop"
     env["VITE_WATERAY_APP_TARGET"] = "desktop"
     if env.get("CI", "").strip() == "1":
         env["CI"] = "true"
+    command = ["npx", "tauri", "build"]
+    if TARGET.tauri_target:
+        command.extend(["--target", TARGET.tauri_target])
+    command.extend(["--bundles", "app"])
     run_command(
-        ["npx", "tauri", "build", "--bundles", "app"],
+        command,
         cwd=TAURI_DIR,
         stage="frontend_shell_build",
         code=32,
@@ -172,6 +182,7 @@ def print_summary(
     elapsed = time.time() - start_ts
     print_step("构建完成")
     print(f"- 平台：{TARGET.display_name}")
+    print("- 架构：universal (arm64 + x86_64)")
     print(f"- 目录：{TARGET.bin_dir}")
     print(f"- App 目录：{APP_OUTPUT_DIR}")
     print(f"- App：{app_bundle_path} ({format_size(path_size_bytes(app_bundle_path))})")

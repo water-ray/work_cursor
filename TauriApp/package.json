@@ -1,6 +1,6 @@
 {
   "name": "wateray-tauri-app",
-  "version": "1.6.0",
+  "version": "1.6.1",
   "private": true,
   "desktopName": "com.singbox.wateray.desktop",
   "description": "Wateray desktop frontend powered by Tauri v2 + React + Ant Design",

@@ -16,8 +16,12 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_clipboard_manager::init())
-        .plugin(mobile_host::init())
-        .setup(|app| {
+        .plugin(mobile_host::init());
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let app = app.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        desktop_host::runtime::restore_main_window(app);
+    }));
+    let app = app.setup(|app| {
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()
@@ -40,6 +44,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             desktop_host::runtime::runtime_platform_info,
             desktop_host::runtime::ensure_packaged_daemon_running,
+            desktop_host::runtime::ensure_macos_packaged_daemon_admin_for_tun,
             desktop_host::runtime::daemon_transport_bootstrap,
             desktop_host::updates::app_update_get_state,
             desktop_host::updates::app_update_check,

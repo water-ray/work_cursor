@@ -1,3 +1,5 @@
+import { invoke } from "@tauri-apps/api/core";
+
 import type {
   DaemonSnapshot,
   ProbeType,
@@ -178,6 +180,68 @@ function ensureStartupNotCancelled(isCancelled?: () => boolean): void {
   if (isCancelled?.()) {
     throw new Error(startupCancelledErrorMessage);
   }
+}
+
+function shouldRetryMacosTunPrecheckWithAdmin(params: {
+  snapshot: DaemonSnapshot;
+  targetMode: ProxyMode;
+  precheckResult: StartPrecheckResult;
+}): boolean {
+  const { snapshot, targetMode, precheckResult } = params;
+  return (
+    targetMode === "tun"
+    && String(snapshot.systemType ?? "").trim().toLowerCase() === "darwin"
+    && snapshot.runtimeAdmin !== true
+    && (precheckResult.blockers ?? []).some((item) => item.code === "admin_required")
+  );
+}
+
+async function retryMacosTunPrecheckWithAdmin(params: {
+  snapshot: DaemonSnapshot;
+  targetMode: ProxyMode;
+  runAction: (action: () => Promise<DaemonSnapshot>) => Promise<DaemonSnapshot>;
+  onStageChange?: (stage: ServiceStartupStage, detail: string) => void;
+  isCancelled?: () => boolean;
+  cancellationErrorMessage: string;
+}): Promise<{
+  snapshot: DaemonSnapshot;
+  precheckResult: StartPrecheckResult;
+}> {
+  const { snapshot, targetMode, runAction, onStageChange, isCancelled, cancellationErrorMessage } = params;
+  onStageChange?.("precheck", `正在检查 ${resolveModeLabel(targetMode)} 的启动参数与运行环境...`);
+  let precheck = await daemonApi.checkStartPreconditions();
+  ensureStartupNotCancelled(isCancelled);
+  if (!shouldRetryMacosTunPrecheckWithAdmin({
+    snapshot,
+    targetMode,
+    precheckResult: precheck.result,
+  })) {
+    return {
+      snapshot,
+      precheckResult: precheck.result,
+    };
+  }
+  onStageChange?.("authorize", "虚拟网卡模式需要管理员权限，正在请求系统授权...");
+  try {
+    await invoke("ensure_macos_packaged_daemon_admin_for_tun");
+  } catch (error) {
+    const detail =
+      error instanceof Error ? error.message.trim() : String(error ?? "").trim();
+    throw new Error(detail === "" ? "请求 macOS 管理员权限失败" : detail);
+  }
+  ensureStartupNotCancelled(isCancelled);
+  const refreshedSnapshot = await runAction(() => daemonApi.getState(false));
+  ensureStartupNotCancelled(isCancelled);
+  onStageChange?.("precheck", `正在重新检查 ${resolveModeLabel(targetMode)} 的启动参数与运行环境...`);
+  precheck = await daemonApi.checkStartPreconditions();
+  ensureStartupNotCancelled(isCancelled);
+  if (isCancelled?.()) {
+    throw new Error(cancellationErrorMessage);
+  }
+  return {
+    snapshot: refreshedSnapshot,
+    precheckResult: precheck.result,
+  };
 }
 
 async function waitForSmartOptimizeProbeResults(params: {
@@ -800,8 +864,9 @@ export async function startServiceWithSmartOptimize(params: {
     isCancelled,
     cancellationErrorMessage = startupCancelledErrorMessage,
   } = params;
+  let currentSnapshot = snapshot;
   const platformExecutor = getServicePlatformExecutor();
-  const targetMode: ProxyMode = platformExecutor.resolveStartupTargetMode(snapshot);
+  const targetMode: ProxyMode = platformExecutor.resolveStartupTargetMode(currentSnapshot);
   await platformExecutor.ensureStartReady({
     targetMode,
     onStageChange,
@@ -811,23 +876,27 @@ export async function startServiceWithSmartOptimize(params: {
   if (isCancelled?.()) {
     throw new Error(cancellationErrorMessage);
   }
-  onStageChange?.("precheck", `正在检查 ${resolveModeLabel(targetMode)} 的启动参数与运行环境...`);
-  const precheck = await daemonApi.checkStartPreconditions();
-  if (isCancelled?.()) {
-    throw new Error(cancellationErrorMessage);
-  }
-  if (!notifyStartPrecheckResult(notice, precheck.result)) {
+  const precheck = await retryMacosTunPrecheckWithAdmin({
+    snapshot: currentSnapshot,
+    targetMode,
+    runAction,
+    onStageChange,
+    isCancelled,
+    cancellationErrorMessage,
+  });
+  currentSnapshot = precheck.snapshot;
+  if (!notifyStartPrecheckResult(notice, precheck.precheckResult)) {
     return {
       aborted: true,
       targetMode,
       selectedNodeName: "",
-      precheckResult: precheck.result,
+      precheckResult: precheck.precheckResult,
     };
   }
   let selectedNodeName = "";
   if (platformExecutor.shouldOptimizeBeforeStart) {
     const smartOptimizeResult = await resolveSmartOptimizeTargetNode({
-      snapshot,
+      snapshot: currentSnapshot,
       runAction,
       startupSmartOptimize,
       onStageChange,
@@ -912,6 +981,6 @@ export async function startServiceWithSmartOptimize(params: {
     nextSnapshot,
     targetMode,
     selectedNodeName,
-    precheckResult: precheck.result,
+    precheckResult: precheck.precheckResult,
   };
 }

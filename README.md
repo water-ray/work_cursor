@@ -118,6 +118,7 @@ docs/            # 架构、测试与设计文档
   - Windows 会生成 `Bin/Wateray-windows`
   - Linux 会生成 `Bin/Wateray-linux`
   - macOS 会生成 `Bin/Wateray-macos`
+  - macOS 当前默认生成通用架构（Apple Silicon / Intel）
   - macOS 原始 App 目录为 `Bin/Wateray-macos/Wateray-macos-app`
   - macOS 安装镜像为 `Bin/Wateray-macos/Wateray-macos.dmg`
 - 构建 Android 客户端：

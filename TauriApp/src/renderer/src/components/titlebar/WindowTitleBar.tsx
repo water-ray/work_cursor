@@ -477,7 +477,7 @@ export function WindowTitleBar({
   };
 
   const handleTitleBarMouseDown = (event: React.MouseEvent<HTMLDivElement>) => {
-    if (isToolbarLayout || event.button !== 0 || !shouldStartDragging(event.target)) {
+    if (event.button !== 0 || !shouldStartDragging(event.target)) {
       return;
     }
     void getCurrentWindow().startDragging().catch((error) => {
@@ -639,23 +639,20 @@ export function WindowTitleBar({
   return (
     <>
       {isToolbarLayout ? (
-        <div className="window-toolbar">
-          <div className="window-toolbar-main">
-            <div className="window-brand-main">
+        <div className="window-toolbar" onMouseDown={handleTitleBarMouseDown}>
+          <div className="window-toolbar-leading">
+            <div className="window-toolbar-brand">
               {appIconUrl ? (
                 <img className="window-app-icon-image" src={appIconUrl} alt="Wateray" />
               ) : (
                 <span className="window-app-icon">W</span>
               )}
-              <Typography.Text className="window-toolbar-title">{title}</Typography.Text>
-              {isWindows ? (
-                <span
-                  className={`window-runtime-status-dot${runtimeAdmin ? " admin" : " user"}`}
-                  title={runtimeStatusLabel}
-                />
-              ) : null}
+              <Typography.Text className="window-app-name">Wateray</Typography.Text>
             </div>
             {brandTools}
+          </div>
+          <div className="window-toolbar-center">
+            <Typography.Text className="window-toolbar-title">{title}</Typography.Text>
           </div>
           {actionButtons}
         </div>

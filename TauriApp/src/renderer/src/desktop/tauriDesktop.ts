@@ -186,7 +186,10 @@ async function shutdownDaemonFromDesktop(reason: string): Promise<boolean> {
   const response = await daemonTransportManager.request({
     method: "POST",
     path: "/v1/system/shutdown",
-    body: {},
+    body: {
+      reason,
+      removeLaunchdJob: reason === "quit_all",
+    },
     timeoutMs: 5000,
   });
   if (!response.ok) {

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"regexp"
@@ -24,6 +25,7 @@ import (
 )
 
 const defaultUnifiedVersion = "0.1.0"
+const launchdJobLabelEnvName = "WATERAY_LAUNCHD_LABEL"
 
 var trustedDesktopOrigins = map[string]struct{}{
 	"http://127.0.0.1:39080":  {},
@@ -46,21 +48,28 @@ var (
 	strictSemVerPattern = regexp.MustCompile(`^\d+\.\d+\.\d+$`)
 )
 
-func main() {
-	listener, listenPort, err := bindDesktopLoopbackListener()
-	if err != nil {
-		log.Fatalf("waterayd bind loopback listener failed: %v", err)
-	}
-	addr := listener.Addr().String()
-	loopbackAuth := newLoopbackAuthManager()
+type daemonShutdownRequest struct {
+	reason           string
+	removeLaunchdJob bool
+}
 
+func main() {
+	if err := run(); err != nil {
+		log.Fatalf("waterayd failed: %v", err)
+	}
+}
+
+func run() error {
+	if err := ensureRuntimeWorkingDirectory(); err != nil {
+		return fmt.Errorf("prepare runtime working directory failed: %w", err)
+	}
 	lock, err := acquireDaemonInstanceLock()
 	if err != nil {
 		if errors.Is(err, errDaemonAlreadyRunning) {
 			log.Println("waterayd daemon already running, skip duplicate start")
-			return
+			return nil
 		}
-		log.Fatalf("waterayd acquire instance lock failed: %v", err)
+		return fmt.Errorf("acquire instance lock failed: %w", err)
 	}
 	defer func() {
 		if releaseErr := lock.release(); releaseErr != nil {
@@ -68,12 +77,18 @@ func main() {
 		}
 	}()
 
+	listener, listenPort, err := bindDesktopLoopbackListener()
+	if err != nil {
+		return fmt.Errorf("bind loopback listener failed: %w", err)
+	}
+	addr := listener.Addr().String()
+	loopbackAuth := newLoopbackAuthManager()
 	runtimeLabel := "waterayd:http://" + addr
 	store := control.NewRuntimeStore(runtimeLabel, resolveCoreVersion())
-	shutdownRequestCh := make(chan string, 1)
-	requestShutdown := func(reason string) {
+	shutdownRequestCh := make(chan daemonShutdownRequest, 1)
+	requestShutdown := func(req daemonShutdownRequest) {
 		select {
-		case shutdownRequestCh <- reason:
+		case shutdownRequestCh <- req:
 		default:
 		}
 	}
@@ -86,24 +101,30 @@ func main() {
 		Handler:           withRequestSecurityGuards(mux),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
+	serverErrCh := make(chan error, 1)
 
 	go func() {
 		log.Printf("waterayd daemon started on %s", addr)
 		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("waterayd listen failed: %v", err)
+			serverErrCh <- err
 		}
 	}()
 
 	// Daemon mode: keep runtime alive independently of UI process lifecycle.
 	stopSignal := make(chan os.Signal, 1)
 	signal.Notify(stopSignal, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(stopSignal)
 	shutdownReason := "signal"
+	removeLaunchdJob := false
 	select {
 	case <-stopSignal:
-	case reason := <-shutdownRequestCh:
-		if strings.TrimSpace(reason) != "" {
-			shutdownReason = reason
+	case req := <-shutdownRequestCh:
+		if strings.TrimSpace(req.reason) != "" {
+			shutdownReason = req.reason
 		}
+		removeLaunchdJob = req.removeLaunchdJob
+	case err := <-serverErrCh:
+		return fmt.Errorf("listen failed: %w", err)
 	}
 	if shutdownReason != "signal" {
 		log.Printf("waterayd daemon shutdown requested: %s", shutdownReason)
@@ -112,7 +133,53 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	_ = server.Shutdown(ctx)
+	if removeLaunchdJob {
+		if err := removeManagedLaunchdJob(); err != nil {
+			log.Printf("waterayd remove managed launchd job failed: %v", err)
+		}
+	}
 	log.Println("waterayd daemon stopped")
+	return nil
+}
+
+func ensureRuntimeWorkingDirectory() error {
+	dataRoot := strings.TrimSpace(control.ResolveWaterayDataRoot())
+	if dataRoot == "" {
+		return errors.New("runtime data root is empty")
+	}
+	if err := os.MkdirAll(dataRoot, 0o755); err != nil {
+		return fmt.Errorf("create runtime data root failed: %w", err)
+	}
+	if err := os.Chdir(dataRoot); err != nil {
+		return fmt.Errorf("switch runtime working directory failed: %w", err)
+	}
+	return nil
+}
+
+func resolveManagedLaunchdLabel() string {
+	return strings.TrimSpace(os.Getenv(launchdJobLabelEnvName))
+}
+
+func removeManagedLaunchdJob() error {
+	label := resolveManagedLaunchdLabel()
+	if label == "" {
+		return nil
+	}
+	output, err := exec.Command("/bin/launchctl", "remove", label).CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	detail := strings.TrimSpace(string(output))
+	lowerDetail := strings.ToLower(detail)
+	if strings.Contains(lowerDetail, "could not find service") ||
+		strings.Contains(lowerDetail, "service not found") ||
+		strings.Contains(lowerDetail, "not found") {
+		return nil
+	}
+	if detail == "" {
+		return fmt.Errorf("launchctl remove %s failed: %w", label, err)
+	}
+	return fmt.Errorf("launchctl remove %s failed: %w (%s)", label, err, detail)
 }
 
 func resolveCoreVersion() string {
@@ -181,7 +248,7 @@ func resolveCoreVersionFromFile() (string, bool) {
 func registerHandlers(
 	mux *http.ServeMux,
 	store *control.RuntimeStore,
-	requestShutdown func(reason string),
+	requestShutdown func(req daemonShutdownRequest),
 	listenPort int,
 	loopbackAuth *loopbackAuthManager,
 ) {
@@ -766,6 +833,14 @@ func registerHandlers(
 		if !allowMethod(w, r, http.MethodPost) {
 			return
 		}
+		var req struct {
+			Reason           string `json:"reason,omitempty"`
+			RemoveLaunchdJob bool   `json:"removeLaunchdJob,omitempty"`
+		}
+		if err := decodeJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		snapshot, stopErr := store.Stop(r.Context())
 		if stopErr != nil {
 			store.LogCore(
@@ -778,9 +853,17 @@ func registerHandlers(
 			"snapshot": snapshot,
 		})
 		if requestShutdown != nil {
+			reason := strings.TrimSpace(req.Reason)
+			if reason == "" {
+				reason = "api:/v1/system/shutdown"
+			}
+			shutdownReq := daemonShutdownRequest{
+				reason:           reason,
+				removeLaunchdJob: req.RemoveLaunchdJob,
+			}
 			go func() {
 				time.Sleep(150 * time.Millisecond)
-				requestShutdown("api:/v1/system/shutdown")
+				requestShutdown(shutdownReq)
 			}()
 		}
 	})

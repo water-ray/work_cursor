@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"syscall"
 )
 
@@ -17,10 +15,7 @@ type fileInstanceLock struct {
 }
 
 func resolveDaemonInstanceLockPath() string {
-	if dataRoot := strings.TrimSpace(os.Getenv("WATERAY_DATA_ROOT")); dataRoot != "" {
-		return filepath.Join(filepath.Clean(dataRoot), "waterayd-instance.lock")
-	}
-	return filepath.Join(os.TempDir(), "waterayd-instance.lock")
+	return filepath.Join(string(os.PathSeparator), "tmp", "wateray-waterayd-instance.lock")
 }
 
 func acquireDaemonInstanceLock() (daemonInstanceLock, error) {
@@ -28,7 +23,7 @@ func acquireDaemonInstanceLock() (daemonInstanceLock, error) {
 	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
 		return nil, fmt.Errorf("prepare lock dir failed: %w", err)
 	}
-	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDONLY, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("open lock file failed: %w", err)
 	}
@@ -39,11 +34,6 @@ func acquireDaemonInstanceLock() (daemonInstanceLock, error) {
 			return nil, errDaemonAlreadyRunning
 		}
 		return nil, fmt.Errorf("lock file failed: %w", err)
-	}
-
-	if err := file.Truncate(0); err == nil {
-		_, _ = file.WriteString(strconv.Itoa(os.Getpid()))
-		_, _ = file.WriteString("\n")
 	}
 
 	return &fileInstanceLock{file: file}, nil

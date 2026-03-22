@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, UNIX_EPOCH};
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
 use std::process::Stdio;
 
 #[cfg(target_os = "windows")]
@@ -66,6 +66,8 @@ const DAEMON_TRANSPORT_BOOTSTRAP_PATH: &str = "/v1/transport/bootstrap";
 const DAEMON_PROBE_TIMEOUT_MS: u64 = 1200;
 const DAEMON_READY_TIMEOUT_MS: u64 = 12_000;
 const DAEMON_READY_POLL_INTERVAL_MS: u64 = 300;
+const DAEMON_STOP_TIMEOUT_MS: u64 = 4_000;
+const DAEMON_STOP_POLL_INTERVAL_MS: u64 = 150;
 const DAEMON_SHUTDOWN_TIMEOUT_MS: u64 = 1200;
 const FRONTEND_EXIT_DISPATCH_DELAY_MS: u64 = 50;
 const FRONTEND_READY_TIMEOUT_MOBILE_MS: u64 = 60_000;
@@ -371,7 +373,7 @@ fn hide_main_window(app: &AppHandle) {
 fn hide_main_window(_app: &AppHandle) {}
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-fn restore_main_window(app: &AppHandle) {
+pub fn restore_main_window(app: &AppHandle) {
     let Some(window) = app.get_webview_window("main") else {
         return;
     };
@@ -470,7 +472,13 @@ async fn quit_all(
         let remembered_daemon_base_url = app
             .try_state::<DaemonBaseUrlState>()
             .and_then(|state| state.get());
-        shutdown_daemon_best_effort(explicit_daemon_base_url, remembered_daemon_base_url).await;
+        shutdown_daemon_best_effort(
+            explicit_daemon_base_url,
+            remembered_daemon_base_url,
+            "quit_all",
+            true,
+        )
+        .await;
     }
     trace_window_flow("quit_all.after_daemon_shutdown", "");
     schedule_frontend_exit(app);
@@ -501,7 +509,17 @@ pub fn apply_platform_window_chrome(app: &AppHandle) {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+pub fn apply_platform_window_chrome(app: &AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    if let Err(error) = window.set_decorations(false) {
+        trace_window_flow("platform_window_chrome.error", &error.to_string());
+    }
+}
+
+#[cfg(any(target_os = "android", target_os = "ios"))]
 pub fn apply_platform_window_chrome(_app: &AppHandle) {}
 
 #[cfg(target_os = "linux")]
@@ -2002,29 +2020,61 @@ fn build_daemon_base_url_candidates(
 async fn build_local_reqwest_client(timeout_ms: u64) -> Option<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(Duration::from_millis(timeout_ms))
+        .no_proxy()
         .build()
         .ok()
 }
 
-async fn find_reachable_daemon_base_url() -> Option<String> {
-    let client = build_local_reqwest_client(DAEMON_PROBE_TIMEOUT_MS).await?;
-    for base_url in resolve_daemon_candidate_base_urls() {
-        let url = format!("{}{}", base_url, DAEMON_TRANSPORT_BOOTSTRAP_PATH);
-        if let Ok(response) = client.get(url).send().await {
-            if response.status().is_success() {
-                return Some(base_url);
-            }
-        }
-    }
-    None
+fn parse_daemon_base_url_port(base_url: &str) -> Option<u16> {
+    normalize_daemon_base_url(base_url)?
+        .rsplit(':')
+        .next()?
+        .parse::<u16>()
+        .ok()
 }
 
-async fn read_daemon_transport_bootstrap(
+fn validate_daemon_transport_bootstrap(
+    base_url: &str,
+    bootstrap: &LoopbackTransportBootstrap,
+) -> Result<(), String> {
+    if bootstrap.protocol_version != 1 {
+        return Err(format!(
+            "loopback 协议版本不匹配：{}",
+            bootstrap.protocol_version
+        ));
+    }
+    if bootstrap.platform_kind.trim() != runtime_platform_kind() {
+        return Err(format!(
+            "loopback 平台类型不匹配：{}",
+            bootstrap.platform_kind
+        ));
+    }
+    if bootstrap.session_id.trim().is_empty() || bootstrap.auth_token.trim().is_empty() {
+        return Err("loopback 握手凭据为空".to_string());
+    }
+    let Some(expected_port) = parse_daemon_base_url_port(base_url) else {
+        return Err("无法解析 loopback 控制端口".to_string());
+    };
+    if bootstrap.active_control_port != expected_port {
+        return Err(format!(
+            "loopback 活跃端口不匹配：expected={expected_port}, actual={}",
+            bootstrap.active_control_port
+        ));
+    }
+    if !bootstrap
+        .control_port_candidates
+        .iter()
+        .any(|candidate| *candidate == expected_port)
+    {
+        return Err(format!("loopback 候选端口列表不包含当前端口：{expected_port}"));
+    }
+    Ok(())
+}
+
+async fn read_daemon_transport_bootstrap_with_client(
+    client: &reqwest::Client,
     base_url: &str,
 ) -> Result<LoopbackTransportBootstrap, String> {
-    let client = build_local_reqwest_client(DAEMON_PROBE_TIMEOUT_MS)
-        .await
-        .ok_or_else(|| "无法创建本地 loopback 客户端".to_string())?;
     let url = format!("{base_url}{DAEMON_TRANSPORT_BOOTSTRAP_PATH}");
     let response = client
         .get(url)
@@ -2042,8 +2092,65 @@ async fn read_daemon_transport_bootstrap(
         .text()
         .await
         .map_err(|error| format!("读取 loopback bootstrap 响应体失败：{error}"))?;
-    serde_json::from_str::<LoopbackTransportBootstrap>(&payload)
-        .map_err(|error| format!("解析 loopback bootstrap 失败：{error}"))
+    let bootstrap = serde_json::from_str::<LoopbackTransportBootstrap>(&payload)
+        .map_err(|error| format!("解析 loopback bootstrap 失败：{error}"))?;
+    validate_daemon_transport_bootstrap(base_url, &bootstrap)?;
+    Ok(bootstrap)
+}
+
+async fn find_reachable_daemon_base_url() -> Option<String> {
+    let client = build_local_reqwest_client(DAEMON_PROBE_TIMEOUT_MS).await?;
+    for base_url in resolve_daemon_candidate_base_urls() {
+        if read_daemon_transport_bootstrap_with_client(&client, &base_url)
+            .await
+            .is_ok()
+        {
+            return Some(base_url);
+        }
+    }
+    None
+}
+
+async fn read_daemon_transport_bootstrap(
+    base_url: &str,
+) -> Result<LoopbackTransportBootstrap, String> {
+    let client = build_local_reqwest_client(DAEMON_PROBE_TIMEOUT_MS)
+        .await
+        .ok_or_else(|| "无法创建本地 loopback 客户端".to_string())?;
+    read_daemon_transport_bootstrap_with_client(&client, base_url).await
+}
+
+async fn read_daemon_state_payload(base_url: &str) -> Result<serde_json::Value, String> {
+    let client = build_local_reqwest_client(DAEMON_PROBE_TIMEOUT_MS)
+        .await
+        .ok_or_else(|| "无法创建本地状态客户端".to_string())?;
+    let url = format!("{base_url}/v1/state?withLogs=0");
+    let response = client
+        .get(url)
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .map_err(|error| format!("读取 daemon 状态失败：{error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("读取 daemon 状态失败：HTTP {}", response.status()));
+    }
+    let payload = response
+        .text()
+        .await
+        .map_err(|error| format!("读取 daemon 状态响应体失败：{error}"))?;
+    serde_json::from_str::<serde_json::Value>(&payload)
+        .map_err(|error| format!("解析 daemon 状态失败：{error}"))
+}
+
+#[cfg(target_os = "macos")]
+async fn read_daemon_runtime_admin(base_url: &str) -> bool {
+    read_daemon_state_payload(base_url)
+        .await
+        .ok()
+        .and_then(|payload| payload.get("snapshot").cloned())
+        .and_then(|snapshot| snapshot.get("runtimeAdmin").cloned())
+        .and_then(|value| value.as_bool())
+        == Some(true)
 }
 
 fn is_dev_mode() -> bool {
@@ -2464,6 +2571,103 @@ fn resolve_daemon_executable_path() -> Result<PathBuf, String> {
         }))
 }
 
+#[cfg(target_os = "macos")]
+fn resolve_macos_user_data_root_from_values(
+    explicit_data_root: Option<&str>,
+    home_dir: Option<&str>,
+    temp_dir: &Path,
+) -> PathBuf {
+    if let Some(value) = explicit_data_root {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+
+    if let Some(value) = home_dir {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed)
+                .join("Library")
+                .join("Application Support")
+                .join("wateray");
+        }
+    }
+
+    temp_dir.join("wateray")
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_macos_user_data_root() -> PathBuf {
+    let explicit_data_root = std::env::var("WATERAY_DATA_ROOT").ok();
+    let home_dir = std::env::var("HOME").ok();
+    resolve_macos_user_data_root_from_values(
+        explicit_data_root.as_deref(),
+        home_dir.as_deref(),
+        &std::env::temp_dir(),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_macos_home_dir() -> Option<String> {
+    let value = std::env::var("HOME").ok()?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_macos_packaged_launch_label(daemon_executable_path: &Path) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(daemon_executable_path.to_string_lossy().as_bytes());
+    hasher.update(b"\n");
+    hasher.update(resolve_macos_user_data_root().to_string_lossy().as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    format!("com.singbox.wateray.packaged-daemon.{}", &digest[..12])
+}
+
+#[cfg(target_os = "macos")]
+fn quote_macos_shell_arg(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    format!("'{}'", value.replace('\'', r#"'"'"'"#))
+}
+
+#[cfg(target_os = "macos")]
+fn build_macos_privileged_daemon_shell_command(
+    daemon_executable_path: &Path,
+) -> Result<String, String> {
+    let daemon_path_text = daemon_executable_path.to_string_lossy().to_string();
+    let data_root_text = resolve_macos_user_data_root().to_string_lossy().to_string();
+    let launch_label = resolve_macos_packaged_launch_label(daemon_executable_path);
+    let mut env_assignments = vec![
+        format!("WATERAY_DATA_ROOT={}", quote_macos_shell_arg(&data_root_text)),
+        format!(
+            "WATERAY_LAUNCHD_LABEL={}",
+            quote_macos_shell_arg(&launch_label)
+        ),
+    ];
+    if let Some(home_dir) = resolve_macos_home_dir() {
+        env_assignments.push(format!("HOME={}", quote_macos_shell_arg(&home_dir)));
+    }
+    let daemon_shell = format!(
+        "umask 022; mkdir -p {data_root}; cd {data_root} || exit 31; exec /usr/bin/env {envs} {daemon_path} >/dev/null 2>&1",
+        data_root = quote_macos_shell_arg(&data_root_text),
+        daemon_path = quote_macos_shell_arg(&daemon_path_text),
+        envs = env_assignments.join(" "),
+    );
+    Ok(format!(
+        "mkdir -p {data_root} || exit 21; /bin/launchctl remove {label} >/dev/null 2>&1 || true; /bin/launchctl submit -l {label} -- /bin/sh -lc {daemon_shell}",
+        data_root = quote_macos_shell_arg(&data_root_text),
+        label = quote_macos_shell_arg(&launch_label),
+        daemon_shell = quote_macos_shell_arg(&daemon_shell),
+    ))
+}
+
 #[cfg(target_os = "windows")]
 fn is_permission_denied_error(error: &std::io::Error) -> bool {
     const ERROR_ACCESS_DENIED: i32 = 5;
@@ -2473,7 +2677,7 @@ fn is_permission_denied_error(error: &std::io::Error) -> bool {
         || error.raw_os_error() == Some(ERROR_ELEVATION_REQUIRED)
 }
 
-#[cfg(all(not(target_os = "windows"), not(target_os = "linux")))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "linux"), not(target_os = "macos")))]
 fn is_permission_denied_error(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::PermissionDenied
 }
@@ -2499,7 +2703,7 @@ fn spawn_daemon_detached(daemon_executable_path: &Path) -> Result<(), std::io::E
     Ok(())
 }
 
-#[cfg(all(not(target_os = "windows"), not(target_os = "linux")))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "linux"), not(target_os = "macos")))]
 fn spawn_daemon_detached(daemon_executable_path: &Path) -> Result<(), std::io::Error> {
     let daemon_dir = daemon_executable_path
         .parent()
@@ -2514,6 +2718,40 @@ fn spawn_daemon_detached(daemon_executable_path: &Path) -> Result<(), std::io::E
 
     command.spawn()?;
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_daemon_elevated_via_osascript(daemon_executable_path: &Path) -> Result<(), String> {
+    let data_root = resolve_macos_user_data_root();
+    fs::create_dir_all(&data_root).map_err(|error| {
+        format!(
+            "创建 macOS 发布态数据目录失败：{} ({error})",
+            data_root.display()
+        )
+    })?;
+    let shell_command = build_macos_privileged_daemon_shell_command(daemon_executable_path)?;
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(r#"do shell script (system attribute "WATERAY_PRIVILEGED_DAEMON_COMMAND") with administrator privileges"#)
+        .env("WATERAY_PRIVILEGED_DAEMON_COMMAND", shell_command)
+        .output()
+        .map_err(|error| format!("请求 macOS 管理员权限失败：{error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if !stderr.is_empty() {
+        stderr.clone()
+    } else if !stdout.is_empty() {
+        stdout.clone()
+    } else {
+        "未返回更多细节".to_string()
+    };
+    if detail.to_lowercase().contains("user canceled") {
+        return Err("已取消 macOS 管理员授权".to_string());
+    }
+    Err(format!("请求 macOS 管理员权限失败：{detail}"))
 }
 
 #[cfg(target_os = "windows")]
@@ -2540,7 +2778,7 @@ fn spawn_daemon_elevated_via_uac(daemon_executable_path: &Path) -> bool {
     (result.0 as isize) > 32
 }
 
-#[cfg(all(not(target_os = "windows"), not(target_os = "linux")))]
+#[cfg(all(not(target_os = "windows"), not(target_os = "linux"), not(target_os = "macos")))]
 fn spawn_daemon_elevated_via_uac(_daemon_executable_path: &Path) -> bool {
     false
 }
@@ -2560,16 +2798,34 @@ async fn wait_daemon_ready() -> bool {
     false
 }
 
+async fn wait_daemon_stopped(timeout_ms: u64) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+    while std::time::Instant::now() < deadline {
+        if !is_daemon_reachable().await {
+            return true;
+        }
+        sleep(Duration::from_millis(DAEMON_STOP_POLL_INTERVAL_MS)).await;
+    }
+    !is_daemon_reachable().await
+}
+
 async fn post_daemon_shutdown(
     client: &reqwest::Client,
     base_url: &str,
+    reason: &str,
+    remove_launchd_job: bool,
 ) -> Result<reqwest::StatusCode, String> {
     let url = format!("{}/v1/system/shutdown", base_url.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "reason": reason,
+        "removeLaunchdJob": remove_launchd_job,
+    })
+    .to_string();
     let response = client
         .post(url)
         .header("Accept", "application/json")
         .header("Content-Type", "application/json; charset=utf-8")
-        .body("{}")
+        .body(body)
         .send()
         .await
         .map_err(|error| error.to_string())?;
@@ -2582,6 +2838,8 @@ async fn post_daemon_shutdown(
 async fn shutdown_daemon_best_effort(
     explicit_daemon_base_url: Option<String>,
     remembered_daemon_base_url: Option<String>,
+    reason: &str,
+    remove_launchd_job: bool,
 ) {
     trace_window_flow("shutdown_daemon_best_effort.begin", "");
     let Some(client) = build_local_reqwest_client(DAEMON_SHUTDOWN_TIMEOUT_MS).await else {
@@ -2595,7 +2853,17 @@ async fn shutdown_daemon_best_effort(
             "shutdown_daemon_best_effort.try",
             &format!("base_url={base_url}"),
         );
-        match post_daemon_shutdown(&client, &base_url).await {
+        if read_daemon_transport_bootstrap_with_client(&client, &base_url)
+            .await
+            .is_err()
+        {
+            trace_window_flow(
+                "shutdown_daemon_best_effort.try_failed",
+                &format!("base_url={base_url}; error=not_wateray_daemon"),
+            );
+            continue;
+        }
+        match post_daemon_shutdown(&client, &base_url, reason, remove_launchd_job).await {
             Ok(status) => {
                 trace_window_flow(
                     "shutdown_daemon_best_effort.done",
@@ -2614,6 +2882,55 @@ async fn shutdown_daemon_best_effort(
     trace_window_flow("shutdown_daemon_best_effort.skip", "daemon_unreachable");
 }
 
+#[cfg(target_os = "macos")]
+async fn ensure_macos_packaged_daemon_running_as_admin_impl() -> Result<(), String> {
+    let daemon_executable_path = resolve_daemon_executable_path()?;
+    if !daemon_executable_path.exists() {
+        return Err(format!(
+            "发布态内核文件不存在：{}",
+            daemon_executable_path.display()
+        ));
+    }
+
+    if let Some(base_url) = find_reachable_daemon_base_url().await {
+        let current_runtime_admin = read_daemon_runtime_admin(&base_url).await;
+        if current_runtime_admin {
+            return Ok(());
+        }
+        shutdown_daemon_best_effort(Some(base_url), None, "macos_switch_to_admin", false).await;
+        if !wait_daemon_stopped(DAEMON_STOP_TIMEOUT_MS).await {
+            return Err("普通权限内核尚未退出，无法切换为管理员权限".to_string());
+        }
+    }
+
+    spawn_daemon_elevated_via_osascript(&daemon_executable_path)?;
+    if wait_daemon_ready().await {
+        if let Some(base_url) = find_reachable_daemon_base_url().await {
+            match read_daemon_state_payload(&base_url).await {
+                Ok(payload) => {
+                    let runtime_admin = payload
+                        .get("snapshot")
+                        .and_then(|snapshot| snapshot.get("runtimeAdmin"))
+                        .and_then(|value| value.as_bool())
+                        == Some(true);
+                    if runtime_admin {
+                        return Ok(());
+                    }
+                    return Err("管理员权限内核已启动但状态仍为普通权限运行".to_string());
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        return Err("管理员权限内核已启动但未找到可用 loopback 地址".to_string());
+    }
+
+    Err(format!(
+        "管理员权限内核已尝试启动，但在 {} 秒内未就绪：{}",
+        DAEMON_READY_TIMEOUT_MS / 1000,
+        daemon_executable_path.display()
+    ))
+}
+
 pub async fn ensure_packaged_daemon_running_impl() -> Result<(), String> {
     if is_mobile_platform() {
         return Ok(());
@@ -2623,17 +2940,24 @@ pub async fn ensure_packaged_daemon_running_impl() -> Result<(), String> {
         return Ok(());
     }
 
-    if is_daemon_reachable().await {
-        return Ok(());
-    }
-
     #[cfg(target_os = "linux")]
     {
+        if is_daemon_reachable().await {
+            return Ok(());
+        }
         return ensure_linux_packaged_service_running().await;
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     {
+        return ensure_macos_packaged_daemon_running_as_admin_impl().await;
+    }
+
+    #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
+    {
+        if is_daemon_reachable().await {
+            return Ok(());
+        }
         let daemon_executable_path = resolve_daemon_executable_path()?;
         if !daemon_executable_path.exists() {
             return Err(format!(
@@ -2673,6 +2997,28 @@ pub async fn ensure_packaged_daemon_running_impl() -> Result<(), String> {
 #[tauri::command]
 pub async fn ensure_packaged_daemon_running() -> Result<(), String> {
     ensure_packaged_daemon_running_impl().await
+}
+
+#[cfg(target_os = "macos")]
+async fn ensure_macos_packaged_daemon_admin_for_tun_impl() -> Result<(), String> {
+    if is_mobile_platform() {
+        return Ok(());
+    }
+
+    if !should_manage_packaged_daemon() {
+        return Ok(());
+    }
+    ensure_macos_packaged_daemon_running_as_admin_impl().await
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn ensure_macos_packaged_daemon_admin_for_tun_impl() -> Result<(), String> {
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn ensure_macos_packaged_daemon_admin_for_tun() -> Result<(), String> {
+    ensure_macos_packaged_daemon_admin_for_tun_impl().await
 }
 
 #[tauri::command]
@@ -2937,6 +3283,45 @@ pub fn system_read_clipboard_file_paths() -> Result<Vec<String>, String> {
     #[cfg(not(target_os = "windows"))]
     {
         Ok(Vec::new())
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_packaged_daemon_tests {
+    use super::{
+        quote_macos_shell_arg, resolve_macos_user_data_root_from_values,
+    };
+    use std::path::Path;
+
+    #[test]
+    fn quote_macos_shell_arg_handles_single_quotes() {
+        assert_eq!(
+            quote_macos_shell_arg("/tmp/wateray's core"),
+            r#"'/tmp/wateray'"'"'s core'"#
+        );
+    }
+
+    #[test]
+    fn resolve_macos_user_data_root_prefers_explicit_env() {
+        let result = resolve_macos_user_data_root_from_values(
+            Some("/tmp/custom-wateray"),
+            Some("/Users/demo"),
+            Path::new("/tmp"),
+        );
+        assert_eq!(result, Path::new("/tmp/custom-wateray"));
+    }
+
+    #[test]
+    fn resolve_macos_user_data_root_falls_back_to_home() {
+        let result = resolve_macos_user_data_root_from_values(
+            None,
+            Some("/Users/demo"),
+            Path::new("/tmp"),
+        );
+        assert_eq!(
+            result,
+            Path::new("/Users/demo/Library/Application Support/wateray")
+        );
     }
 }
 

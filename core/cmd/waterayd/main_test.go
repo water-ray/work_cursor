@@ -4,8 +4,43 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 )
+
+func TestEnsureRuntimeWorkingDirectory(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("WATERAY_DATA_ROOT", tempDir)
+
+	previousDir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd failed: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chdir(previousDir)
+	})
+
+	if err := ensureRuntimeWorkingDirectory(); err != nil {
+		t.Fatalf("ensureRuntimeWorkingDirectory() failed: %v", err)
+	}
+
+	currentDir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd after ensure failed: %v", err)
+	}
+	resolvedCurrentDir, err := filepath.EvalSymlinks(currentDir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(currentDir) failed: %v", err)
+	}
+	resolvedTempDir, err := filepath.EvalSymlinks(tempDir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(tempDir) failed: %v", err)
+	}
+	if filepath.Clean(resolvedCurrentDir) != filepath.Clean(resolvedTempDir) {
+		t.Fatalf("working directory = %q, want %q", resolvedCurrentDir, resolvedTempDir)
+	}
+}
 
 func TestAllowTrustedLocalRequest(t *testing.T) {
 	t.Parallel()
