@@ -1,31 +1,18 @@
-# scripts
+# 脚本目录说明
 
-Automation scripts for build, CI, and packaging.
+本目录用于统一存放项目脚本。
 
-- `build/`: Local and release build scripts.
-- `release/`: Version bump and release changelog scripts.
-- `ci/`: CI workflow helper scripts.
-- `package/`: Installer and distributable packaging scripts.
+## 组织方式
 
-## sing-box library workflow
+- 默认使用 Python 编写脚本。
+- 按项目类型、用途或阶段再分一级目录，例如：
+  - `scripts/build/`
+  - `scripts/dev/`
+  - `scripts/release/`
+  - `scripts/tools/`
 
-- GitHub workflow: `.github/workflows/sb-libs-release.yml`
-- Download helper: `scripts/build/download-sb-libs.ps1`
+## 约定
 
-## windows-only sing-box workflow
-
-- GitHub workflow: `.github/workflows/sb-windows-release.yml`
-- Download helper: `scripts/build/download-sb-windows.ps1`
-- Local setup helper: `scripts/dev/setup-windows-dev.ps1`
-
-## unified version release workflow
-
-- Single version source: repository root `VERSION` (strict `X.Y.Z`).
-- Release helper: `scripts/release/release_version.py`.
-- Usage:
-  - `python scripts/release/release_version.py minor`
-  - `python scripts/release/release_version.py patch`
-- Script side effects:
-  - Update `VERSION`
-  - Sync `TauriApp/package.json` and `TauriApp/package-lock.json`
-  - Generate `docs/build/CHANGELOG_LATEST.md`
+- 不要把脚本散落在仓库根目录或源码目录。
+- 脚本运行产生的临时文件写入 `temp/`。
+- 构建、打包后的最终产物输出到 `Bin/`。

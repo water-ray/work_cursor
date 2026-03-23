@@ -1,45 +1,19 @@
-# Wateray Cursor Rules Index
+# 规则目录说明
 
-This file documents the intent, scope, and precedence of rules under `.cursor/rules/`.
+本目录存放供 Cursor 使用的项目规则文件。
 
-## Rule Precedence
+## 当前规则
 
-When multiple rules apply at the same time, use this order:
+- `代码规则.mdc`
+  - 约束通用代码协作方式与基础质量要求。
+  - 重点包括：基于上下文回答、控制修改边界、保持命名清晰、关注安全与可维护性。
 
-1. Architecture/runtime boundary rules (`00`, `05`)
-2. Mandatory cleanup rule (`30`)
-3. Language/framework rules by file scope (`10`, `12`, `13`, `20`)
+- `项目框架规则.mdc`
+  - 约束新项目的基础目录布局和默认执行边界。
+  - 重点包括：脚本放入 `scripts/`、文档放入 `docs/`、产物输出到 `Bin/`、临时文件写入 `temp/`。
 
-If two rules appear to conflict, prefer the stricter runtime-boundary rule and keep logic in the core daemon.
+## 扩展建议
 
-## Rule Catalog
-
-| File | Scope | alwaysApply | Primary Intent |
-|---|---|---:|---|
-| `00-project-baseline.mdc` | global | true | Project-level boundaries, ownership, and verification baseline |
-| `05-runtime-framework.mdc` | global | true | UI/daemon runtime split and source-of-truth boundaries |
-| `10-electron-ui.mdc` | `TauriApp/src/renderer/src/**/*.{ts,tsx}` | false | Tauri renderer implementation conventions |
-| `12-electron-ui-framework.mdc` | `TauriApp/src/renderer/src/**/*.{ts,tsx,css}` | false | React + Ant Design component usage and UI framework standards |
-| `13-ui-token-conventions.mdc` | `TauriApp/src/renderer/src/**/*.{ts,tsx,css}` | false | Token naming and shared style organization conventions |
-| `20-go-core.mdc` | `core/**/*.go` | false | Go daemon/control-plane and lifecycle conventions |
-| `21-singbox-latest-config.mdc` | `core/internal/control/**/*.go` | false | Enforce latest sing-box config syntax and migration-safe fields |
-| `30-remove-obsolete-code.mdc` | global | true | Remove replaced/legacy code and stale aliases |
-
-## Maintenance Checklist
-
-- Keep each rule focused on one concern; avoid cross-rule duplication.
-- Keep frontmatter complete: `description`, optional `globs`, `alwaysApply`.
-- Keep examples concrete (`BAD` / `GOOD`) for enforceable guidance.
-- Keep rule numbering stable and grouped by concern:
-  - `00-09`: baseline/runtime
-  - `10-19`: frontend/UI
-  - `20-29`: core/backend
-  - `30+`: cross-cutting quality gates
-- Update this index whenever adding, removing, renaming, or changing scope of a rule.
-
-## Typical Usage Map
-
-- Editing Tauri renderer pages: `10` + `12` (+ `30`)
-- Editing token files: `12` + `13` (+ `30`)
-- Editing Go daemon/control API: `20` + `05` (+ `30`)
-- Cross-layer architecture changes: `00` + `05` (+ scoped rules + `30`)
+- 语言或框架有明确约束时，再新增对应规则文件。
+- 一份规则只负责一个主题，避免把多个无关要求堆在同一文件中。
+- 规则内容保持简短、明确、可执行，避免重复表达。

@@ -1,445 +1,279 @@
 {
   "version": "2.0.0",
-  "inputs": [
-    {
-      "id": "githubPrivateRemoteName",
-      "type": "promptString",
-      "description": "输入私有源码仓库 remote 名称",
-      "default": "source-private"
-    },
-    {
-      "id": "githubPrivateTargetBranch",
-      "type": "promptString",
-      "description": "输入要推送到私有源码仓库的目标分支名",
-      "default": "main"
-    },
-    {
-      "id": "githubPublicRepo",
-      "type": "promptString",
-      "description": "输入公开发布仓库 owner/name",
-      "default": "water-ray/wateray-release"
-    },
-    {
-      "id": "gitCommitMessage",
-      "type": "promptString",
-      "description": "输入本次提交说明",
-      "default": "chore: update project files"
-    },
-    {
-      "id": "gitTargetBranch",
-      "type": "promptString",
-      "description": "输入目标分支名（例如 feat/my-change、fix/bug-123、release/v1.1.0）",
-      "default": "feat/my-change"
-    }
-  ],
   "tasks": [
     {
-      "label": "客户端：开发：运行当前平台前端",
+      "label": "仓库：查看当前分支",
       "type": "process",
-      "command": "npm",
+      "command": "python3",
       "args": [
-        "run",
-        "dev"
+        "${workspaceFolder}/scripts/git/repo_tasks.py",
+        "status"
       ],
-      "osx": {
-        "command": "/bin/zsh",
-        "args": [
-          "-lc",
-          "export PATH=\"$HOME/.local/node-current/bin:/usr/local/opt/node@20/bin:/usr/local/bin:/opt/homebrew/bin:$PATH\"; if [ -f \"$HOME/.cargo/env\" ]; then source \"$HOME/.cargo/env\"; fi; command -v npm >/dev/null 2>&1 || { echo \"npm not found. Please install Node.js and ensure npm is in PATH.\" >&2; exit 127; }; command -v cargo >/dev/null 2>&1 || { echo \"cargo not found. Please install Rust toolchain and ensure cargo is in PATH.\" >&2; exit 127; }; exec npm run dev"
-        ]
-      },
-      "linux": {
-        "command": "/bin/bash",
-        "args": [
-          "-lc",
-          "source \"$HOME/.cargo/env\" && exec npm run dev"
-        ]
-      },
       "windows": {
-        "command": "python",
+        "command": "py",
         "args": [
-          "${workspaceFolder}\\scripts\\dev\\run_tauri_dev_watchdog.py"
-        ],
-        "options": {
-          "cwd": "${workspaceFolder}",
-          "env": {
-            "WATERAY_APP_MODE": "dev",
-            "WATERAY_APP_TARGET": "desktop",
-            "VITE_WATERAY_APP_TARGET": "desktop",
-            "VITE_AIRPORT_WEB_URL": "http://127.0.0.1:5179/"
-          }
-        }
-      },
-      "options": {
-        "cwd": "${workspaceFolder}/TauriApp",
-        "env": {
-          "WATERAY_APP_MODE": "dev",
-          "WATERAY_APP_TARGET": "desktop",
-          "VITE_WATERAY_APP_TARGET": "desktop",
-          "VITE_AIRPORT_WEB_URL": "http://127.0.0.1:5179/"
-        }
-      },
-      "group": "build",
-      "isBackground": true,
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "focus": true
-      }
-    },
-    {
-      "label": "广告端：开发：运行服务端",
-      "type": "shell",
-      "command": "npm run dev",
-      "options": {
-        "cwd": "${workspaceFolder}/adsroot/server"
-      },
-      "group": "build",
-      "isBackground": true,
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "focus": false
-      }
-    },
-    {
-      "label": "广告端：开发：运行前端",
-      "type": "shell",
-      "command": "npm run dev",
-      "linux": {
-        "command": "node node_modules/vite/bin/vite.js"
-      },
-      "options": {
-        "cwd": "${workspaceFolder}/adsroot/web"
-      },
-      "group": "build",
-      "isBackground": true,
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "focus": false
-      }
-    },
-    {
-      "label": "广告端：本地发布：前后端整套到 Bin/adsroot",
-      "type": "shell",
-      "command": "python scripts/build/targets/publish_adsroot.py",
-      "options": {
-        "cwd": "${workspaceFolder}"
-      },
-      "group": "build",
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "focus": false
-      }
-    },
-    {
-      "label": "客户端：开发：运行当前平台内核",
-      "type": "shell",
-      "command": "python scripts/dev/run_waterayd.py",
-      "osx": {
-        "command": "/bin/zsh",
-        "args": [
-          "-lc",
-          "exec sudo env PATH=\"$PATH\" /usr/bin/python3 scripts/dev/run_waterayd.py"
-        ]
-      },
-      "linux": {
-        "command": "/bin/bash",
-        "args": [
-          "-lc",
-          "exec python3 scripts/dev/run_waterayd.py"
+          "-3",
+          "${workspaceFolder}/scripts/git/repo_tasks.py",
+          "status"
         ]
       },
       "options": {
         "cwd": "${workspaceFolder}"
       },
-      "group": "build",
-      "isBackground": true,
-      "problemMatcher": [],
       "presentation": {
         "reveal": "always",
-        "panel": "dedicated",
-        "focus": true
-      }
-    },
-    {
-      "label": "客户端：构建：当前平台客户端",
-      "type": "shell",
-      "command": "python scripts/build/targets/build_current_platform_client.py",
-      "osx": {
-        "command": "/bin/zsh",
-        "args": [
-          "-lc",
-          "if [ -f \"$HOME/.cargo/env\" ]; then source \"$HOME/.cargo/env\"; fi; exec python3 scripts/build/targets/build_current_platform_client.py"
-        ]
+        "panel": "shared",
+        "clear": true
       },
-      "options": {
-        "cwd": "${workspaceFolder}"
+      "runOptions": {
+        "reevaluateOnRerun": true
       },
-      "group": "build",
       "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "focus": false
-      }
+      "detail": "显示当前分支、上游、远程仓库和作者信息。"
     },
     {
-      "label": "客户端：构建：Android",
-      "type": "shell",
-      "command": "python scripts/build/targets/build_android_release.py",
-      "linux": {
-        "command": "/bin/bash",
-        "args": [
-          "-lc",
-          "source \"$HOME/.cargo/env\" && exec python3 scripts/build/targets/build_android_release.py"
-        ]
-      },
-      "options": {
-        "cwd": "${workspaceFolder}"
-      },
-      "group": "build",
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "focus": false
-      }
-    },
-    {
-      "label": "客户端：构建：清理 Tauri 编译缓存",
+      "label": "仓库：切换/创建分支",
       "type": "process",
-      "command": "cargo",
+      "command": "python3",
       "args": [
-        "clean",
-        "--manifest-path",
-        "${workspaceFolder}/TauriApp/src-tauri/Cargo.toml"
+        "${workspaceFolder}/scripts/git/repo_tasks.py",
+        "switch",
+        "--branch",
+        "${input:repoBranchName}"
       ],
-      "options": {
-        "cwd": "${workspaceFolder}"
-      },
-      "group": "build",
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "focus": false
-      }
-    },
-    {
-      "label": "客户端：版本：发布补丁版",
-      "type": "shell",
-      "command": "python scripts/release/release_version.py patch",
-      "options": {
-        "cwd": "${workspaceFolder}"
-      },
-      "group": "build",
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "focus": false
-      }
-    },
-    {
-      "label": "客户端：版本：发布次版本",
-      "type": "shell",
-      "command": "python scripts/release/release_version.py minor",
-      "options": {
-        "cwd": "${workspaceFolder}"
-      },
-      "group": "build",
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "focus": false
-      }
-    },
-    {
-      "label": "客户端：版本：发布主版本",
-      "type": "shell",
-      "command": "python scripts/release/release_version.py major",
-      "options": {
-        "cwd": "${workspaceFolder}"
-      },
-      "group": "build",
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "focus": false
-      }
-    },
-    {
-      "label": "私有源码：提交当前改动",
-      "type": "shell",
-      "command": "python scripts/git/private_source_tasks.py commit",
-      "options": {
-        "cwd": "${workspaceFolder}",
-        "env": {
-          "WATERAY_GIT_COMMIT_MESSAGE": "${input:gitCommitMessage}"
-        }
-      },
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "focus": true
-      }
-    },
-    {
-      "label": "私有源码：推送当前分支",
-      "type": "shell",
-      "command": "python scripts/git/private_source_tasks.py push-current --remote \"${input:githubPrivateRemoteName}\"",
-      "options": {
-        "cwd": "${workspaceFolder}"
-      },
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "focus": true
-      }
-    },
-    {
-      "label": "私有源码：切换或创建 Git 分支",
-      "type": "shell",
-      "command": "python scripts/git/private_source_tasks.py switch-branch --branch \"${input:gitTargetBranch}\"",
-      "options": {
-        "cwd": "${workspaceFolder}"
-      },
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "focus": true
-      }
-    },
-    {
-      "label": "私有源码：查看当前分支",
-      "type": "shell",
-      "command": "python scripts/git/private_source_tasks.py show-branch",
-      "options": {
-        "cwd": "${workspaceFolder}"
-      },
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "focus": false
-      }
-    },
-    {
-      "label": "私有源码：推送到指定分支+++",
-      "type": "shell",
-      "command": "python scripts/git/private_source_tasks.py push-main --remote \"${input:githubPrivateRemoteName}\" --branch \"${input:githubPrivateTargetBranch}\"",
-      "options": {
-        "cwd": "${workspaceFolder}"
-      },
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "dedicated",
-        "focus": true
-      }
-    },
-    {
-      "label": "公开发布：上传当前平台产物到 GitHub",
-      "type": "shell",
-      "command": "python scripts/release/build_and_upload_current_platform_release.py --repo \"${input:githubPublicRepo}\" --release-root-dir \"Bin/github-staging-release\"",
-      "osx": {
-        "command": "/bin/zsh",
+      "windows": {
+        "command": "py",
         "args": [
-          "-lc",
-          "if [ -f \"$HOME/.cargo/env\" ]; then source \"$HOME/.cargo/env\"; fi; exec python3 scripts/release/build_and_upload_current_platform_release.py --repo \"${input:githubPublicRepo}\" --release-root-dir \"Bin/github-staging-release\""
-        ]
-      },
-      "linux": {
-        "command": "/bin/bash",
-        "args": [
-          "-lc",
-          "source \"$HOME/.cargo/env\" && exec python3 scripts/release/build_and_upload_current_platform_release.py --repo \"${input:githubPublicRepo}\" --release-root-dir \"Bin/github-staging-release\""
+          "-3",
+          "${workspaceFolder}/scripts/git/repo_tasks.py",
+          "switch",
+          "--branch",
+          "${input:repoBranchName}"
         ]
       },
       "options": {
         "cwd": "${workspaceFolder}"
       },
-      "problemMatcher": [],
       "presentation": {
         "reveal": "always",
-        "panel": "dedicated",
-        "focus": true
-      }
+        "panel": "shared",
+        "clear": true
+      },
+      "runOptions": {
+        "reevaluateOnRerun": true
+      },
+      "problemMatcher": [],
+      "detail": "输入分支名称；存在则切换，不存在则创建并切换。"
     },
     {
-      "label": "公开发布：上传安卓产物到 GitHub",
-      "type": "shell",
-      "command": "python scripts/release/build_and_upload_android_release.py --repo \"${input:githubPublicRepo}\" --release-root-dir \"Bin/github-staging-release\"",
-      "linux": {
-        "command": "/bin/bash",
+      "label": "仓库：提交当前改动",
+      "type": "process",
+      "command": "python3",
+      "args": [
+        "${workspaceFolder}/scripts/git/repo_tasks.py",
+        "commit",
+        "--message",
+        "${input:repoCommitMessage}"
+      ],
+      "windows": {
+        "command": "py",
         "args": [
-          "-lc",
-          "source \"$HOME/.cargo/env\" && exec python3 scripts/release/build_and_upload_android_release.py --repo \"${input:githubPublicRepo}\" --release-root-dir \"Bin/github-staging-release\""
+          "-3",
+          "${workspaceFolder}/scripts/git/repo_tasks.py",
+          "commit",
+          "--message",
+          "${input:repoCommitMessage}"
         ]
       },
       "options": {
         "cwd": "${workspaceFolder}"
       },
-      "problemMatcher": [],
       "presentation": {
         "reveal": "always",
-        "panel": "dedicated",
-        "focus": true
-      }
+        "panel": "shared",
+        "clear": true
+      },
+      "runOptions": {
+        "reevaluateOnRerun": true
+      },
+      "problemMatcher": [],
+      "detail": "输入提交说明后，自动暂存并提交当前全部改动。"
     },
     {
-      "label": "公开发布：触发 GitHub 汇总发布（Windows/Linux/macOS/Android）",
-      "type": "shell",
-      "command": "python scripts/release/dispatch_github_release_workflow.py --public-repo \"${input:githubPublicRepo}\"",
-      "osx": {
-        "command": "/bin/zsh",
+      "label": "仓库：推送当前分支",
+      "type": "process",
+      "command": "python3",
+      "args": [
+        "${workspaceFolder}/scripts/git/repo_tasks.py",
+        "push-current",
+        "--remote",
+        "${input:repoRemoteName}"
+      ],
+      "windows": {
+        "command": "py",
         "args": [
-          "-lc",
-          "exec python3 scripts/release/dispatch_github_release_workflow.py --public-repo \"${input:githubPublicRepo}\""
-        ]
-      },
-      "linux": {
-        "command": "/bin/bash",
-        "args": [
-          "-lc",
-          "exec python3 scripts/release/dispatch_github_release_workflow.py --public-repo \"${input:githubPublicRepo}\""
+          "-3",
+          "${workspaceFolder}/scripts/git/repo_tasks.py",
+          "push-current",
+          "--remote",
+          "${input:repoRemoteName}"
         ]
       },
       "options": {
         "cwd": "${workspaceFolder}"
       },
-      "problemMatcher": [],
       "presentation": {
         "reveal": "always",
-        "panel": "dedicated",
-        "focus": true
-      }
+        "panel": "shared",
+        "clear": true
+      },
+      "runOptions": {
+        "reevaluateOnRerun": true
+      },
+      "problemMatcher": [],
+      "detail": "输入远程源；留空时复用缓存或回退到当前上游/ origin。"
     },
     {
-      "label": "公开发布：手工直发最终 Release（兜底）",
-      "type": "shell",
-      "command": "python scripts/release/publish_github_release.py --repo \"${input:githubPublicRepo}\"",
+      "label": "仓库：推送指定分支",
+      "type": "process",
+      "command": "python3",
+      "args": [
+        "${workspaceFolder}/scripts/git/repo_tasks.py",
+        "push-branch",
+        "--remote",
+        "${input:repoRemoteName}",
+        "--branch",
+        "${input:repoTargetBranch}"
+      ],
+      "windows": {
+        "command": "py",
+        "args": [
+          "-3",
+          "${workspaceFolder}/scripts/git/repo_tasks.py",
+          "push-branch",
+          "--remote",
+          "${input:repoRemoteName}",
+          "--branch",
+          "${input:repoTargetBranch}"
+        ]
+      },
       "options": {
         "cwd": "${workspaceFolder}"
       },
-      "problemMatcher": [],
       "presentation": {
         "reveal": "always",
-        "panel": "dedicated",
-        "focus": true
-      }
+        "panel": "shared",
+        "clear": true
+      },
+      "runOptions": {
+        "reevaluateOnRerun": true
+      },
+      "problemMatcher": [],
+      "detail": "输入远程源和目标分支；留空时优先复用缓存。"
+    },
+    {
+      "label": "仓库：拉取当前分支",
+      "type": "process",
+      "command": "python3",
+      "args": [
+        "${workspaceFolder}/scripts/git/repo_tasks.py",
+        "pull-current",
+        "--remote",
+        "${input:repoRemoteName}"
+      ],
+      "windows": {
+        "command": "py",
+        "args": [
+          "-3",
+          "${workspaceFolder}/scripts/git/repo_tasks.py",
+          "pull-current",
+          "--remote",
+          "${input:repoRemoteName}"
+        ]
+      },
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true
+      },
+      "runOptions": {
+        "reevaluateOnRerun": true
+      },
+      "problemMatcher": [],
+      "detail": "输入远程源；留空时复用缓存或回退到当前上游/ origin。"
+    },
+    {
+      "label": "仓库：设置远程仓库源",
+      "type": "process",
+      "command": "python3",
+      "args": [
+        "${workspaceFolder}/scripts/git/repo_tasks.py",
+        "set-remote",
+        "--name",
+        "${input:repoRemoteSetName}",
+        "--url",
+        "${input:repoRemoteSetUrl}"
+      ],
+      "windows": {
+        "command": "py",
+        "args": [
+          "-3",
+          "${workspaceFolder}/scripts/git/repo_tasks.py",
+          "set-remote",
+          "--name",
+          "${input:repoRemoteSetName}",
+          "--url",
+          "${input:repoRemoteSetUrl}"
+        ]
+      },
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true
+      },
+      "runOptions": {
+        "reevaluateOnRerun": true
+      },
+      "problemMatcher": [],
+      "detail": "输入远程源名称与地址；不存在则新增，已存在则更新绑定。"
+    }
+  ],
+  "inputs": [
+    {
+      "id": "repoBranchName",
+      "type": "promptString",
+      "description": "输入分支名称；本地存在则切换，不存在则创建并切换。"
+    },
+    {
+      "id": "repoCommitMessage",
+      "type": "promptString",
+      "description": "输入提交说明；任务会自动提交当前全部改动。"
+    },
+    {
+      "id": "repoRemoteName",
+      "type": "promptString",
+      "description": "输入远程源名称；留空时使用缓存，缓存不存在时回退到当前上游或 origin。"
+    },
+    {
+      "id": "repoTargetBranch",
+      "type": "promptString",
+      "description": "输入目标远程分支；留空时使用缓存，缓存不存在时使用当前分支。"
+    },
+    {
+      "id": "repoRemoteSetName",
+      "type": "promptString",
+      "description": "输入远程源名称，例如 origin。"
+    },
+    {
+      "id": "repoRemoteSetUrl",
+      "type": "promptString",
+      "description": "输入远程仓库地址，例如 https://github.com/user/repo.git。"
     }
   ]
 }

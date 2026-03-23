@@ -19,39 +19,18 @@
     // 1. 防止 VS Code 监控这些目录的文件变动（解决占用的核心）
     "files.watcherExclude": {
       "**/Bin/**": true,
-      "**/core/bin/**": true,
-      "**/core/dist/**": true,
-      "**/core/prebuilt/**": true,
-      "**/core/cache.db": true,
-      "**/docs/build/**": true,
-      "**/scripts/build/__pycache__/**": true,
-      "**/TauriApp/dist/**": true,
-      "**/TauriApp/src-tauri/target/**": true,
+ 
       "**/node_modules/**": true
     },
     // 2. 从搜索结果中排除（减少磁盘 IO 和索引压力）
     "search.exclude": {
       "**/Bin/**": true,
-      "**/core/bin/**": true,
-      "**/core/dist/**": true,
-      "**/core/prebuilt/**": true,
-      "**/core/cache.db": true,
-      "**/docs/build/**": true,
-      "**/scripts/build/__pycache__/**": true,
-      "**/TauriApp/dist/**": true,
-      "**/TauriApp/src-tauri/target/**": true,
       "**/node_modules/**": true
     },
     // 3. 在左侧资源管理器中隐藏这些目录（可选，界面更清爽）
     "files.exclude": {
       "**/Bin/**": false,
-      "**/core/bin/**": true,
-      "**/core/dist/**": true,
-      "**/core/prebuilt/**": true,
-      "**/docs/build/**": true,
-      "**/scripts/build/__pycache__/**": true,
-      "**/TauriApp/dist/**": true,
-      "**/TauriApp/src-tauri/target/**": true,
+
       "**/node_modules/**": true
     }
   },
