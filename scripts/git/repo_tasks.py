@@ -258,6 +258,78 @@ def resolve_target_branch(ctx: RepoContext, explicit_branch: str) -> tuple[str, 
     return ensure_branch(ctx), "当前分支"
 
 
+def is_non_fast_forward_push_error(result: subprocess.CompletedProcess[str]) -> bool:
+    combined = "\n".join(
+        part.strip() for part in (result.stdout or "", result.stderr or "") if part.strip()
+    ).lower()
+    markers = (
+        "fetch first",
+        "non-fast-forward",
+        "[rejected]",
+        "tip of your current branch is behind",
+    )
+    return any(marker in combined for marker in markers)
+
+
+def confirm_force_push() -> bool:
+    print_section("推送冲突")
+    print("检测到远程分支存在未合并提交，普通推送已被 Git 拒绝。")
+    print("如果确认要覆盖远程分支，请输入 Y 或 yes 继续强制推送。")
+    print("输入其他内容或直接回车将取消。")
+    try:
+        answer = input("是否执行强制推送？[y/N]: ").strip().lower()
+    except EOFError:
+        return False
+    return answer in {"y", "yes"}
+
+
+def print_completed_process(result: subprocess.CompletedProcess[str]) -> None:
+    stdout = (result.stdout or "").strip()
+    stderr = (result.stderr or "").strip()
+    if stdout:
+        print(stdout)
+    if stderr:
+        print(stderr)
+
+
+def run_push_with_optional_force(
+    ctx: RepoContext,
+    push_args: list[str],
+    force_push_args: list[str],
+    success_message: str,
+    force_success_message: str,
+    remote_name: str,
+    branch_name: str,
+) -> int:
+    result = git(ctx, *push_args, check=False)
+    if result.returncode == 0:
+        print_completed_process(result)
+        save_cache(ctx, last_remote=remote_name, last_branch=branch_name)
+        print(success_message)
+        return 0
+
+    if not is_non_fast_forward_push_error(result):
+        raise TaskError(format_process_error([ctx.git_exe, *push_args], result))
+
+    print(format_process_error([ctx.git_exe, *push_args], result))
+
+    if not sys.stdin.isatty():
+        raise TaskError("当前终端不可交互，无法确认是否强制推送。")
+
+    if not confirm_force_push():
+        raise TaskError("已取消强制推送，远程未发生变更。")
+
+    print("\n开始执行强制推送...")
+    force_result = git(ctx, *force_push_args, check=False)
+    if force_result.returncode != 0:
+        raise TaskError(format_process_error([ctx.git_exe, *force_push_args], force_result))
+
+    print_completed_process(force_result)
+    save_cache(ctx, last_remote=remote_name, last_branch=branch_name)
+    print(force_success_message)
+    return 0
+
+
 def print_section(title: str) -> None:
     print(f"\n== {title} ==")
 
@@ -372,10 +444,15 @@ def cmd_push_current(ctx: RepoContext, args: argparse.Namespace) -> int:
     ensure_remote_exists(ctx, remote_name)
 
     print(f"使用远程源: {remote_name}（来源：{source}）")
-    git(ctx, "push", "-u", remote_name, branch_name)
-    save_cache(ctx, last_remote=remote_name, last_branch=branch_name)
-    print(f"已推送当前分支到 {remote_name}/{branch_name}")
-    return 0
+    return run_push_with_optional_force(
+        ctx,
+        ["push", "-u", remote_name, branch_name],
+        ["push", "--force", "-u", remote_name, branch_name],
+        f"已推送当前分支到 {remote_name}/{branch_name}",
+        f"已强制推送当前分支到 {remote_name}/{branch_name}",
+        remote_name,
+        branch_name,
+    )
 
 
 def cmd_push_branch(ctx: RepoContext, args: argparse.Namespace) -> int:
@@ -385,11 +462,15 @@ def cmd_push_branch(ctx: RepoContext, args: argparse.Namespace) -> int:
 
     print(f"使用远程源: {remote_name}（来源：{remote_source}）")
     print(f"目标分支: {target_branch}（来源：{branch_source}）")
-
-    git(ctx, "push", remote_name, f"HEAD:{target_branch}")
-    save_cache(ctx, last_remote=remote_name, last_branch=target_branch)
-    print(f"已将当前内容推送到 {remote_name}/{target_branch}")
-    return 0
+    return run_push_with_optional_force(
+        ctx,
+        ["push", remote_name, f"HEAD:{target_branch}"],
+        ["push", "--force", remote_name, f"HEAD:{target_branch}"],
+        f"已将当前内容推送到 {remote_name}/{target_branch}",
+        f"已强制将当前内容推送到 {remote_name}/{target_branch}",
+        remote_name,
+        target_branch,
+    )
 
 
 def cmd_pull_current(ctx: RepoContext, args: argparse.Namespace) -> int:

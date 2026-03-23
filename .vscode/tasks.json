@@ -23,6 +23,7 @@
       "presentation": {
         "reveal": "always",
         "panel": "shared",
+        "focus": true,
         "clear": true
       },
       "runOptions": {
@@ -131,7 +132,7 @@
         "reevaluateOnRerun": true
       },
       "problemMatcher": [],
-      "detail": "输入远程源；留空时复用缓存或回退到当前上游/ origin。"
+      "detail": "输入远程源；留空时复用缓存或回退到当前上游/ origin。若遇到非 fast-forward，可在终端输入 Y/yes 强推。"
     },
     {
       "label": "仓库：推送指定分支",
@@ -163,13 +164,14 @@
       "presentation": {
         "reveal": "always",
         "panel": "shared",
+        "focus": true,
         "clear": true
       },
       "runOptions": {
         "reevaluateOnRerun": true
       },
       "problemMatcher": [],
-      "detail": "输入远程源和目标分支；留空时优先复用缓存。"
+      "detail": "输入远程源和目标分支；留空时优先复用缓存。若遇到非 fast-forward，可在终端输入 Y/yes 强推。"
     },
     {
       "label": "仓库：拉取当前分支",
