@@ -8,7 +8,7 @@
 
 - 提供类似 `v2rayN` 的易用体验与完整配置能力。
 - 使用前后端分离架构：`TauriApp/` 负责 UI 与宿主能力，`core/` 负责运行时与配置计算。
-- 当前以 Windows / Linux / Android 主链路稳定可用为目标；macOS 保留现有桌面链路，本阶段暂不推进 `Network Extension` 代理框架专项改造；iOS 仍在规划中。
+- 当前以 Windows / Linux / Android 主链路稳定可用为目标；macOS 已可构建、打包并参与公开发布，但当前仍沿用非 `Network Extension` 方案，系统 DNS 不能完全接管，存在 DNS 污染风险；当前安装包未签名，首次打开需用户手动确认；后续是否购买 Apple 开发者证书用于继续完善 macOS 版本，再单独评估；iOS 仍在规划中。
 
 ## 1.6.0 版本概览
 
@@ -17,6 +17,7 @@
 - 桌面端“请求监控”已从原型阶段进入真实可用状态，可采集请求记录并辅助生成分流规则草案。
 - Linux 已切到 `systemd-first` TUN 运行模型，支持 `.deb` 与 `AppImage` 打包。
 - Android 已接入 `VpnService` + 前台服务链路，并复用订阅、规则、DNS、设置等主界面能力。
+- macOS 当前可构建 `DMG` 并参与公开发布，但仍未签名，首次打开需用户手动确认；同时由于未采用 `Network Extension`，系统 DNS 仍不能完全接管。
 
 ## 项目完成度
 
@@ -26,8 +27,15 @@
 | Windows 桌面 | 日常可用 | 桌面主链路、托盘、守护进程协同、构建 / 发布链路已接入。 |
 | Linux 桌面 | 日常可用 | `systemd-first` TUN、普通用户 UI + root daemon、`.deb` / `AppImage` 可用；系统代理真实实现仍保留后续项。 |
 | Android | 已完成主链路 | `VpnService` + 前台服务、移动端页面适配、构建发布已接入。 |
-| macOS | 部分完成 | 保留现有桌面构建与 daemon / TUN 链路；`1.6.0` 阶段暂不推进 `Network Extension` 代理框架改造，公开发布与更新链路仍不作为当前承诺。 |
+| macOS | 可发布 / 有限制 | 当前可构建 `DMG` 并参与公开发布；未签名，首次打开需用户手动确认；未使用 `Network Extension`，系统 DNS 不能完全接管，存在 DNS 污染风险。 |
 | iOS | 规划中 | 目标形态为 `Network Extension (Packet Tunnel)`，当前未发布。 |
+
+## macOS 当前说明
+
+- 当前 macOS 版本继续沿用现有 `daemon + TUN` 桌面链路，暂未切到 `Network Extension` 模式。
+- 由于系统 DNS 无法完全接管，当前仍可能出现 DNS 污染。
+- 当前公开发布的 macOS 安装包未签名，首次安装 / 打开需要用户手动确认。
+- 后续是否购买 Apple 开发者证书，用于签名、权限与发布体验完善，再单独评估。
 
 ## 项目特性
 
@@ -38,7 +46,7 @@
 - DNS 配置：支持远程 / 直连 / Bootstrap DNS、FakeIP、自定义 hosts、内置规则集状态与更新。
 - 运行态与诊断：可查看连接阶段、当前节点、实时上下行速率、累计流量、核心 / 客户端日志与错误提示。
 - 桌面增强：支持托盘快捷操作、后台运行、最近节点切换、请求监控与规则草案生成。
-- 跨平台发布：提供 Windows / Linux / Android 构建与 GitHub staging/release 脚本，便于多机协同发版。
+- 跨平台发布：提供 Windows / Linux / macOS / Android 构建与 GitHub staging/release 脚本，便于多机协同发版；其中 macOS 当前为未签名发布。
 
 ## 技术栈
 
@@ -224,22 +232,24 @@ cd adsroot/web && npm install && cd ../..
 
 说明：
 
-- 当前公开发布以 Windows / Linux / Android 为主：
+- 当前公开发布支持 Windows / Linux / macOS / Android：
   - Windows 在 Windows 构建
   - Linux 在 Linux 构建
+  - macOS 在 macOS 构建
   - Android 在 Android 构建机或已配置 Android SDK/NDK 的环境构建
-- macOS 当前保留本地构建与验证链路，但暂未纳入本轮公开发布主承诺。
+- macOS 当前安装包未签名，首次打开需用户手动确认。
+- macOS 当前未使用 `Network Extension` 模式，系统 DNS 不能完全接管，存在 DNS 污染风险。
 - iOS 当前未进入发布流程。
 - 正式 GitHub Release 不再由某一台机器本地直接上传，而是由 GitHub Actions 汇总 staging 产物后统一发布。
 
 推荐流程：
 
-1. Windows / Linux / Android 构建机分别拉取同一版本源码，并确认 `VERSION` 一致。
-2. Windows / Linux 端执行 `公开发布：上传当前平台产物到 GitHub`。
+1. Windows / Linux / macOS / Android 构建机分别拉取同一版本源码，并确认 `VERSION` 一致。
+2. Windows / Linux / macOS 端执行 `公开发布：上传当前平台产物到 GitHub`。
    - 该流程会先构建对应平台正式资产，再生成 staging 素材并上传到 `staging-v<version>`
    - 同时上传 `platform-build-<platform>-v<version>.json`，记录版本、提交和资产清单
 3. Android 端执行 `公开发布：上传安卓产物到 GitHub`。
-4. 任意一台机器执行 `公开发布：触发 GitHub 汇总发布（Windows/Linux/Android）`。
+4. 任意一台机器执行 `公开发布：触发 GitHub 汇总发布（Windows/Linux/macOS/Android）`。
 5. GitHub Actions 从 `staging-v<version>` 收集当前阶段已支持的平台 manifest 和正式资产：
    - 若缺少必需平台产物，则更新 `v<version>` 草稿状态，不发布正式版。
    - 若产物齐备，则生成更新摘要、校验文件、`latest*.json` 与正式 Release。

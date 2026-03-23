@@ -628,19 +628,30 @@ def build_public_release_readme(version: str, public_repo: str, assets: list[Rel
     summary = build_release_summary(version, ordered_assets)
     platform_ids = distinct_platforms(ordered_assets)
     platform_labels = format_platform_delivery_labels(platform_ids)
+    notes = [
+        "- 该仓库默认只保留公开发布所需文件，不包含源码与开发文档。",
+        "- 最终可下载平台以本 README 与对应 Release 附件为准。",
+    ]
+    if "macos" in platform_ids:
+        notes.extend(
+            [
+                "- macOS 当前未使用 Network Extension，无法完全接管系统 DNS，可能出现 DNS 污染。",
+                "- macOS 当前安装包未签名，首次打开需用户手动确认；后续是否购买 Apple 开发者证书以完善签名与发布体验，再单独评估。",
+            ]
+        )
     lines = [
         "# Wateray Release",
         "",
         f"官网：[{OFFICIAL_SITE_URL}]({OFFICIAL_SITE_URL})",
         "",
-        "Wateray 的公开发布仓库，用于分发客户端安装包、版本说明与升级索引文件。",
+        "Wateray 的公开发布仓库，用于分发已纳入公开发布流程的平台客户端安装包、版本说明与升级索引文件。",
         "此 README 由发布流程自动更新。",
         "",
         "## 当前稳定版本",
         "",
         f"- 版本：`{version}`",
         "- 发布渠道：稳定版",
-        f"- 当前平台：{', '.join(platform_labels) if platform_labels else '暂无公开发布平台'}",
+        f"- 当前公开发布平台：{', '.join(platform_labels) if platform_labels else '暂无公开发布平台'}",
         f"- Release 页面：[Wateray {release_tag}](https://github.com/{repo}/releases/tag/{release_tag})",
         f"- 全部版本：[查看 Releases](https://github.com/{repo}/releases)",
         "",
@@ -676,8 +687,7 @@ def build_public_release_readme(version: str, public_repo: str, assets: list[Rel
             "",
             "## 说明",
             "",
-            "- 该仓库默认只保留公开发布所需文件，不包含源码开发文档。",
-            "- 当前公开发布平台以本 README 与对应 Release 附件为准。",
+            *notes,
             "",
         ]
     )
