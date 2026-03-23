@@ -5,13 +5,10 @@ use std::fs;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, UNIX_EPOCH};
-
-#[cfg(target_os = "windows")]
-use std::process::Stdio;
 
 #[cfg(target_os = "windows")]
 use std::ffi::c_void;
