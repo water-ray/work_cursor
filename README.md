@@ -2,13 +2,43 @@
 
 高性能跨平台 VPN 客户端（Tauri v2 + Go + sing-box）。
 
-当前版本：`1.5.1`，当前内核基线为 `sing-box 1.12.25`。
+当前文档基线：`1.6.0` 版本线，当前内核基线为 `sing-box 1.12.25`。
 
 ## 项目目标
 
-- 提供类似 v2rayN 的易用体验与完整配置能力。
-- 当前已提供 Windows / Linux / Android / macOS 客户端； iOS 计划下个月发布。
-- 使用前后端分离架构：Tauri 前端控制台 + Go 核心守护进程。
+- 提供类似 `v2rayN` 的易用体验与完整配置能力。
+- 使用前后端分离架构：`TauriApp/` 负责 UI 与宿主能力，`core/` 负责运行时与配置计算。
+- 当前以 Windows / Linux / Android 主链路稳定可用为目标；macOS 保留现有桌面链路，本阶段暂不推进 `Network Extension` 代理框架专项改造；iOS 仍在规划中。
+
+## 1.6.0 版本概览
+
+- `MVP / P0` 主链路已基本齐备：连接、断开、节点切换、订阅导入、规则模式、TUN / 系统代理、日志与运行态可视化已接入。
+- `P1` 能力已部分落地：请求监控、桌面托盘快捷操作、节点测速 / 优选、内置规则集下载等能力已进入当前版本线。
+- 桌面端“请求监控”已从原型阶段进入真实可用状态，可采集请求记录并辅助生成分流规则草案。
+- Linux 已切到 `systemd-first` TUN 运行模型，支持 `.deb` 与 `AppImage` 打包。
+- Android 已接入 `VpnService` + 前台服务链路，并复用订阅、规则、DNS、设置等主界面能力。
+
+## 项目完成度
+
+| 模块 | 完成度 | 说明 |
+| --- | --- | --- |
+| Core 运行时 | 已完成主链路 | `waterayd` 负责订阅、分组、规则、连接状态、统计、热重载与控制面 API。 |
+| Windows 桌面 | 日常可用 | 桌面主链路、托盘、守护进程协同、构建 / 发布链路已接入。 |
+| Linux 桌面 | 日常可用 | `systemd-first` TUN、普通用户 UI + root daemon、`.deb` / `AppImage` 可用；系统代理真实实现仍保留后续项。 |
+| Android | 已完成主链路 | `VpnService` + 前台服务、移动端页面适配、构建发布已接入。 |
+| macOS | 部分完成 | 保留现有桌面构建与 daemon / TUN 链路；`1.6.0` 阶段暂不推进 `Network Extension` 代理框架改造，公开发布与更新链路仍不作为当前承诺。 |
+| iOS | 规划中 | 目标形态为 `Network Extension (Packet Tunnel)`，当前未发布。 |
+
+## 项目特性
+
+- 前后端分离：UI 仅负责展示与命令发起，运行态真相源统一在 `core/`。
+- 连接与切换体验：节点切换尽量保持 TUN 常驻，通过热重载更新 outbound，减少中断。
+- 订阅与节点管理：支持手动节点、订阅导入、分组管理、节点排序、收藏 / 激活、延迟与真实连接探测。
+- 规则中心：支持推荐 / 规则 / 全局模式、规则组编排、节点池选择与运行时热应用。
+- DNS 配置：支持远程 / 直连 / Bootstrap DNS、FakeIP、自定义 hosts、内置规则集状态与更新。
+- 运行态与诊断：可查看连接阶段、当前节点、实时上下行速率、累计流量、核心 / 客户端日志与错误提示。
+- 桌面增强：支持托盘快捷操作、后台运行、最近节点切换、请求监控与规则草案生成。
+- 跨平台发布：提供 Windows / Linux / Android 构建与 GitHub staging/release 脚本，便于多机协同发版。
 
 ## 技术栈
 
@@ -21,7 +51,7 @@
 ## 目录结构
 
 ```text
-TauriApp/      # Tauri 前端控制台
+TauriApp/        # Tauri 前端控制台
 core/            # Go 内核守护进程与控制面 API
 adsroot/server/  # 广告后端服务
 adsroot/web/     # 广告前端单页应用
@@ -34,27 +64,14 @@ docs/            # 架构、测试与设计文档
 - 节点切换时保持 TUN 网卡常驻，不销毁虚拟网卡。
 - 通过热重载更新 outbound，避免中断连接。
 - UI 关闭后内核可继续运行，UI 重启后恢复控制。
-- 运行态配置（订阅/分组/规则/连接状态）由 core 作为真相源维护。
-- 所有运行时功能逻辑（订阅解析、路由决策、节点管理）必须在 core 处理，前端仅做展示与请求发起。
+- 运行态配置（订阅 / 分组 / 规则 / 连接状态）由 `core/` 作为真相源维护。
+- 所有运行时功能逻辑（订阅解析、路由决策、节点管理）必须在 `core/` 处理，前端仅做展示与请求发起。
 
 ## 运行框架
 
 - 规范文档：`docs/architecture/RUNTIME_FRAMEWORK.md`
 - 跨平台桌面分层：`docs/architecture/CROSS_PLATFORM_DESKTOP.md`
-- 持久规则：`.cursor/rules/05-runtime-framework.mdc`
-
-## 1.5.1 版本概览
-
-- 相比 `1.3.0`，新增 Android 客户端链路与构建/发布接入。
-- 桌面端新增“请求监控”功能，可记录请求并按进程、域名、IP 进行筛选与生成规则草案。
-- Go 内核当前绑定 `sing-box 1.12.25`。
-- iOS 版本计划下个月发布。
-
-## 当前状态
-
-- Windows / Linux / Android 主链路已接入当前版本。
-- 桌面端请求监控功能已进入日常可用状态。
-- Cursor 项目规则位于 `.cursor/rules/`。
+- Cursor 项目规则：`.cursor/rules/`
 
 ## 社区协作
 
@@ -124,7 +141,6 @@ docs/            # 架构、测试与设计文档
 - 构建 Android 客户端：
   - `客户端：构建：Android`
   - 生成 `Bin/Wateray-Android`
-  - iOS 计划下个月发布
 - 广告端本地发布到 `Bin/adsroot`：
   - `广告端：本地发布：前后端整套到 Bin/adsroot`
 - GitHub 公开发布只面向 VPN 客户端：
@@ -208,11 +224,12 @@ cd adsroot/web && npm install && cd ../..
 
 说明：
 
-- 当前公开发布支持 Windows / Linux / Android：
+- 当前公开发布以 Windows / Linux / Android 为主：
   - Windows 在 Windows 构建
   - Linux 在 Linux 构建
   - Android 在 Android 构建机或已配置 Android SDK/NDK 的环境构建
-- macOS / iOS 计划下个月补齐。
+- macOS 当前保留本地构建与验证链路，但暂未纳入本轮公开发布主承诺。
+- iOS 当前未进入发布流程。
 - 正式 GitHub Release 不再由某一台机器本地直接上传，而是由 GitHub Actions 汇总 staging 产物后统一发布。
 
 推荐流程：
